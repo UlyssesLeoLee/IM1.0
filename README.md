@@ -9,3 +9,6 @@ IM 通信软件，适合 AI 和工作场景，便于集成进游戏的通信软�
 - [软件需求规格说明书（SRS）](docs/SRS.md) —— 产品定位、IM Core 与扩展架构、游戏身份桥接、Laser HUD 交互模型、安全与合规、MVP 与路线图、PoC 计划、ADR 候选、风险登记表。
 - [LiveKit 实时语音子系统技术调查与需求定义书](docs/LiveKit-Voice-Subsystem.md) —— LiveKit 架构/License 调查、Voice Control Plane 设计、VoiceScope（Party/Guild/Match/Proximity）、K3s 部署约束、安全威胁建模、PoC 与基准测试计划、最终采纳结论。
 - [基本设计书（MVP）](docs/BasicDesign.md) —— 服务拓扑与拆分依据、数据模型、消息 Sequence/幂等设计、Identity/Token API、事件总线 Topic、Game SDK 接入映射、Laser HUD 方案、K3s 部署清单。
+- [详细设计书（MVP）](docs/DetailedDesign.md) —— 代码仓库结构、内部 gRPC 契约、WebSocket 协议全量定义、REST API 清单、状态机、错误码表、数据库迁移脚本骨架、Rust 模块接口签名、配置项清单。
+- [Game SDK 集成指南（MVP / Unity）](docs/SDK-Integration-Guide.md) —— 身份接入两种路径、Unity 五步接入代码骨架、离线同步行为、常见接入错误排查、Console/其他引擎现状说明。
+- [K3s 部署与运维手册（MVP）](docs/Deployment-Runbook.md) —— 依赖组件安装顺序、数据库迁移、密钥管理与轮换、常见故障排查、扩缩容指引、灾难恢复演练清单。
