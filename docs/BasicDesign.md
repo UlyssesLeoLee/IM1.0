@@ -89,6 +89,7 @@ CREATE TABLE environments (
     id UUID PRIMARY KEY,
     game_id UUID NOT NULL REFERENCES games(id),
     name TEXT NOT NULL,     -- production / test
+    settings JSONB NOT NULL DEFAULT '{}',   -- 租户/环境级配置（速率限制、好友开关、Retention策略）
     UNIQUE (game_id, name)
 );
 
@@ -113,12 +114,24 @@ CREATE TABLE device_sessions (
 );
 
 -- relationship（MVP：好友基础模型，可按 tenant/game 配置为禁用，见 SRS IM-REL-002）
+CREATE TABLE friend_requests (
+    id UUID PRIMARY KEY,
+    environment_id UUID NOT NULL REFERENCES environments(id),
+    sender_id UUID NOT NULL REFERENCES users(id),
+    recipient_id UUID NOT NULL REFERENCES users(id),
+    state TEXT NOT NULL CHECK (state IN ('pending','accepted','rejected','expired')),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    UNIQUE (environment_id, sender_id, recipient_id)
+);
+
 CREATE TABLE friendships (
+    environment_id UUID NOT NULL REFERENCES environments(id),
     user_id UUID NOT NULL REFERENCES users(id),
     friend_id UUID NOT NULL REFERENCES users(id),
-    state TEXT NOT NULL CHECK (state IN ('pending','accepted','blocked')),
+    state TEXT NOT NULL CHECK (state IN ('accepted','blocked')),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (user_id, friend_id)
+    PRIMARY KEY (environment_id, user_id, friend_id)
 );
 
 -- conversation（Core Schema，禁止游戏专有字段，仅 metadata 扩展点）
@@ -128,6 +141,22 @@ CREATE TABLE conversations (
     kind TEXT NOT NULL CHECK (kind IN ('dm','group','channel','system','broadcast')),
     metadata JSONB NOT NULL DEFAULT '{}',   -- namespaced: game.*, ai.*, work.*
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- 会话内 Sequence 分配器（强单调、行锁原子自增）
+CREATE TABLE conversation_sequences (
+    conversation_id UUID PRIMARY KEY REFERENCES conversations(id) ON DELETE CASCADE,
+    next_sequence BIGINT NOT NULL DEFAULT 1
+);
+
+-- DM 会话双人唯一对（规避并发创建重复私聊，规范化 user_a < user_b）
+CREATE TABLE dm_pairs (
+    environment_id UUID NOT NULL REFERENCES environments(id),
+    user_a UUID NOT NULL REFERENCES users(id),
+    user_b UUID NOT NULL REFERENCES users(id),
+    conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    PRIMARY KEY (environment_id, user_a, user_b),
+    CHECK (user_a < user_b)
 );
 
 CREATE TABLE conversation_members (
@@ -153,7 +182,7 @@ CREATE TABLE messages (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     edited_at TIMESTAMPTZ,
     UNIQUE (conversation_id, sequence),
-    UNIQUE (conversation_id, sender_id, idempotency_key)
+    UNIQUE NULLS NOT DISTINCT (conversation_id, sender_id, idempotency_key)
 );
 
 CREATE TABLE message_reactions (
@@ -180,8 +209,8 @@ CREATE TABLE audit_logs (
 
 ## 5. 消息 Sequence 与幂等设计
 
-- **Sequence 生成**：每个 Conversation 的 Sequence 由 PostgreSQL 内 `SELECT ... FOR UPDATE` 行锁 + 自增列，或使用单独的 `conversation_sequences(conversation_id, next_seq)` 表在同一事务内原子递增后写入 `messages`，保证同一 Conversation 内严格单调、无重复（呼应 `IM-FR-002`）。**MVP 采用行锁方案**（实现简单，正确性优先于极限吞吐），若后续压测显示为瓶颈，再评估分布式ID方案（ADR候选，非MVP决策点）。
-- **幂等**：客户端生成 `idempotency_key`（如 UUID），与 `(conversation_id, sender_id)` 联合唯一约束；重复提交返回已存在的消息而非报错，语义为"幂等成功"。
+- **Sequence 生成**：每个 Conversation 的 Sequence 由 PostgreSQL 内 `conversation_sequences(conversation_id, next_sequence)` 表在数据库事务内执行 `SELECT next_sequence FROM conversation_sequences WHERE conversation_id = $1 FOR UPDATE`，取得当前序号并在同一事务内递增更新且写入 `messages`，保证同一 Conversation 内严格单调、无空洞、无重复（呼应 `IM-FR-002`）。**MVP 采用行锁方案**（实现简单，正确性优先于极限吞吐），若后续压测显示为瓶颈，再评估分布式ID方案（ADR候选，非MVP决策点）。
+- **幂等**：客户端生成 `idempotency_key`（如 UUID），与 `(conversation_id, sender_id)` 在 PostgreSQL 15+ 下通过 `UNIQUE NULLS NOT DISTINCT` 联合唯一约束；重复提交返回已存在的消息而非报错，语义为"幂等成功"。
 - **Delivery State 状态机**：`sent → delivered → read`，允许旁路到 `recalled`/`deleted`；状态转换记录经由 NATS 事件驱动 `im-presence`/推送逻辑异步更新，不阻塞发送主路径（呼应 IM Core 短路径原则）。
 
 ## 6. Identity / Token 设计
@@ -211,14 +240,15 @@ POST   /v1/conversations/{id}/messages/{msg_id}/reactions  添加reaction
 POST   /v1/conversations/{id}/read              上报已读（更新last_read_sequence）
 ```
 
-实时通道（WebSocket，im-gateway 终结）：
+实时通道（WebSocket，im-gateway 终结，契约与 DetailedDesign 严格一致）：
 
 ```
-Client → Gateway:  { type: "send_message", conversation_id, idempotency_key, content }
-Gateway → Client:  { type: "message_ack", idempotency_key, message_id, sequence }
-Gateway → Client:  { type: "message_new", message }          // 广播给会话在线成员
-Gateway → Client:  { type: "presence_update", user_id, status }
-Gateway → Client:  { type: "typing", conversation_id, user_id }
+Client → Gateway:  { "type": "send_message", "req_id": "uuid", "conversation_id": "...", "idempotency_key": "...", "kind": "text", "content": {"text": "hi"}, "reply_to": null }
+Gateway → Client:  { "type": "ack", "req_id": "uuid", "ok": true, "data": { "message_id": "...", "sequence": 42 } }
+Gateway → Client:  { "type": "ack", "req_id": "uuid", "ok": false, "error": { "code": "IDEMPOTENCY_CONFLICT", "message": "..." } }
+Gateway → Client:  { "type": "message_new", "message": { ... } }          // 广播给会话在线成员
+Gateway → Client:  { "type": "presence_update", "user_id": "...", "status": "online" }
+Gateway → Client:  { "type": "typing", "conversation_id": "...", "user_id": "..." }
 ```
 
 **离线/断线重连**：客户端携带 `last_known_sequence`（每会话）通过 `GET /v1/conversations/{id}/messages?after_sequence=` 增量拉取，WebSocket 仅推送重连后的新增；不做"服务端主动补发离线队列"这类有状态设计，退化为客户端拉取模式，实现更简单且天然幂等（呼应弱网设计原则，MVP优先简单正确）。
@@ -226,12 +256,15 @@ Gateway → Client:  { type: "typing", conversation_id, user_id }
 ## 8. 事件总线（NATS JetStream）Topic 设计
 
 ```
-im.message.created         { message_id, conversation_id, sender_id, sequence }
+im.message.created         { message_id, conversation_id, sender_id, sequence, kind }
+im.message.edited          { message_id, conversation_id, content, edited_at }       // 2026-08-23 补
 im.message.recalled        { message_id, conversation_id }
+im.message.reaction_added  { message_id, user_id, emoji }                            // 2026-08-23 补
 im.conversation.created    { conversation_id, kind, metadata }
 im.conversation.member_joined / member_left
 im.presence.changed        { user_id, status }
 im.identity.state_changed  { user_id, state }   // ban/delete等，供audit与其他服务响应
+im.auth.token_rotated      { user_id, device_session_id }                            // 2026-08-23 补,触发 force_disconnect
 ```
 
 Extension Runtime（骨架）通过 JetStream Consumer 订阅上述 Topic 的子集（按 Manifest 声明的 `event_subscription` 过滤），**MVP 阶段无任何 Extension 实际消费这些事件**，仅验证订阅链路可用性与权限隔离（呼应 `EXT-FR-001`）。
@@ -239,7 +272,7 @@ Extension Runtime（骨架）通过 JetStream Consumer 订阅上述 Topic 的子
 ## 9. im-gateway 设计要点
 
 - 单个 WebSocket 连接对应一个 `device_session`；同一 User 允许多端同时连接（多设备），但 Token 校验/续期独立。
-- 连接状态（`user_id → gateway_instance_id → connection_id`）写入 Valkey，供 Fan-out 时定位消息应推送到哪个 Gateway 实例（多网关实例横向扩展的基础）。
+- **连接会话状态与 TTL 管理**：连接建立后将路由元数据（`user_id → gateway_instance_id → connection_id`）写入 Valkey，并设置 `TTL = 120s`（2倍心跳周期）。客户端通过定周期 `ping` 帧驱动网关对该 Key 执行 `EXPIRE` 续期。若客户端异常断电或网关实例异常宕机，过期键将在 120s 内自动失效，避免 Fan-out 路由向死连接投递产生悬空 gRPC 开销。
 - Fan-out 路径：`im-core` 写入消息并提交事务后，发布 `im.message.created` 事件 → 订阅该事件的 Fan-out 组件（MVP 阶段可内置于 im-gateway 或作为 im-core 的轻量 sidecar 逻辑，**不新建独立服务**，避免过早拆分）→ 查询 Valkey 中会话在线成员的 Gateway 位置 → 通过内部 gRPC 推送到对应 Gateway 实例 → WebSocket 下发。
 - Rate Limit：按 `user_id` + `ip` 维度，基于 Valkey 令牌桶实现，MVP 覆盖发送消息、创建会话、Guest 注册三个高风险端点。
 
@@ -304,8 +337,106 @@ Ingress:
 
 ## 14. 配置与密钥管理
 
-- 每 Environment 独立 `server_secret`（第6章）、JWT签名密钥，存储于 K3s Secret（MVP），V1+ 评估外部KMS（如开源Vault，Apache-2.0/MPL，符合开源约束）。
-- 租户级配置（Rate Limit阈值、好友系统开关、消息保留策略）存于 `environments` 表的 `settings JSONB` 列（本设计文档第4章表结构可扩展此列，实现时补充），由 im-core 加载并缓存至 Valkey。
+### 14.1 配置分层
+
+| 层级 | 来源 | 范围 | 生效时机 | 变更流程 |
+|---|---|---|---|---|
+| **构建期配置** | Cargo features + 编译时常量 | 进程级开关（如启用 Prometheus exporter） | 重新构建 | Git 提交即变更 |
+| **启动期配置** | 环境变量（`IM_*` 前缀）+ 配置文件（`config/{env}.toml`） | 服务实例级 | 进程启动时加载 | 重启服务 |
+| **运行期配置** | `environments.settings` JSONB 字段 | 租户/环境级 | im-core 启动 + 定期重载（Valkey 缓存 + pub/sub 失效） | DB UPDATE → 失效广播 → 重载 |
+| **密钥/凭证** | K3s Secret（`im-env-{environment_id}`） | 环境级 | 启动时挂载为环境变量 | 双密钥校验窗口轮换（§14.4） |
+
+### 14.2 启动期配置项分类
+
+| 类别 | 典型变量 | 加载方式 | 缺失行为 |
+|---|---|---|---|
+| **必填**（缺则启动失败） | `IM_DATABASE_URL`, `IM_JWT_SIGNING_KEY`, `IM_NATS_URL`, `IM_VALKEY_URL` | 启动时校验 | panic + 非 0 退出码 |
+| **有默认值** | `IM_HTTP_PORT`（默认 8080）、`IM_WS_HEARTBEAT_TIMEOUT_SECONDS`（默认 60） | 启动时填充 | 取默认值 |
+| **环境相关** | `IM_ENV` ∈ {`dev`, `staging`, `prod`} 决定日志级别、metrics 开关、错误堆栈暴露策略 | 启动时决定 | 默认 `dev` |
+
+详细配置项清单（每个变量的名称、类型、范围、默认值、影响范围）见 `DetailedDesign.md §10`，本节不重复。
+
+### 14.3 租户级运行期配置（`environments.settings` 字段）
+
+`environments` 表的 `settings` JSONB 列承载租户/环境级可调参数，MVP 落地的字段：
+
+| 字段 | 类型 | 默认值 | 含义 | 影响 |
+|---|---|---|---|---|
+| `friend_system_enabled` | bool | `true` | 是否暴露好友 UI/API（呼应 `IM-REL-002`） | 关闭后 `POST /v1/friends/*` 全部 403 |
+| `rate_limit.send_message.per_min` | int | `60` | 单用户每分钟发送消息上限 | 触发后 `RATE_LIMITED` 错误 |
+| `rate_limit.guest_register.per_hour` | int | `10` | Guest 注册按 IP 每小时上限 | 防脚本注册 |
+| `message.recall_window_seconds` | int | `120` | 消息撤回时间窗 | 超窗后只能 delete |
+| `message.retention_days.dm` | int | `null`（永久） | DM 消息保留天数 | 过期后台 job 物理删除 |
+| `message.retention_days.group` | int | `null` | 群消息保留天数 | 同上 |
+| `message.retention_days.channel` | int | `365` | 频道消息保留天数 | 同上 |
+| `voice.enabled` | bool | `false` | V1 语音子系统启用开关 | 关闭后 SDK 不暴露 Voice API |
+| `audit.detailed` | bool | `false` | 是否记录详细审计（详细级别影响性能） | 影响 `audit_logs` 写入量 |
+
+加载与缓存：
+- im-core 启动时全量加载所有 `environments` 行 → 写入 Valkey（Key 形如 `env:settings:{environment_id}`，TTL 3600s）
+- 提供 `PATCH /v1/internal/environments/{id}/settings` 内部 API（仅 `im-gateway` 可调用，签名校验）触发 Valkey pub/sub 失效广播
+- 收到广播后 im-core 各实例主动重载本实例已缓存的 settings（避免全集群击穿 DB）
+
+### 14.4 密钥管理
+
+#### 14.4.1 密钥清单
+
+每个 Environment 独立持有以下密钥（存储于 K3s Secret `im-env-{environment_id}`，MVP 阶段不引入外部 KMS）：
+
+| 密钥 | 用途 | 生成 | 长度 | 轮换频率 |
+|---|---|---|---|---|
+| `server_secret` | 游戏服务器 Token Exchange HMAC 签名（§6） | `openssl rand -hex 32` | 32 字节（64 hex） | 季度 |
+| `jwt_signing_key` | Access Token 签名 | `openssl rand -hex 32` | 32 字节 | 季度 |
+| `refresh_token_pepper` | Refresh Token 哈希加盐 | `openssl rand -hex 32` | 32 字节 | 半年 |
+| `im_jwt_signing_keys_v1/v2` | Access Token 签名（轮换期双密钥） | 同上 | 32 字节 | 轮换期 7 天 |
+
+#### 14.4.2 轮换流程（呼应 `SEC-NFR-003`）
+
+1. **生成新密钥** → 写入新 Secret Key（如 `im_jwt_signing_keys_v2`），不覆盖 `v1`。
+2. **应用层支持双密钥校验**：`im-core` 的 Token 校验逻辑同时接受 `v1`/`v2` 两个 Key 签名（Key ID 嵌入 JWT `kid` 头），实现细节见 `DetailedDesign.md §6/§10`。
+3. **下发明文配置变更**：通过 im-gateway 的内部 admin API（`POST /v1/internal/auth/rotate-start`）告知游戏服务器"已开始轮换，请用 `kid=v2` 签发新 Token"。
+4. **观察期（默认 7 天）**：监控 Token 流量分布，v1 占比 < 1% 时进入下一步。
+5. **下线 v1**：发布配置移除 `v1` Key，所有 `kid=v1` 的 Token 视为非法。
+6. **归档审计**：轮换过程写入 `audit_logs`（`action=secret_rotation`, `target_type=environment`）。
+
+#### 14.4.3 密钥访问控制
+
+- K3s Secret 仅 im-core 命名空间内 Pod 可挂载（`imagePullSecrets` + `serviceAccount` 限定）
+- 应用进程以非 root 用户运行（Dockerfile `USER 1000:1000`，见 `Platform-Specifics.md §6`）
+- 密钥**永不**写入日志（tracing 层 filter 掉 `server_secret` 等字段名）
+- 密钥**永不**进入 Git（`.gitignore` 已包含 `.env*`，Secret 仅通过 `kubectl create secret` 注入）
+
+### 14.5 配置加载与故障行为
+
+```rust
+// crates/im-common/src/config.rs 概念示意
+pub struct AppConfig {
+    pub database_url: Secret<String>,        // 必填,缺失 panic
+    pub jwt_signing_keys: Vec<SigningKey>,    // 至少 1 个,缺失 panic
+    pub nats_url: String,                     // 必填
+    pub valkey_url: String,                   // 必填
+    pub env: Environment,                     // dev/staging/prod
+    pub settings_refresh_interval: Duration,  // 默认 300s
+}
+
+impl AppConfig {
+    pub fn load() -> Result<Self, ConfigError> {
+        // 1. 读取 IM_ENV 决定 config/{env}.toml
+        // 2. 读取环境变量覆盖
+        // 3. 校验必填项
+        // 4. 解析双密钥(v1/v2)
+        // 5. 启动 background task 监听 settings 失效
+    }
+}
+```
+
+启动期任意必填项缺失或格式错误 → `process::exit(78)` (sysexits.h `EX_CONFIG`)，由 K3s 自动重启（CrashLoopBackOff 在监控中显形）。
+
+### 14.6 V1+ 演进路径
+
+- **V1**：评估外部 KMS（候选：HashiCorp Vault，BSL 1.1 需评估 / OpenBao，Apache-2.0 / 青云 KBS），引入 secret 自动轮换 + 审计推送
+- **V1**：拆分 `config-server` 服务统一管理配置分发，im-core 通过 gRPC 拉取而非读 DB
+- **V2**：支持租户自助修改 settings（通过 Web Dashboard，不再依赖内部 API）
 
 ## 15. 可观测性落地（MVP最小集）
 
@@ -314,11 +445,14 @@ Ingress:
 
 ## 16. 详细设计阶段的遗留决策点（非本文档阻塞项，需在下一阶段闭环）
 
-- ADR-011：im-core 未来拆分的触发阈值（QPS/连接数具体数字，需第一轮压测后回填）。
-- ADR-012：PostgreSQL Operator 选型（第13章）。
-- ADR-013：HUD Runtime 容器技术选型（Tauri vs 其他，第12章）。
+- **ADR-011**：im-core 未来拆分的触发阈值（QPS/连接数具体数字，需第一轮压测后回填）。
+- **ADR-012**：PostgreSQL Operator 选型（第13章）。
+- **ADR-013**：HUD Runtime 容器技术选型（Tauri vs 其他，第12章）。
+- **ADR-014**：WS 帧序列化格式（JSON vs Protobuf）—— DetailedDesign §3 Candidate 暂定 JSON，需压测确认（与 SRS §50 ADR-Candidate 同步）。
+- **ADR-015**：Valkey vs KeyDB 选型（Valkey 已默认，详细设计阶段需确认集群模式与 Sentinel 配置）。
 - Sequence生成方案的性能天花板需要 POC-02（SRS第47章）实测后确认是否需要升级为分布式方案。
-- `settings JSONB` 的具体字段清单（好友开关、保留策略等）需在详细设计阶段与产品逐项确认字段命名与默认值。
+- `environments.settings` 字段清单已落 §14.3，**产品确认后**即定版；如需扩展字段按 `F. 字段变更控制`（aux-02）流程。
+- `IM_ACCESS_TOKEN_TTL_SECONDS` / `IM_RATE_LIMIT_SEND_MESSAGE_PER_MIN` / `IM_MESSAGE_RECALL_WINDOW_SECONDS` 等 Candidate 默认值需在第一轮压测 + 业务确认后固化（详细设计 §10 已标 Candidate）。
 
 ---
 

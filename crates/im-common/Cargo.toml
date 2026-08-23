@@ -1,0 +1,38 @@
+[package]
+name = "im-common"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "IM1.0 共享工具:错误类型(单一来源,21 项错误码) + ID newtype + 时间"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# Serde / ID / Time
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Error / Async
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error code string mapping
+strum = { workspace = true }
+
+# Hash
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

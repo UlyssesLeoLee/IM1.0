@@ -78,7 +78,10 @@ await ImClient.Instance.JoinConversationAsync(conversationId);
 await ImClient.Instance.SendMessageAsync(conversationId, new TextContent { Text = "hello" });
 ```
 
-SDK 内部自动处理：断线重连（指数退避，初始1s，上限30s）、心跳（30s间隔，呼应 `DetailedDesign.md §10`）、`req_id`/`idempotency_key` 生成与去重、本地会话游标（`last_known_sequence`）维护。
+SDK 内部自动处理：
+- **防重连风暴（Full Jitter 指数退避）**：连接断开时，SDK 严格按照 `sleep = min(backoff_max, rand(0, backoff_base * 2^attempt))` 计算下一次重试延迟（初始 `base = 1s`, `max = 30s`），引入完整随机抖动，杜绝全服掉线恢复时大量客户端同时发起连接击穿网关（呼应 `SRS.md` 中的 `RISK-05` 缓解策略）。
+- **心跳保活**：30s 周期发送 `ping`，服务端 60s 无响应触发主动重连与会话重建（呼应 `DetailedDesign.md §10`）。
+- **去重与序列追踪**：自动为发送请求生成 `req_id` 与 `idempotency_key`，并在内存维护每会话最新的 `last_known_sequence` 游标。
 
 ## 4. 离线消息与增量同步（客户端无需手写，但需理解行为）
 
