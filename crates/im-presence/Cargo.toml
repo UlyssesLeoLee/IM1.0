@@ -1,0 +1,15 @@
+[package]
+name = "im-presence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "IM1.0 Presence 服务(在线状态) - MVP 占位,V1 实装"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+im-common = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

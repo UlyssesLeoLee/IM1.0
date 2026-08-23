@@ -1,0 +1,81 @@
+# ===== Rust =====
+target/
+**/*.rs.bk
+Cargo.lock.bak
+
+# sqlx 离线模式缓存
+.sqlx/
+
+# benchmark 产物
+benches/
+target/criterion/
+
+# ===== Node / Next.js (V1+ Dashboard) =====
+node_modules/
+.next/
+.pnpm-store/
+
+# ===== Env / 密钥 =====
+.env
+.env.*
+!.env.example
+
+# ===== IDE =====
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Build 产物 =====
+*.log
+*.tmp
+*.pid
+*.swp
+
+# ===== K3s / Kube =====
+kubeconfig
+.kube/
+
+# ===== 临时文件 =====
+fp.txt
+auxout.txt
+c1.txt
+dbg.txt
+debug.txt
+f2.txt
+f2b.txt
+f3.txt
+f3b.txt
+f4.txt
+f6.txt
+fa.txt
+fix3out.txt
+fix4out.txt
+fix5out.txt
+fixout.txt
+fout.txt
+genout.txt
+genout2.txt
+gout.txt
+gout2.txt
+gout3.txt
+gout4.txt
+gout5.txt
+gout6.txt
+gout7.txt
+listbad.txt
+out.txt
+out2.txt
+out3.txt
+result.txt
+s.txt
+sum.txt
+t2.txt
+tout.txt
+fwt.txt

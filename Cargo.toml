@@ -1,0 +1,138 @@
+[workspace]
+members = [
+    "crates/im-common",
+    "crates/im-proto",
+    "crates/im-protocol",
+    "crates/im-core",
+    "crates/im-gateway",
+    "crates/im-presence",
+    "crates/im-media",
+    "crates/extension-runtime",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["IM1.0 Team"]
+license = "Apache-2.0"
+repository = "https://github.com/{org}/im1.0"
+homepage = "https://github.com/{org}/im1.0"
+documentation = "https://github.com/{org}/im1.0/tree/main/docs"
+
+[workspace.dependencies]
+# ---- Web 框架 ----
+actix-web = "4"
+actix-ws = "0.3"
+actix-web-httpauth = "0.8"
+actix-cors = "0.7"
+actix-rt = "2"
+
+# ---- 异步运行时 ----
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# ---- 数据库 ----
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "postgres",
+    "macros",
+    "migrate",
+    "uuid",
+    "chrono",
+    "json",
+] }
+
+# ---- 缓存 / KV ----
+# NOTE: redis 0.27 的 tls-rustls feature 与 tokio_rustls 不兼容(MVP 暂不启用 TLS,V1+ 处理)
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+
+# ---- 事件总线 ----
+async-nats = "0.37"
+
+# ---- 序列化 ----
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+
+# ---- ID / 时间 ----
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# ---- 错误处理 ----
+thiserror = "1"
+anyhow = "1"
+strum = { version = "0.26", features = ["derive"] }
+
+# ---- 密码 / Token ----
+argon2 = "0.5"
+jsonwebtoken = "9"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+# ---- 媒体 (MinIO S3 兼容) ----
+aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = "1"
+
+# ---- 可观测性 ----
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-actix-web = "0.7"
+prometheus = "0.13"
+opentelemetry = "0.24"
+opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
+
+# ---- gRPC ----
+tonic = "0.12"
+tonic-build = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+# ---- 配置 / 密钥 ----
+figment = { version = "0.10", features = ["env", "toml"] }
+dotenvy = "0.15"
+secrecy = "0.8"
+
+# ---- 通用工具 ----
+once_cell = "1"
+parking_lot = "0.12"
+dashmap = "6"
+
+# ---- 测试 ----
+testcontainers = "0.23"
+testcontainers-modules = { version = "0.11", features = ["postgres", "redis"] }
+proptest = "1"
+mockall = "0.13"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# ---- 内部依赖 ----
+im-common = { path = "crates/im-common" }
+im-proto = { path = "crates/im-proto" }
+im-protocol = { path = "crates/im-protocol" }
+im-core = { path = "crates/im-core" }
+im-gateway = { path = "crates/im-gateway" }
+im-presence = { path = "crates/im-presence" }
+im-media = { path = "crates/im-media" }
+extension-runtime = { path = "crates/extension-runtime" }
+
+# ---- 共享编译 profile ----
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+debug = false
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.test]
+opt-level = 0
+debug = true

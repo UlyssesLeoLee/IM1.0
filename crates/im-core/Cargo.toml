@@ -1,0 +1,64 @@
+[package]
+name = "im-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "IM1.0 Core 业务逻辑:Identity / Conversation / Message / Relationship / Event / Settings"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+im-common = { workspace = true }
+im-proto = { workspace = true }
+im-protocol = { workspace = true }
+
+# secrets (deprecated 重复条目,保留)
+
+# DB
+sqlx = { workspace = true }
+
+# Cache
+redis = { workspace = true }
+
+# Event bus
+async-nats = { workspace = true }
+
+# Async / Serialization / ID
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Error
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Crypto
+argon2 = { workspace = true }
+jsonwebtoken = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+secrecy = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Config
+figment = { workspace = true }
+
+# Common
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+mockall = { workspace = true }
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

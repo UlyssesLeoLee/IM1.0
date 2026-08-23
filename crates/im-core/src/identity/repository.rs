@@ -1,0 +1,78 @@
+//! Identity Repository 接口
+//!
+//! 依据: ImplementationSpec §7.4.1 + DetailedDesign §9.2
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+pub use im_common::ids::{DeviceSessionId, EnvironmentId, UserId};
+use im_common::AppError;
+
+use super::token::DeviceSession;
+
+/// 用户类型
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserKind {
+    User,
+    Guest,
+}
+
+/// 用户状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UserState {
+    Active,
+    Banned,
+    Suspended,
+    Deleted,
+}
+
+/// 外部身份(游戏服务器 Token Exchange 用)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalIdentity {
+    pub provider: String,         // steam | xbox | psn | epic | custom_jwt | ...
+    pub external_uid: String,
+}
+
+/// User 实体
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub id: UserId,
+    pub environment_id: EnvironmentId,
+    pub kind: UserKind,
+    pub external_identity: Option<ExternalIdentity>,
+    pub state: UserState,
+    pub display_name: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// User Repository trait
+#[async_trait]
+pub trait UserRepository: Send + Sync {
+    async fn find_by_id(&self, id: UserId) -> Result<Option<User>, AppError>;
+    async fn find_by_external_identity(
+        &self,
+        env: EnvironmentId,
+        provider: &str,
+        external_uid: &str,
+    ) -> Result<Option<User>, AppError>;
+    async fn create(
+        &self,
+        env: EnvironmentId,
+        kind: UserKind,
+        external: Option<ExternalIdentity>,
+        display_name: Option<String>,
+    ) -> Result<User, AppError>;
+    async fn update_state(&self, id: UserId, state: UserState) -> Result<(), AppError>;
+    async fn update_display_name(
+        &self,
+        id: UserId,
+        display_name: Option<&str>,
+    ) -> Result<User, AppError>;
+}
+
+/// Device Session Repository trait (在 token.rs 中定义以避免循环)
+pub use super::token::DeviceSessionRepository;

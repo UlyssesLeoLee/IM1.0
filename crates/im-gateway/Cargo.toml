@@ -1,0 +1,53 @@
+[package]
+name = "im-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "IM1.0 Gateway: HTTP REST + WebSocket 终结,内部 gRPC 客户端"
+
+[[bin]]
+name = "im-gateway"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+im-common = { workspace = true }
+im-proto = { workspace = true }
+im-protocol = { workspace = true }
+im-core = { workspace = true }
+im-media = { workspace = true }
+
+# Web
+actix-web = { workspace = true }
+actix-ws = { workspace = true }
+actix-web-httpauth = { workspace = true }
+actix-cors = { workspace = true }
+actix-rt = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# Error / Tracing
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-actix-web = { workspace = true }
+
+# Metrics
+prometheus = { workspace = true }
+
+[dev-dependencies]
+actix-web = { workspace = true, features = ["macros"] }
+reqwest = { version = "0.12", features = ["json"] }

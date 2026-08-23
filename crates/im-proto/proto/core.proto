@@ -1,0 +1,297 @@
+// =============================================================================
+// im-proto/core.proto
+// Internal gRPC contract: im-gateway ⇄ im-core
+// Package: im.core.v1
+//
+// 依据: docs/ImplementationSpec.md §3.3 (22 个 RPC)
+//       docs/DetailedDesign.md §2 (核心 proto 框架)
+//
+// 错误码 → tonic::Code 映射: docs/templates/04-detailed-design/aux/aux-13 §2.5
+// =============================================================================
+syntax = "proto3";
+
+package im.core.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// =============================================================================
+// 公共类型
+// =============================================================================
+
+// User 类型(kind: user / guest)
+message User {
+  string id = 1;
+  string environment_id = 2;
+  string kind = 3;                   // user | guest
+  // JSON-encoded external_identity (MVP 不用 google.protobuf.Value 以避免 struct.proto 依赖)
+  string external_identity_json = 4;
+  string state = 5;                  // active | banned | suspended | deleted
+  optional string display_name = 6;
+  google.protobuf.Timestamp created_at = 7;
+}
+
+// Conversation 类型
+message Conversation {
+  string id = 1;
+  string environment_id = 2;
+  string kind = 3;                   // dm | group | channel | system | broadcast
+  // JSON-encoded metadata, namespaced: game.* / ai.* / work.*
+  string metadata_json = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+enum MessageKind {
+  MESSAGE_KIND_UNSPECIFIED = 0;
+  TEXT = 1;
+  IMAGE = 2;
+  FILE = 3;
+  STICKER = 4;
+  SYSTEM = 5;
+  CUSTOM = 6;
+}
+
+// Message 类型
+message Message {
+  string id = 1;
+  string conversation_id = 2;
+  int64 sequence = 3;
+  optional string sender_id = 4;     // null = 系统消息
+  MessageKind kind = 5;
+  bytes content_json = 6;            // 序列化的 JSON content
+  optional string reply_to = 7;
+  string state = 8;                  // sent | delivered | read | recalled | deleted
+  google.protobuf.Timestamp created_at = 9;
+  optional google.protobuf.Timestamp edited_at = 10;
+}
+
+message ListMessagesResponse {
+  repeated Message messages = 1;
+  bool has_more = 2;
+  int64 latest_sequence = 3;
+}
+
+message ListConversationsResponse {
+  repeated Conversation conversations = 1;
+  string next_cursor = 2;            // "" = 无更多
+}
+
+message TokenPair {
+  string access_token = 1;
+  string refresh_token = 2;
+  string user_id = 3;
+  int32 expires_in = 4;             // seconds
+}
+
+// =============================================================================
+// Identity / Token  (6 RPC)
+// =============================================================================
+
+message ExchangeTokenRequest {
+  string environment_id = 1;
+  string external_provider = 2;      // steam | xbox | psn | epic | custom_jwt | ...
+  string external_uid = 3;
+  optional string display_name = 4;
+  // Server-to-Server 鉴权 (在 gRPC metadata 中)
+  // - im-server-signature: hex(HMAC-SHA256(server_secret, body))
+  // - im-server-timestamp: unix_seconds
+  // - im-server-nonce: random
+}
+
+message AuthenticateGuestRequest {
+  string environment_id = 1;
+}
+
+message RefreshTokenRequest {
+  string refresh_token = 1;
+}
+
+message LinkAccountRequest {
+  string access_token = 1;           // 当前 Access Token (Guest)
+  string external_provider = 2;
+  string external_uid = 3;
+}
+
+message LogoutRequest {
+  string user_id = 1;
+  string device_session_id = 2;
+}
+
+message ValidateAccessTokenRequest {
+  string access_token = 1;
+}
+
+message ValidateAccessTokenResponse {
+  bool valid = 1;
+  string user_id = 2;
+  string environment_id = 3;
+  string tenant_id = 4;
+  int64 expires_at_unix = 5;
+}
+
+// =============================================================================
+// Conversation  (3 RPC)
+// =============================================================================
+
+message CreateConversationRequest {
+  string kind = 1;                   // dm | group | channel
+  string environment_id = 2;
+  string creator_user_id = 3;
+  repeated string member_user_ids = 4;
+  string metadata_json = 5;          // JSON-encoded
+}
+
+message ListConversationsRequest {
+  string user_id = 1;
+  string cursor = 2;                 // "" = 头
+  int32 limit = 3;                  // default 50, max 200
+}
+
+message GetConversationRequest {
+  string conversation_id = 1;
+  string user_id = 2;
+}
+
+// =============================================================================
+// Message  (5 RPC)
+// =============================================================================
+
+message SendMessageRequest {
+  string conversation_id = 1;
+  string sender_id = 2;
+  string idempotency_key = 3;
+  MessageKind kind = 4;
+  bytes content_json = 5;
+  optional string reply_to = 6;
+}
+
+message ListMessagesRequest {
+  string conversation_id = 1;
+  string user_id = 2;                 // 用于成员校验
+  int64 after_sequence = 3;
+  int32 limit = 4;
+}
+
+message EditMessageRequest {
+  string message_id = 1;
+  string user_id = 2;                 // 用于 sender 校验
+  bytes content_json = 3;
+}
+
+message RecallMessageRequest {
+  string message_id = 1;
+  string user_id = 2;
+}
+
+message ReactMessageRequest {
+  string message_id = 1;
+  string user_id = 2;
+  string emoji = 3;
+}
+
+message MarkReadRequest {
+  string conversation_id = 1;
+  string user_id = 2;
+  int64 sequence = 3;
+}
+
+// =============================================================================
+// Relationship  (3 RPC)
+// =============================================================================
+
+message SendFriendRequestRequest {
+  string environment_id = 1;
+  string sender_id = 2;
+  string recipient_id = 3;
+}
+
+message RespondFriendRequestRequest {
+  string request_id = 1;
+  string responder_id = 2;
+  bool accept = 3;
+}
+
+message BlockUserRequest {
+  string user_id = 1;
+  string target_id = 2;
+}
+
+message ListFriendsRequest {
+  string user_id = 1;
+  string cursor = 2;
+  int32 limit = 3;
+}
+
+message ListFriendsResponse {
+  repeated User friends = 1;
+  string next_cursor = 2;
+}
+
+// =============================================================================
+// Media  (1 RPC)
+// =============================================================================
+
+message PresignMediaRequest {
+  string user_id = 1;
+  string content_type = 2;
+  int64 size_hint = 3;
+}
+
+message PresignMediaResponse {
+  string upload_url = 1;
+  string media_id = 2;
+  int64 expires_at_unix = 3;
+}
+
+// =============================================================================
+// User 资料  (2 RPC)
+// =============================================================================
+
+message GetMeRequest {
+  string user_id = 1;
+}
+
+message UpdateMeRequest {
+  string user_id = 1;
+  optional string display_name = 2;
+}
+
+// =============================================================================
+// CoreService
+// =============================================================================
+
+service CoreService {
+  // ---- Identity (6) ----
+  rpc ExchangeToken(ExchangeTokenRequest) returns (TokenPair);
+  rpc AuthenticateGuest(AuthenticateGuestRequest) returns (TokenPair);
+  rpc RefreshToken(RefreshTokenRequest) returns (TokenPair);
+  rpc LinkAccount(LinkAccountRequest) returns (TokenPair);
+  rpc Logout(LogoutRequest) returns (google.protobuf.Empty);
+  rpc ValidateAccessToken(ValidateAccessTokenRequest) returns (ValidateAccessTokenResponse);
+
+  // ---- Conversation (3) ----
+  rpc CreateConversation(CreateConversationRequest) returns (Conversation);
+  rpc ListConversations(ListConversationsRequest) returns (ListConversationsResponse);
+  rpc GetConversation(GetConversationRequest) returns (Conversation);
+
+  // ---- Message (5) ----
+  rpc SendMessage(SendMessageRequest) returns (Message);
+  rpc ListMessages(ListMessagesRequest) returns (ListMessagesResponse);
+  rpc EditMessage(EditMessageRequest) returns (Message);
+  rpc RecallMessage(RecallMessageRequest) returns (google.protobuf.Empty);
+  rpc ReactMessage(ReactMessageRequest) returns (google.protobuf.Empty);
+  rpc MarkRead(MarkReadRequest) returns (google.protobuf.Empty);
+
+  // ---- Relationship (3) ----
+  rpc SendFriendRequest(SendFriendRequestRequest) returns (google.protobuf.Empty);
+  rpc RespondFriendRequest(RespondFriendRequestRequest) returns (google.protobuf.Empty);
+  rpc BlockUser(BlockUserRequest) returns (google.protobuf.Empty);
+  rpc ListFriends(ListFriendsRequest) returns (ListFriendsResponse);
+
+  // ---- Media (1) ----
+  rpc PresignMedia(PresignMediaRequest) returns (PresignMediaResponse);
+
+  // ---- User 资料 (2) ----
+  rpc GetMe(GetMeRequest) returns (User);
+  rpc UpdateMe(UpdateMeRequest) returns (User);
+}

@@ -1,0 +1,21 @@
+[package]
+name = "im-media"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "IM1.0 媒体服务(MinIO 预签名 URL) - MVP 最小化,V1 实装"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+im-common = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }

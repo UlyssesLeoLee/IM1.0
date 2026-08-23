@@ -1,0 +1,19 @@
+[package]
+name = "im-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "IM1.0 WS 帧 / 错误响应 / 消息 content schema"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+im-common = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

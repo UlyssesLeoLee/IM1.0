@@ -1,0 +1,18 @@
+[package]
+name = "im-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "IM1.0 共享 protobuf 定义 + tonic-build 生成代码"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
