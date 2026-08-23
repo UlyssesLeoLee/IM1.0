@@ -186,7 +186,7 @@ async function handleResponse<T>(resp: Response): Promise<T> {
 
 ## 6. 验收标准 (Acceptance Criteria)
 
-- [ ] 所有错误码在本表登记(§B 已收 20 项 MVP 错误码)
+- [ ] 所有错误码在本表登记(§B 已收 21 项 MVP 错误码,与 `crates/im-common/src/error.rs` `ErrorCode` 枚举严格对齐)
 - [ ] CI 中 `scripts/check_error_codes.sh` 100% 通过
 - [ ] 弃用 6 个月后未清零 → 自动告警(SRE 看板)
 - [ ] 任何 `match err.code { ... }` 必有 `default` 分支(`@typescript-eslint/switch-exhaustiveness-check`)

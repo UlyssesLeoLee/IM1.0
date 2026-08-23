@@ -26,7 +26,7 @@
 - [ ] **未变更** wire format (WS 帧 / gRPC 字段 / REST 路径)
 - [ ] **已变更** wire format —— 已同步更新:
   - [ ] `docs/DetailedDesign.md` 对应章节
-  - [ ] `docs/templates/04-detailed-design/aux/aux-13-protocol-frame-samples.md`
+  - [ ] `docs/templates/04-detailed-design/auxiliary/aux-13-protocol-frame-samples.md`
   - [ ] `docs/ImplementationSpec.md §3`
   - [ ] `crates/im-proto/proto/*.proto` (重新生成)
 
