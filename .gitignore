@@ -42,6 +42,10 @@ desktop.ini
 kubeconfig
 .kube/
 
+# ===== Python (脚本生成) =====
+__pycache__/
+*.pyc
+
 # ===== 临时文件 =====
 fp.txt
 auxout.txt
