@@ -91,7 +91,7 @@ opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
 tonic = "0.12"
 tonic-build = "0.12"
 prost = "0.13"
-prost-types = "0.13"
+prost-types = "0.14"
 
 # ---- 配置 / 密钥 ----
 figment = { version = "0.10", features = ["env", "toml"] }
