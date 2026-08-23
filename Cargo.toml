@@ -82,7 +82,7 @@ aws-credential-types = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-actix-web = "0.7"
-prometheus = "0.13"
+prometheus = "0.14"
 opentelemetry = "0.24"
 opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
