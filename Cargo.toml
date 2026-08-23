@@ -50,7 +50,7 @@ sqlx = { version = "0.8", features = [
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
 # ---- 事件总线 ----
-async-nats = "0.37"
+async-nats = "0.50"
 
 # ---- 序列化 ----
 serde = { version = "1", features = ["derive"] }
