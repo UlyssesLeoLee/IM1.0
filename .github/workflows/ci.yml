@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# 4 个 job: lint / test-unit / test-integration / sast
+# 全部用 PostgreSQL 18 服务(与 BasicDesign §5 一致)
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt check
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: aux-01 naming check
+        run: |
+          # 占位:clippy 已含命名检查;后续加 sqlfluff / buf lint
+          echo "naming checks: clippy + manual review per aux-01 §J"
+
+  test-unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: im
+          POSTGRES_PASSWORD: im
+          POSTGRES_DB: im_test
+        ports: [5432:5432]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://im:im@localhost:5432/im_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (unit)
+        run: cargo test --workspace --lib --no-fail-fast
+
+  test-integration:
+    name: Integration Tests (PG + migrations)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: im
+          POSTGRES_PASSWORD: im
+          POSTGRES_DB: im_test
+        ports: [5432:5432]
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://im:im@localhost:5432/im_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install sqlx-cli
+        run: cargo install sqlx-cli --version '^0.8' --no-default-features --features rustls,postgres --locked
+      - name: run migrations
+        run: sqlx migrate run --database-url $DATABASE_URL
+      - name: cargo test (integration)
+        # 当前 MVP: 集成测试用例尚少,待后续 PR 补充
+        # 跑全部 test 即可,包括 unit 集成的 lib tests
+        run: cargo test --workspace --no-fail-fast
+
+  sast:
+    name: Static Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo audit
+        run: |
+          cargo install --locked cargo-audit
+          cargo audit
+      - name: check error codes consistency (aux-03)
+        run: |
+          # 占位:检查所有错误码字符串都在 aux-03 §B 中
+          # 实现见 scripts/check_error_codes.sh(MVP 后续 PR 补充)
+          echo "error code check: manual review for MVP"
+      - name: semgrep
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/rust
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten

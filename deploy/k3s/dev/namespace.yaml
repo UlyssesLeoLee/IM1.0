@@ -1,0 +1,10 @@
+# K3s dev namespace
+# 依据: ImplementationSpec §13 + BasicDesign §13
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: im1-dev
+  labels:
+    name: im1-dev
+    env: dev
+    app.kubernetes.io/part-of: im1.0

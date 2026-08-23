@@ -1,0 +1,112 @@
+# im-gateway Deployment
+# 依据: ImplementationSpec §8.3 + §7.5
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: im-gateway
+  namespace: im1-dev
+spec:
+  replicas: 1    # MVP 单实例,V1 HPA on connection count
+  selector:
+    matchLabels:
+      app: im-gateway
+  template:
+    metadata:
+      labels:
+        app: im-gateway
+    spec:
+      initContainers:
+        - name: wait-for-postgres
+          image: postgres:18
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h postgres -p 5432; do
+                echo "waiting for postgres..."
+                sleep 2
+              done
+        - name: run-migrations
+          image: ghcr.io/yourorg/im1.0-im-migrate:latest
+          command: ["sqlx", "migrate", "run"]
+          env:
+            - name: IM_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: database-url
+      containers:
+        - name: im-gateway
+          image: ghcr.io/yourorg/im1.0-im-gateway:latest
+          ports:
+            - name: http
+              containerPort: 8080
+            - name: grpc
+              containerPort: 9000
+          env:
+            - name: IM_ENV
+              value: dev
+            - name: IM_HTTP_PORT
+              value: "8080"
+            - name: IM_GRPC_PORT
+              value: "9000"
+            - name: IM_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: database-url
+            - name: IM_VALKEY_URL
+              valueFrom:
+                secretKeyRef:
+                  name: im-core-env
+                  key: valkey-url
+            - name: IM_NATS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: im-core-env
+                  key: nats-url
+            - name: IM_JWT_SIGNING_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: im-core-env
+                  key: jwt-signing-keys
+            - name: IM_REFRESH_TOKEN_PEPPER
+              valueFrom:
+                secretKeyRef:
+                  name: im-core-env
+                  key: refresh-token-pepper
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 200m
+            limits:
+              memory: 512Mi
+              cpu: 1000m
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: im-gateway
+  namespace: im1-dev
+spec:
+  selector:
+    app: im-gateway
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+    - name: grpc
+      port: 9000
+      targetPort: 9000

@@ -1,0 +1,26 @@
+# CODEOWNERS —— 自动指派 reviewer
+# 依据: Platform-Specifics.md §2.2
+
+# 默认:所有文件需要 TL 批准
+*       @tech-lead
+
+# 文档可由 PM 批准
+/docs/  @pm @tech-lead
+
+# Workflow 模板目录 Mavis 跳过(自动生成)
+/docs/templates/ @tech-lead
+
+# 部署 manifest 需要 SRE 同意
+/k8s/   @sre @tech-lead
+/deploy/ @sre @tech-lead
+
+# 协议 / API 改动需要 2 人
+/crates/im-protocol/ @tech-lead @dev-b
+/crates/im-proto/   @tech-lead @dev-b
+/crates/im-gateway/src/api/ @tech-lead @dev-b
+
+# DB 迁移需要 TL 同意(改动历史敏感)
+/migrations/ @tech-lead
+
+# CI 改动需要 SRE 同意
+/.github/  @sre @tech-lead

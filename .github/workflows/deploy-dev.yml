@@ -1,0 +1,87 @@
+name: Deploy Dev
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      skip_smoke:
+        description: "Skip smoke test (manual deploy only)"
+        required: false
+        default: "false"
+
+concurrency:
+  group: deploy-dev
+  cancel-in-progress: false    # 部署排队不取消
+
+jobs:
+  deploy:
+    name: Deploy to K3s dev
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup kubeconfig
+        env:
+          KUBECONFIG_SECRET: ${{ secrets.KUBECONFIG_DEV }}
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBECONFIG_SECRET" | base64 -d > ~/.kube/config
+
+      - name: Apply secrets first (if changed)
+        run: |
+          # 实际部署用 sealed-secrets,本步骤是占位
+          if [ -f deploy/k3s/dev/secrets-template.yaml ]; then
+            echo "WARN: secrets-template.yaml contains placeholders, skipping apply"
+            echo "      Use: kubectl apply -f <sealed-secret.yaml> (post-rotation)"
+          fi
+
+      - name: Apply manifests
+        run: |
+          kubectl apply -k deploy/k3s/dev/ -n im1-dev
+          kubectl rollout status deployment/postgres -n im1-dev --timeout=5m
+          kubectl rollout status deployment/valkey -n im1-dev --timeout=2m
+          kubectl rollout status deployment/nats -n im1-dev --timeout=2m
+          kubectl rollout status deployment/im-gateway -n im1-dev --timeout=5m
+
+      - name: Run migrations
+        run: |
+          kubectl create job --from=cronjob/im-migrate-cronjob im-migrate-manual -n im1-dev 2>/dev/null || \
+            kubectl apply -f deploy/k3s/dev/migrate-job.yaml -n im1-dev
+          kubectl wait --for=condition=complete job/im-migrate -n im1-dev --timeout=2m
+
+      - name: Smoke test
+        if: ${{ !inputs.skip_smoke && github.event_name == 'push' }}
+        run: |
+          # 等待 im-gateway 就绪
+          for i in {1..30}; do
+            if kubectl get pods -n im1-dev -l app=im-gateway -o jsonpath='{.items[0].status.containerStatuses[0].ready}' 2>/dev/null | grep -q true; then
+              break
+            fi
+            sleep 2
+          done
+
+          # 端口转发 + 测 healthz / readyz
+          kubectl port-forward -n im1-dev svc/im-gateway 18080:8080 &
+          PF_PID=$!
+          sleep 3
+
+          echo "=== /healthz ==="
+          curl -sf http://localhost:18080/healthz | jq .
+          echo "=== /readyz ==="
+          curl -sf http://localhost:18080/readyz | jq .
+
+          kill $PF_PID
+        env:
+          IM_BASE_URL: https://im-dev.example.com
+
+      - name: Notify Slack
+        if: always()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "IM1.0 dev deploy ${{ job.status }}: ${{ github.event.head_commit.message }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}

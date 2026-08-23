@@ -1,0 +1,28 @@
+# Ingress: im-gateway HTTP 入口
+# 依据: BasicDesign §13 (K3s 部署清单) + ImplementationSpec §8
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: im-gateway
+  namespace: im1-dev
+  annotations:
+    # WebSocket 长连接:增加超时
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    # CORS (Game SDK 跨域调用)
+    nginx.ingress.kubernetes.io/cors-allow-origin: "*"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, PATCH, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "Authorization, X-IM-Idempotency-Key, X-IM-Server-Signature, X-IM-Server-Timestamp, X-IM-Server-Nonce, Content-Type"
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: im-dev.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: im-gateway
+                port:
+                  number: 8080
