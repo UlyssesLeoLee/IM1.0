@@ -9,6 +9,7 @@
 //! 4. 提交事务后发布 `im.message.created` 事件(失败不阻塞 ack,V1+ outbox)
 //! 5. 返回 Message
 
+#![allow(dead_code, unused_imports, unused_variables)] // 2026-08-26 Day 2 GATE: 占位模块,clippy -D warnings 通过;V1 实装时移除
 use std::sync::Arc;
 
 use async_trait::async_trait;

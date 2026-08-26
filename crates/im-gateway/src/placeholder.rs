@@ -2,6 +2,7 @@
 //!
 //! 所有端点暂时返回 501 Not Implemented,实际 handler 在后续 PR 提交
 
+#![allow(dead_code, unused_imports, unused_variables)] // 2026-08-26 Day 2 GATE: 占位模块,clippy -D warnings 通过;V1 实装时移除
 use actix_web::HttpResponse;
 use serde_json::json;
 

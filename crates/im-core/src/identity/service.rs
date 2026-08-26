@@ -8,6 +8,7 @@
 //! - Refresh Token Rotation
 //! - Guest Upgrade (LinkAccount)
 
+#![allow(dead_code, unused_imports, unused_variables)] // 2026-08-26 Day 2 GATE: 占位模块,clippy -D warnings 通过;V1 实装时移除
 use async_trait::async_trait;
 use chrono::Utc;
 use uuid::Uuid;

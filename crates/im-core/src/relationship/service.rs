@@ -2,6 +2,7 @@
 //!
 //! 依据: ImplementationSpec §7.4.4
 
+#![allow(dead_code, unused_imports, unused_variables)] // 2026-08-26 Day 2 GATE: 占位模块,clippy -D warnings 通过;V1 实装时移除
 use std::sync::Arc;
 
 use uuid::Uuid;
@@ -41,9 +42,9 @@ impl RelationshipService {
             .create_request(env, sender, recipient)
             .await
             .map(|_| ())
-            .or_else(|e| match e {
-                AppError::Internal(_) => Err(AppError::FriendRequestExists),
-                other => Err(other),
+            .map_err(|e| match e {
+                AppError::Internal(_) => AppError::FriendRequestExists,
+                other => other,
             })
     }
 

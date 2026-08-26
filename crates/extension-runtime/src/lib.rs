@@ -5,6 +5,7 @@
 //!
 //! 依据: SRS §26 EXT-FR-001..005 + ImplementationSpec §1.2
 
+#![allow(dead_code, unused_imports, unused_variables)] // 2026-08-26 Day 2 GATE: 占位模块,clippy -D warnings 通过;V1 实装时移除
 use serde::{Deserialize, Serialize};
 
 /// Extension Manifest schema

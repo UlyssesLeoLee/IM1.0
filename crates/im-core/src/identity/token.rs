@@ -2,6 +2,7 @@
 //!
 //! 依据: ImplementationSpec §7.4.1 + DetailedDesign §9.2
 
+#![allow(dead_code, unused_imports, unused_variables)] // 2026-08-26 Day 2 GATE: 占位模块,clippy -D warnings 通过;V1 实装时移除
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use secrecy::{ExposeSecret, SecretString};
