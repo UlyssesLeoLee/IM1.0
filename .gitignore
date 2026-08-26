@@ -2,6 +2,9 @@
 target/
 **/*.rs.bk
 Cargo.lock.bak
+# 2026-08-26 加:Day 1 GATE 补签过程 backup (dot-file 形式,不与上面 Cargo.lock.bak 冲突)
+.Cargo.lock.bak
+.Cargo.lock.obsolete
 
 # sqlx 离线模式缓存
 .sqlx/
