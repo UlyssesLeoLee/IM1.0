@@ -89,7 +89,12 @@ aws-credential-types = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-actix-web = "0.7"
-prometheus = "0.13"
+# 2026-08-26 升级:0.13 → 0.14 + default-features = false(0.13.4 拉 protobuf 2.28.0,
+# 后者在 cargo 1.98 / rustc 1.98 上 codegen 阶段触发 STATUS_STACK_BUFFER_OVERRUN 0xc0000409,
+# test target 必触发;0.14 (2026-03 发布) 仍 default-features = ["protobuf"] (protobuf 3.x),
+# 故需显式 default-features = false。仓库内 placeholder.rs / health.rs 仅占位未调用
+# prometheus API,protobuf 不开 OK。V1 实装 metrics 时再启 protobuf feature)
+prometheus = { version = "0.14", default-features = false }
 opentelemetry = "0.24"
 opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
