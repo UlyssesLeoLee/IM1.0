@@ -214,13 +214,20 @@ futures = "0.3"
 async-trait = "0.1"
 
 # 数据库
-sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "migrate", "uuid", "chrono", "json"] }
+# 2026-08-26 升级:0.8.6 → 0.9.0(0.8.6 在 cargo 1.98 / rustc 1.98 上 sqlx-macros-core
+# 触发 E0220 "Output not found for F" + "cannot determine resolution for the derive
+# macro Debug";0.8.x 无 0.8.7+ patch,0.9.0 (2026-05-21) 已修复)
+sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "macros", "migrate", "uuid", "chrono", "json"] }
 
 # 缓存 / 键值
 redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
 
 # 事件总线
-async-nats = "0.37"
+# 2026-08-26 升级:0.37.0 → 0.50.0(0.37.0 编译期 STATUS_STACK_BUFFER_OVERRUN
+# 0xc0000409 / 6 MB 内存分配失败;0.50.0 (2026-07-20) stable,默认 features
+# 仍含 ring/jetstream/websockets/kv/object-store,§6 NATS Secret Key 不变,
+# im-core/src/event/publisher.rs 占位代码实装时需核对 0.50 API 命名空间)
+async-nats = "0.50"
 
 # 序列化
 serde = { version = "1", features = ["derive"] }
@@ -252,7 +259,11 @@ tracing-actix-web = "0.7"
 opentelemetry = { version = "0.24" }
 opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
 opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
-prometheus = "0.13"
+# 2026-08-26 升级:0.13.4 → 0.14.0 + default-features = false(0.13.4 default 拉
+# protobuf 2.28.0,后者在 cargo 1.98 codegen 阶段必爆栈;0.14 (2026-03 发布) 仍
+# default = ["protobuf"],故显式 default-features = false;V1 实装 metrics 时再
+# 开 protobuf feature)
+prometheus = { version = "0.14", default-features = false }
 
 # gRPC
 tonic = "0.12"
@@ -267,7 +278,11 @@ dotenvy = "0.15"
 secrecy = "0.8"
 once_cell = "1"
 parking_lot = "0.12"
-dashmap = "6"
+# 2026-08-26 移除:dashmap 6.2.1 (最新 stable 也是 6.2.1) 在 cargo 1.98 / rustc
+# 1.98 上因 Self::Output 推导撞上 IntoFuture::Output / AsyncFnOnce::Output /
+# FnOnce::Output 触发 5×E0223 ambiguous associated type (dashmap 自身
+# src/lib.rs:1267-1303 触发)。IM1.0 仓库 0 处实际调用 (grep 验证),im-core
+# 仅 Cargo.toml 声明,故直接移除依赖;V1+ 若需并发 map 改 parking_lot::Mutex<HashMap>。
 
 # 测试
 testcontainers = "0.23"
@@ -1474,6 +1489,7 @@ initContainers:
 |---|---|---|---|
 | 1.0.0 | 2026-08-23 | Mavis 辅助 | 初版:基于 DetailedDesign + BasicDesign 落地 MVP 实施细节;§1 范围,§2 仓库结构与依赖锁版本,§3 API 实施 Checklist,§4 DB 迁移 6 份 SQL,§5 错误码 Rust 枚举,§6 配置 + K3s Secret,§7 Rust 模块完整 trait 清单,§8 部署 + CI,§9 可观测性 MVP 5 项,§10 测试,§11 安全 Checklist,§12 DoD,§13 风险,§14 关联 |
 | 1.0.1 | 2026-08-23 | Mavis 自审 | **自审修复批次**:① 修 §1.1 多个计数(错误码 20→21 / gRPC 14→22 / env 23→27 / Secret 4→10 / CI 4→3 / REST 24→26 / 4类→5类覆盖);② **修 SQL BUG**:`users.external_identity` `UNIQUE NULLS NOT DISTINCT` 会阻断多个 Guest 共存,改为默认 `UNIQUE`(NULL 视为 distinct);③ 修 §7.5 "im-gateway + im-core 单进程" 误述(实际为独立进程,gRPC 通信,呼应 `BasicDesign §2`);④ 修 §8.2 K3s migrate Job 镜像缺 `sqlx-cli` 的问题(新增 `docker/im-migrate.Dockerfile`);⑤ aux-03 新增 `FRIEND_REQUEST_NOT_FOUND` 错误码(§3.1.4 引用了它);⑥ §3.1.4 好友/拉黑错误码语义明确 + body 必填说明;⑦ §3.2 加 WS 鉴权方式决策(选 auth 帧而非 Day 1 的 query token,补理由);⑧ `BasicDesign §8` 事件总线补 `im.message.edited` / `im.message.reaction_added` / `im.auth.token_rotated`;⑨ `DetailedDesign §5` 加 `GET /readyz`;⑩ §3.1.2 加 Guest 创建会话限制(kind=dm only);⑪ §2.2 Cargo.toml 加 "初始估计" 说明;详细自审报告见 §16 |
+| 1.0.2 | 2026-08-26 | 架构师 (Mavis) | **Day 1 GATE 补签:依赖升级 (cargo 1.98 / rustc 1.98 兼容性 hotfix)**:① §2.2 `sqlx`: 0.8.6→**0.9** (0.8.6 在 cargo 1.98 上 `sqlx-macros-core` E0220 "Output not found for F" + Debug 解析卡死;0.8.x 无 0.8.7+ patch;0.9.0 2026-05-21 已修);② §2.2 `async-nats`: 0.37→**0.50** (0.37.0 编译期 STATUS_STACK_BUFFER_OVERRUN 0xc0000409;0.50.0 2026-07-20 stable;0.50 默认 features 仍含 ring/jetstream/websockets/kv/object-store,§6 NATS Secret Key 不变,publisher.rs 占位代码实装时需核对 0.50 API 命名空间);③ §2.2 `prometheus`: 0.13→**0.14** + `default-features = false` (0.13.4 拉 protobuf 2.28.0 → cargo 1.98 codegen 爆栈;0.14 2026-03 发布;protobuf feature 关闭,V1 实装 metrics 时再开);④ §2.2 `dashmap`: **移除** (6.2.1 即最新 stable,在 cargo 1.98 上 `Self::Output` 推导撞上 IntoFuture/AsyncFnOnce/FnOnce 5×E0223;仓库 0 处实际调用,grep 验证)。**Cargo.lock 重新 resolve, 467 packages 锁到最新兼容版本**。配套 commit: main 0477e1d + 0b08c4a (hotfix 直 commit main,per 2026-08-26 09:05 JST 用户决策)。**Day 1 GATE 验收状态**: `cargo check --workspace --all-targets` EXIT 0;`cargo test --workspace` 待 test target 编译错修复 (在 worktree `feat/day1-build-20260826` 由子代理 `bg_055f3e71` 进行中)。 |
 
 ---
 
