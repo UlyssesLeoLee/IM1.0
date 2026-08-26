@@ -219,7 +219,7 @@ jobs:
     needs: lint
     services:
       postgres:
-        image: postgres:18
+        image: postgres:18.6
         env:
           POSTGRES_USER: im
           POSTGRES_PASSWORD: im
@@ -244,7 +244,7 @@ jobs:
     needs: test-unit
     services:
       postgres:
-        image: postgres:18
+        image: postgres:18.6
         env:
           POSTGRES_USER: im
           POSTGRES_PASSWORD: im
@@ -419,7 +419,7 @@ spec:
     spec:
       containers:
         - name: postgres
-          image: postgres:18
+          image: postgres:18.6.6
           env:
             - name: POSTGRES_USER
               value: im
@@ -560,11 +560,11 @@ spec:
 
 ### 5.3 PostgreSQL
 
-- **版本**:18(2025-09 发布,2026-08 是最新稳定)
-- **CI / 本地**:`postgres:18` Docker image
-- **驱动 crate**:`sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "macros", "migrate"] }`
+- **版本**:18.6(2026-08 锁 patch level,2026-08-26 per Ulysses 指令)
+- **CI / 本地**:`postgres:18.6` Docker image
+- **驱动 crate**:`sqlx = { version = "0.9", features = ["runtime-tokio", "postgres", "macros", "migrate"] }`(2026-08-26 已升 0.9 per Day 1 GATE 补签)
 - **迁移工具**:`sqlx migrate`(无需独立 migration 工具)
-- **生产前升级检查**:PG 18 → 19 时,先在 staging 跑一周
+- **生产前升级检查**:PG 18.6 → 18.7 / 19.x 时,先在 staging 跑一周
 
 ### 5.4 不用 / 暂不引入
 

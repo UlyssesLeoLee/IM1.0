@@ -39,7 +39,7 @@
 - **测试通过**:`cargo test --workspace` 27 tests passed / 0 failed(im_common 8 / im_core 12 / im_protocol 7)。
 - **遗留工程债**:
   - im-core 各 service / repository **未直接引用** aux-02 §F 字段定义(只有 `im-common/src/ids.rs:3` 1 处 + 6 个 migration 注释引用;ImSpec §12.3 要求"im-core 各 service / repository 至少 3 处引用 aux-02",未达成)。
-  - 6 份 SQL migration 未在真 PG 实例上跑过(沙箱无 Docker 拉 postgres:18 验证)。
+  - 6 份 SQL migration 未在真 PG 实例上跑过(2026-08-26 沙箱 Docker Desktop 启了但 Windows↔WSL2 daemon bridge 未就绪,`docker ps` 2 分钟超时;`postgres:18.6` image 锁 tag 已 commit,K3s dev 部署 / 桌面端 daemon bridge 就绪后立即可验证)。
 
 ### 1.2 第一个产品线:IM Core (消息为主)
 
@@ -90,8 +90,8 @@
 | Web 框架 | **actix-web 4.x** | `"4"`(拿 4.x 最新) |
 | WebSocket | **actix-ws 0.3** | MVP 用;后续可换 actix-web-actors |
 | 异步运行时 | tokio | actix 内置 |
-| DB | **PostgreSQL 18** | 2025-09 发布,2026-08 是最新稳定 |
-| DB 驱动 | **sqlx 0.8** | async-friendly;带 migration 工具 |
+| DB | **PostgreSQL 18.6** | 2026-08 锁 patch level(per Ulysses 2026-08-26 指令) |
+| DB 驱动 | **sqlx 0.9** | async-friendly;带 migration 工具(Day 1 GATE 补签 0.8→0.9) |
 | 前端(MVP 后) | Next.js | 已有(详见 README) |
 | 部署 | K3s + Docker | 单节点 dev → 后续多节点 prod |
 | 镜像 | GHCR | 私有 registry |
@@ -104,8 +104,8 @@
 - ❌ LiveKit / Voice(留给 Voice 阶段)
 
 **版本跟随**:
-- Rust:`rust:1-slim` 自动拉最新;CI 用 `dtolnay/rust-toolchain@stable`
-- PostgreSQL:`postgres:18`;升级到 19 时先在 staging 跑一周
+- Rust:`rust:1-slim` 自动拉最新(stable rolling tag,2026-08 系统为 1.98.0);CI 用 `dtolnay/rust-toolchain@stable`
+- PostgreSQL:`postgres:18.6` 锁 patch level(2026-08-26 per Ulysses 指令);升级到 18.7 / 19.x 时先在 staging 跑一周
 - 详细 spec 见 `Platform-Specifics.md` §5
 
 ---

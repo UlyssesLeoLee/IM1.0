@@ -27,7 +27,7 @@ IM 通信软件，适合 AI 和工作场景，便于集成进游戏的通信软�
 
 > 4 个核心决策已落库：(1) MVP 第一个 PR = 消息收发最小闭环 (2) 产品线 = IM Core (3) 平台 = GitHub + GitHub Actions (4) 团队 = 2-3 人极简。等待填：**关键里程碑日期**。
 >
-> **技术栈**：Rust 最新 stable + actix-web 4.x + PostgreSQL 18 + sqlx 0.8 + K3s。
+> **技术栈**：Rust 最新 stable (1.98.0) + actix-web 4.x + PostgreSQL 18.6 + sqlx 0.9 + K3s。
 
 - [项目当前状态 Project-Status](docs/Project-Status.md) —— 4 项已决策 + 1 项待决策 + 技术栈选型 + 简化流程对照 + Day 1 必填文档清单 + 风险登记。
 - [Workflow RACI 矩阵](docs/Workflow-RACI.md) —— 极简团队下 16 Phase 的 R / A / C / I 分配，含 4 个关键 GATE 与升级路径。

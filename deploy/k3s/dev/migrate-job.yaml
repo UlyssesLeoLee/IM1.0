@@ -14,7 +14,7 @@ spec:
       restartPolicy: OnFailure
       initContainers:
         - name: wait-for-db
-          image: postgres:18
+          image: postgres:18.6
           command:
             - sh
             - -c

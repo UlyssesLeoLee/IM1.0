@@ -43,7 +43,7 @@
   ├── frontend/           # Next.js(放后)
   ├── docs/               # 已有
   ├── .github/workflows/  # CI 配置
-  ├── k8s/                # K3s manifests(postgres:18)
+  ├── k8s/                # K3s manifests(postgres:18.6)
   └── README.md
   ```
 - [ ] 写 `Cargo.toml` workspace 根(关键依赖锁版本):
@@ -125,14 +125,14 @@
 
 ### Day 3 - DB 层
 
-- [ ] `im-store` crate(sqlx 0.8 + PostgreSQL 18):
+- [ ] `im-store` crate(sqlx 0.9 + PostgreSQL 18.6):
   - `pub async fn create_user(email, password_hash, nickname) -> UserId`
   - `pub async fn get_user_by_email(email) -> Option<User>`
   - `pub async fn create_message(sender, receiver, payload) -> MessageId`
   - `pub async fn list_messages_between(a, b, before, limit) -> Vec<Message>`
 - [ ] 单测覆盖(覆盖率 ≥ 60%,关键路径 ≥ 80%):
   - 创建 / 查重 / 边界(空表 / 超长 payload)
-- [ ] 集成测:用 `docker compose up -d postgres:18` 跑 migration
+- [ ] 集成测:用 `docker compose up -d postgres:18.6` 跑 migration
 
 **Day 3 GATE**:单测通过 + integration 跑通
 

@@ -73,7 +73,7 @@ flowchart LR
     Sender -->|gRPC| Store
     GW -.->|gRPC| Voice[voice-svc]
     Voice -.->|WebRTC| SFU
-    Store -->|SQL| PG[(PostgreSQL 18)]
+    Store -->|SQL| PG[(PostgreSQL 18.6)]
 ```
 
 #### 1.1.3 API 边界
@@ -1006,7 +1006,7 @@ datasources:
 
 ## 11. 数据库可观测性
 
-### 11.1 PostgreSQL 18 监控
+### 11.1 PostgreSQL 18.6 监控
 
 #### OBS-MET-DB-001 关键指标
 

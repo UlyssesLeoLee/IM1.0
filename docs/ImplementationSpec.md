@@ -745,7 +745,7 @@ sqlx migrate run --database-url $IM_DATABASE_URL
 
 # CI 集成测(临时 DB)
 # 由 GitHub Actions 的 test-integration job 自动执行:
-# 1. 用 testcontainers 拉 postgres:18
+# 1. 用 testcontainers 拉 postgres:18.6
 # 2. export DATABASE_URL=...
 # 3. sqlx migrate run
 # 4. cargo test --workspace --test '*'
@@ -1227,7 +1227,7 @@ spec:
       restartPolicy: OnFailure
       initContainers:
         - name: wait-for-db
-          image: postgres:18
+          image: postgres:18.6
           command: ["sh", "-c", "until pg_isready -h postgres -p 5432; do sleep 2; done"]
       containers:
         - name: migrate
