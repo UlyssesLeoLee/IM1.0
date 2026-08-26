@@ -50,6 +50,6 @@ prometheus = { workspace = true }
 
 [dev-dependencies]
 actix-web = { workspace = true, features = ["macros"] }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 # Day 2 GATE 补签:migration 验证(无 docker daemon 时仅解析 + 语法检查)
 sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "migrate"] }
