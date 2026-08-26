@@ -463,6 +463,19 @@ target/criterion/
 - 顺序:同一会话内 `message_new` 按 `sequence` 升序(由 im-core 单调分配保证,详见 §4.5)
 - `IDEMPOTENCY_CONFLICT` 走成功语义(`ok=true` + `idempotent_replay: true`),客户端无需分支处理
 
+#### 3.2.4 协议冻结声明 [PROTOCOL-FROZEN]
+
+> **冻结时间**:2026-08-26 JST
+> **冻结范围**:WS 12 个帧(双向 8 client + 4 server-only unique) + gRPC 22 个 RPC(§3.3) + REST 26 个端点 / 7 类(§3.1.1-§3.1.7)
+> **冻结标签**:`[PROTOCOL-FROZEN]`(本 commit 标题与 Project-Status §1.1 同步)
+> **变更流程**:任何破坏性变更走 `aux-13 §7` 流程(Slack 公告 7 天 + RFC + Tech Lead + PM review + 6 个月兼容期)
+> **配套 commit**: `feat: Day 2 GATE 补签 + 协议冻结 [PROTOCOL-FROZEN]`(commit hash 见 §15 v1.0.3)
+
+冻结时点对应的实现:
+- WS 帧类型:`auth` / `send_message` / `edit_message` / `recall_message` / `react` / `mark_read` / `typing` / `ping`(client 8)+ `connected` / `ack` / `message_new` / `message_edited` / `message_recalled` / `reaction_added` / `presence_update` / `pong` / `force_disconnect`(server 9 unique)= 17 unique types
+- gRPC 22 RPC:见 §3.3 表(ExchangeToken / AuthenticateGuest / RefreshToken / ValidateAccessToken / LinkAccount / Logout / CreateConversation / ListConversations / GetConversation / SendMessage / ListMessages / EditMessage / RecallMessage / ReactMessage / MarkRead / SendFriendRequest / RespondFriendRequest / BlockUser / ListFriends / PresignMedia / GetMe / UpdateMe)
+- REST 26 端点(7 类):鉴权 5 / 会话 5 / 消息 5 / 好友 4 / 媒体 2 / 用户资料 2 / 健康 3(见 §3.1.1-§3.1.7)
+
 ### 3.3 gRPC 契约(im-gateway ⇄ im-core, package `im.core.v1`)
 
 完整 proto 见 §2.1 中的 `crates/im-proto/proto/core.proto`。**MVP 必实现 14 个 RPC**:

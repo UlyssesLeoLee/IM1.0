@@ -713,6 +713,8 @@ grpcurl -plaintext -d '{"access_token":"eyJ..."}' \
 | gRPC | v1 | package `im.core.v1` | 不兼容变更升 v2,旧版保留 6 个月 |
 
 > **MVP 当前**:WS 帧 `type` 不带 `v1.` 前缀(简化);协议冻结后任何破坏性变更必须升 v2 并保留 6 个月。
+>
+> **冻结状态 [PROTOCOL-FROZEN]**(2026-08-26 JST 生效):WS 12 个帧(双向,详见 §1) + gRPC 22 个 RPC(im.core.v1) + REST 26 个端点(im-gateway 对外) 三套协议已冻结。后续任何破坏性变更走 §7 流程(7 天公告 + RFC + Tech Lead + PM review + 6 个月兼容期)。配套 commit 标题含 `[PROTOCOL-FROZEN]` 标签,变更时解除冻结。
 
 ## 7. 协议冻结与变更流程
 

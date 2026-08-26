@@ -342,3 +342,4 @@ Tech Lead(架构) + DBA(物理模型、性能、安全)。字段新增/删除/�
 |---|---|---|---|
 | 1.0.0 | YYYY-MM-DD | (模板初版) | 初版通用模板 |
 | 1.1.0 | 2026-08-23 | Mavis 辅助 | 填实 IM1.0 全部 14 张表(§F.1-F.14);§D 枚举值与 BasicDesign §4 严格对齐;§E on delete 行为按业务语义细化;§G 合规映射 GDPR/中国个保法/等保/COPPA;§C 字段变更控制补充 INDEX CONCURRENTLY;验收标准加 Core Schema 纯净性校验 |
+| 1.1.1 | 2026-08-26 | 架构师 (Mavis) | **Day 2 GATE 复检**:① 14 张表与 `migrations/0001-0006` SQL 实际定义严格一致(3+2+2+4+2+1=14);② 关键字段抽查 5 个(`users.external_identity` JSONB+UNIQUE / `conversations.metadata` JSONB+chk / `messages.idempotency_key` UNIQUE NULLS NOT DISTINCT / `dm_pairs.user_a < user_b` CHECK / `audit_logs.target_type` ENUM CHECK)SQL 与 aux-02 表对齐;③ 引用方 grep 验证: `crates/im-common/src/ids.rs:3` 1 处 + `migrations/0001-0006` 6 处注释引用 + `crates/im-gateway/src/error.rs:3` 引 aux-03,**im-core 各 service / repository 0 处直接引用 aux-02 §F 字段名**——ImSpec §12.3 验收项"im-core 各 service / repository 至少 3 处引用 aux-02"未达成(已记入 Project-Status §1.1.1 遗留工程债,V1 实装 service 时补) |

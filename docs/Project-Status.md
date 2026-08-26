@@ -32,6 +32,15 @@
   - 消息持久化,刷新后能查历史
 - **预计工期**:~2 周(2-3 人极简团队)
 
+### 1.1.1 Day 2 GATE 补签里程碑 (2026-08-26) [PROTOCOL-FROZEN]
+
+- **协议冻结**:WS 12 个帧 + gRPC 22 个 RPC + REST 26 个端点(7 类)三套协议已冻结(详细见 ImplementationSpec §3.2.4 + aux-13 §6 末段)。
+- **clippy 阻断通过**:`cargo clippy --workspace --all-targets -- -D warnings` EXIT 0(占位模块加 `#![allow(dead_code, unused_imports, unused_variables)]`,V1 实装时移除)。
+- **测试通过**:`cargo test --workspace` 27 tests passed / 0 failed(im_common 8 / im_core 12 / im_protocol 7)。
+- **遗留工程债**:
+  - im-core 各 service / repository **未直接引用** aux-02 §F 字段定义(只有 `im-common/src/ids.rs:3` 1 处 + 6 个 migration 注释引用;ImSpec §12.3 要求"im-core 各 service / repository 至少 3 处引用 aux-02",未达成)。
+  - 6 份 SQL migration 未在真 PG 实例上跑过(沙箱无 Docker 拉 postgres:18 验证)。
+
 ### 1.2 第一个产品线:IM Core (消息为主)
 
 - **优先级**:P0
