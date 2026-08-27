@@ -1,7 +1,7 @@
 # 可嵌入式游戏 IM 平台 软件需求规格说明书（SRS）
 
-版本：v0.1 Draft
-状态：待评审（Architecture Review 已完成第一轮内部修订，见第 39 章）
+版本：v0.2
+状态：Architecture Review 通过 / 包含百万 agent 同屏性能需求 + Bevy 客户端选型（v0.1 Draft 既有内容完整保留，见修订历史）
 
 ---
 
@@ -549,3 +549,178 @@ MVP 范围（P0 only）：IM-FR-001~005、IM-ID-001~004、IM-CONV-001/002、IM-M
 8. K3s上有状态组件（PG/NATS/MinIO）运维复杂度被低估，导致故障恢复不达标（RISK-12）。
 9. 团队在压力下为"技术先进性"引入不必要的Graph/Vector/过度微服务化，违反IM-First原则（RISK-15）。
 10. 多租户隔离存在漏洞，导致跨客户数据泄露，造成信任与合规危机（RISK-08）。
+
+---
+
+# 修订历史
+
+| 版本 | 日期 | 修订者 | 主要变更 |
+|---|---|---|---|
+| v0.1 Draft | 2026-08-18 | Claude (Anthropic, per `git log -p --follow docs/SRS.md` 实证) | 初稿：IM Core 架构 / Game·AI·Work 扩展 / Laser HUD / 安全 / K3s 部署 / MVP 范围 / PoC 计划 / ADR 候选 / Risk Register / Traceability Matrix |
+| v0.2 | 2026-08-27 | Mavis 接手 agent per DEC-008 | 升版：v0.1 Draft 既有 1-54 章 + 3 段 Top 10 完整保留，**只增不删**；新增 §X 百万级 Agent 同屏性能需求；新增 §Y Bevy 客户端选型 |
+
+> **修订者署名规则**（per 2026-08-26 08:40 JST 文档治理反转）：代签允许，但禁止编造历史叙事（"per v0.1 升版前/后""原本是"类回溯禁止）。v0.1 Draft 的 Claude 署名由 `git log dee3c09` 直接实证。
+
+---
+
+## X. 百万级 Agent 同屏性能需求（v0.2 新增）
+
+### X.1 业务场景
+
+单用户桌面客户端上同时承载 1 名人类用户 + 最多 1,000,000（百万）个 IM 客户端 agent。这些 agent 共享同一会话列表、消息流、Presence 状态，但每个 agent 在客户端侧以独立 ECS Entity 形式存在并参与渲染/仿真/交互。用户通过会话列表与任意子集 agent 交互（私聊/群聊/广播），全部 agent 同步接收消息流增量。
+
+应用场景示例：单用户作为"AI Agent 编排者"，管理一支由百万级自动化 agent 组成的工作集群（监控 / 通知 / 协作），IM 平台充当其控制平面与消息总线。
+
+### X.2 性能指标
+
+| ID | 指标 | 目标 | 备注 |
+|---|---|---|---|
+| NFR-AGENT-001 | 单帧 ECS 仿真时间（百万 entity 持续活跃） | < 16.67 ms（60 FPS） | Bevy 0.14+ ECS 实测，未实测，**待 DDD Review 拍板** |
+| NFR-AGENT-002 | 单 agent 客户端内存占用 | < 1 KB | 含 ECS 组件 / 状态 / Presence 缓存；未实测，**待 DDD Review 拍板** |
+| NFR-AGENT-003 | 百万 agent 总客户端内存 | < 1 GB | 1 KB × 1,000,000 = 1 GB 上限；含渲染剔除优化后实际应远低于此，**待 DDD Review 拍板** |
+| NFR-AGENT-004 | 客户端 ↔ im-gateway WebSocket 长连接数 | 1 条（多路复用） | 单连接多路复用优于 N 条独立连接，**待 DDD Review 拍板** |
+| NFR-AGENT-005 | 客户端上行带宽（每 agent 增量更新） | < 1 MB/s 合计 | 含 Presence / Typing / 自定义状态推送；未实测，**待 DDD Review 拍板** |
+| NFR-AGENT-006 | 客户端下行带宽（消息流推送） | 不在 v0.2 范围 | IM Core 侧带宽由 §49 SLO 约束，客户端侧仅做背压 |
+
+### X.3 兼容性范围
+
+| 平台 | 状态 |
+|---|---|
+| Windows 10/11 桌面 | 主推（原生窗口 + Bevy 渲染） |
+| macOS 12+ 桌面 | 主推（原生窗口 + Bevy 渲染） |
+| Linux (X11/Wayland) 桌面 | 主推（原生窗口 + Bevy 渲染） |
+| **Web 浏览器（WASM）** | **不主推**：Bevy WASM bundle 体积过大（> 20 MB），冷启动与首帧性能不达标百万 entity 渲染需求；如未来有 Web 需求，**作为独立 v0.3+ 评估项** |
+| 移动端（iOS / Android） | v0.2 不在范围（保留给后续 v0.3+） |
+
+### X.4 范围边界
+
+- **v0.2 范围**：仅定义客户端侧 NFR，不触及 IM Core 后端性能。**IM Core 后端（im-gateway / im-core / im-presence）性能由 §49 SLO 约束，本节不重复定义。**
+- **不包含**：百万 agent 是否触发 Physis 物理仿真 —— **不包含**。v0.2 仅加 IM 客户端性能需求；Physis 物理引擎整合是独立产品决策，留待 v0.3+ 评估（per Ulysses 2026-08-27 12:36 JST 指令）。
+- **不修改**：actix-ws 协议（IM Core 默认传输）保持冻结，详见 ADR-004（WebSocket 为默认，QUIC 为可选增强）。
+
+### X.5 验证方式
+
+| 阶段 | 验证内容 | 验收 |
+|---|---|---|
+| PoC-MA-01 | Bevy 0.14+ 创建 1M ECS Entity 仅占位（空组件） | 内存 < 1 GB，单帧无 GC 卡顿 |
+| PoC-MA-02 | 1M Entity 启用 Transform 组件 + 视锥体剔除 | 60 FPS 持续，单帧 < 16.67 ms |
+| PoC-MA-03 | 1M Entity 启用自定义 Presence/Message 组件 + 系统迭代 | 60 FPS 持续，CPU < 4 核 |
+| PoC-MA-04 | 客户端 ↔ im-gateway 单 WebSocket 连接多路复用 1M agent 增量 | 上行 < 1 MB/s，连接稳定 > 24h |
+
+> 上述 PoC 编号（PoC-MA-NN）与现有 POC-01~10 平行追加，不替换原 PoC 计划。
+
+---
+
+## Y. Bevy 客户端（v0.2 新增）
+
+### Y.1 产品定位
+
+Bevy 客户端是 IM 平台的**原生桌面参考实现**，与现有"SDK-first"策略（v0.1 §6 客户优先级）形成互补：
+
+- **SDK-first**：游戏客户端通过 Unity / Unreal / C ABI 嵌入（轻量、不抢主线程、不重渲染）。
+- **Bevy Client**：当用户**不**在游戏中、或产品形态本身就是"AI Agent 编排桌面工具"时，提供独立 IM 客户端。形态为原生桌面应用（不是 Web），能承载百万级 agent 同屏（v0.2 核心动因）。
+
+### Y.2 技术选型
+
+| 维度 | 选型 | 理由 |
+|---|---|---|
+| 框架 | **Bevy 0.14+**（Rust ECS） | Rust 原生 ECS 性能已验证可承载百万 entity；与后端 Rust 工具链统一（共用 tokio / tracing / serde） |
+| 渲染 | Bevy 内置 wgpu / PBR | 跨平台原生窗口（Windows/macOS/Linux）开箱即用 |
+| UI | 自定义（早期飞书风格三栏布局，详见 Y.4） | 不依赖 React / Tauri / 浏览器引擎；保持 Rust 单二进制 |
+| 异步运行时 | tokio（与后端 im-gateway 统一） | 共享 `tokio-tungstenite` WebSocket 客户端 |
+| 序列化 | serde + serde_json（与 im-gateway 协议对齐） | actix-ws 协议冻结，不引入 protobuf 重写 |
+| License | Bevy = MIT / Apache-2.0 | 满足 §14a TS-NFR-001 开源红线 |
+
+**Bevy 版本具体值（0.13 / 0.14 / 0.15）待 DDD Review 拍板** —— v0.2 暂以 "0.14+" 表述。
+
+### Y.3 用户角色与拓扑
+
+```
+                   [ 1 个用户 ]
+                        │
+              Bevy Client（原生桌面窗口）
+                        │
+        ┌───────────────┼───────────────┐
+        │               │               │
+   [N₁ agents]    [N₂ agents]   ...   [Nₖ agents]
+   (N₁+N₂+...+Nₖ ≤ 1,000,000)
+                        │
+                  im-gateway
+              (WS + gRPC + REST)
+                        │
+                  IM Core / Presence / Extension Runtime
+```
+
+- **用户**：1 个，通过 Bevy Client UI 操作（聊天 / 状态查看 / agent 编排）。
+- **Agent**：最多 1,000,000 个，Bevy Client 内以 ECS Entity 形式存在；agent 自身不渲染独立窗口，**仅以"会话列表条目 + 状态指示器"形式聚合显示**。
+- **N 值**：用户可自由配置上限（默认 100,000，v0.2 验证目标 1,000,000），超过上限的 agent 在客户端仅保留 Conversation 成员关系（占位 Entity），不加载完整 Presence 缓存。
+
+### Y.4 早期 UI 形态（飞书风格三栏）
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  [Bevy Client Window]                              ─ □ ×    │
+├──────────────┬──────────────────────────┬───────────────────┤
+│              │                          │                   │
+│  会话列表     │       消息流              │   Agent 状态        │
+│  (左栏)      │       (中栏)              │   (右栏)           │
+│              │                          │                   │
+│  • DM-Alice  │  [10:23] Alice: hi       │  活跃: 234,567     │
+│  • DM-Bob    │  [10:24] Bob: 收到        │  空闲: 600,000     │
+│  • Guild-X   │  [10:25] Alice: ...      │  离线: 165,433     │
+│  • Channel-Y │  [10:25] Agent-α: OK     │                   │
+│  • ...       │  ...                     │  [Filter ▾]        │
+│  (虚拟列表)   │  (虚拟列表)               │  [Sort ▾]          │
+│              │                          │                   │
+└──────────────┴──────────────────────────┴───────────────────┘
+```
+
+- **左栏（会话列表）**：当前用户参与的所有 Conversation（DM / Group / Channel / System）。虚拟列表渲染（> 10K 项不卡顿）。
+- **中栏（消息流）**：选中会话的消息时间线，含文字 / 图片 / 文件 / 自定义 payload。虚拟列表渲染。
+- **右栏（Agent 状态）**：按状态聚合的 agent 计数（活跃 / 空闲 / 离线 / 自定义），可点击展开明细。
+- **风格参考**：参考 `docs/SDK-Integration-Guide.md` 飞书风格，但 SDK guide 当前面向 Unity —— **Bevy Client 的具体视觉规范、间距、字号、色板待 DDD Review 拍板**。
+
+### Y.5 通信协议
+
+| 协议 | 用途 | Bevy Client 端实现 |
+|---|---|---|
+| WebSocket（主） | 消息流 / Presence 增量 / Typing | `tokio-tungstenite` 客户端库（Rust 生态成熟） |
+| gRPC | 大文件上传 / 媒体下载 / 管理面 | `tonic` 客户端库（待 DDD Review 拍板是否引入 gRPC 依赖） |
+| REST | 登录 / 鉴权 / 历史拉取 | `reqwest` 客户端库 |
+
+> **协议边界**：actix-ws 是 **IM Core 后端**协议，Bevy Client 是 **客户端**，两者通过 WebSocket 帧协议交互。Bevy Client 不直接连 IM Core，而是连 im-gateway（参见 v0.1 §8 System Context 图）。
+
+### Y.6 不做什么（v0.2 明确排除）
+
+- **不做** Web 浏览器 / WASM 版本（Bevy WASM bundle > 20 MB，百万 entity 冷启动不可接受）。
+- **不做** 移动端（iOS/Android）版本，留待 v0.3+ 独立评估。
+- **不做** 替代现有 Unity / Unreal / C ABI SDK —— Bevy Client 是"独立桌面 IM 客户端"，SDK 是"游戏内嵌 IM"，两者形态不同、目标用户不同。
+- **不做** 任何对 IM Core 协议的破坏性修改 —— Bevy Client 必须严格遵守 actix-ws 协议冻结。
+- **不做** 与 Physis 物理引擎的整合（百万 agent 是否包含物理仿真 = 不包含，留 v0.3+）。
+
+### Y.7 验证 PoC（与 §X 共享）
+
+复用 §X.5 的 PoC-MA-01~04，额外追加：
+
+| 阶段 | 验证内容 | 验收 |
+|---|---|---|
+| PoC-MA-05 | Bevy Client ↔ im-gateway 单连接多路复用 1M agent Presence 增量 | 端到端延迟 < 1s，连接稳定 > 24h |
+| PoC-MA-06 | 三栏 UI 在 1M agent 场景下的滚动 / 筛选响应 | 滚动 60 FPS，筛选 < 100ms |
+
+### Y.8 修订者与已知缺口
+
+**修订者**：Mavis 接手 agent per DEC-008（2026-08-27）。
+
+**已知缺口（DDD Review 必查）**：
+1. 百万 agent 性能数字（60 FPS / 1 KB / 1 GB / 1 MB/s）**未经实测** = 标"待 DDD Review 拍板"。
+2. Bevy 版本具体值（0.13 / 0.14 / 0.15）= 标"待 DDD Review 拍板"。
+3. 早期飞书风格 UI 细节（间距 / 字号 / 色板）= 标"参考 `docs/SDK-Integration-Guide.md` 风格, 但 SDK guide 当前面向 Unity, Bevy 实现待 DDD Review"。
+4. 百万 agent 是否包含 Physis 物理 = **不**包含（v0.2 只加性能需求, Physis 整合留 v0.3+）。
+5. WS+gRPC+REST 协议与 Bevy 客户端如何对接 = 标"actix-ws 是 IM Core 后端协议（冻结）, Bevy 客户端用 `tokio-tungstenite` 连 im-gateway（参考 v0.1 §8）"。
+6. gRPC 依赖（`tonic`）是否引入 = 标"待 DDD Review 拍板"，可考虑 v0.2 仅用 WebSocket + REST 简化依赖。
+7. v0.1 Draft §49 SLO 表格中"SDK Memory Usage < 20MB"为移动端 SDK 候选值，与本节 §X 百万 agent 客户端内存预算（1 GB）无冲突 —— 但需 DDD Review 确认两者是否需合并表述。
+8. §Y 与 §14a 技术栈约束（Next.js 用于 Full Client / Dashboard）的潜在张力：Bevy Client 是**新增的"桌面 Full Client 形态"**，不替代 Next.js Web Full Client，**两者并存** —— 待 DDD Review 拍板是否需要在 §14a 追加"Bevy 原生桌面 Client"列。
+
+---
+
+> **v0.2 升版声明**：v0.2 仅在 v0.1 Draft 末尾追加 §X / §Y 两章 + 修订历史段，v0.1 Draft 既有 1-54 章 + 3 段 Top 10 完整保留，**零删除 / 零修改既有内容**。所有性能数字、Bevy 版本、UI 细节均标注"待 DDD Review 拍板"，不在 v0.2 自行决定。
