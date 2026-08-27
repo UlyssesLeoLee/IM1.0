@@ -1,7 +1,9 @@
 # 可嵌入式游戏 IM 平台 详细设计书（Detailed Design）
 
-版本：v0.1 Draft ｜ 范围：**MVP**（承接 `docs/BasicDesign.md`）
-本文档面向编码落地：完整 REST/WebSocket 协议、内部 gRPC 契约、错误码表、数据库迁移脚本骨架、模块级 Rust 接口签名、状态机定义、配置项清单。不重复 BasicDesign 已给出的架构图与拆分依据，只做细化。
+版本:v0.2(2026-08-27 升版,承接 v0.1 Draft) | 范围:**MVP**(承接 `docs/BasicDesign.md`)
+本文档面向编码落地:完整 REST/WebSocket 协议、内部 gRPC 契约、错误码表、数据库迁移脚本骨架、模块级 Rust 接口签名、状态机定义、配置项清单。不重复 BasicDesign 已给出的架构图与拆分依据,只做细化。
+
+**v0.2 变更**:新增 §X「Bevy 客户端 ECS 模块设计」(草案,待 DDD Review)。v0.1 Draft §1-§12 内容**不**改动。WS / gRPC / REST 协议细节沿用 v0.1 Draft。
 
 ---
 
@@ -631,4 +633,209 @@ impl AppError {
 
 - WS帧序列化格式（JSON vs Protobuf二进制）：ADR-014，Candidate暂定JSON。
 - sqlx迁移双向脚本 vs 单向脚本约定：交由实现时选定的工具链版本决定。
-- Rate Limit / Token TTL / 撤回时间窗的具体数值：均为Candidate，压测与产品确认后回填。
+- Rate Limit / Token TTL / 撤回时间窗的具体数值:均为Candidate,压测与产品确认后回填。
+
+---
+
+## X. Bevy 客户端 ECS 模块设计(草案,待 DDD Review)
+
+> **本节性质**:`v0.2` 新增章节,全部内容为草案,待 DDD Review 拍板。`v0.1 Draft` §1-§12 既有内容**不**改动;WS 协议细节(§3)、gRPC 契约(§2)、REST API(§5)由 v0.1 Draft 已覆盖,本节**不**重复展开。
+> **范围边界**:仅定义 Bevy ECS 侧的 Component / System / Resource 草案与文件结构草案。实际新增 `crates/bevy-client` crate 留 v0.3+ 实施(`Cargo.toml` workspace 当前不含此 crate,本节不修改 `Cargo.toml`)。Physis 物理引擎整合**不**包含,留 v0.3+ 议。
+
+### X.1 ECS Component 草案
+
+```rust
+// 草案,字段命名/类型/数量待 DDD Review 拍板
+use bevy::prelude::*;
+use std::collections::VecDeque;
+use std::time::Instant;
+
+#[derive(Component)]
+pub struct AgentId(pub u64);
+
+#[derive(Component)]
+pub struct AgentStatus {
+    pub online: bool,
+    pub last_active: Instant,
+}
+
+#[derive(Component)]
+pub struct AgentPosition {
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Component, Default)]
+pub struct MessageBuffer {
+    pub messages: VecDeque<ImMessage>,
+}
+
+// ImMessage 类型定义:草案
+// 真实结构应与 im-gateway WS §3.2 `message_new` 帧 `message` 字段对齐,
+// v0.2 暂以占位类型表达,字段展开留 v0.3+ 实施。
+#[derive(Debug, Clone)]
+pub struct ImMessage {
+    pub id: String,
+    pub conversation_id: String,
+    pub sequence: i64,
+    pub sender_id: Option<String>,
+    pub kind: String,
+    pub content: serde_json::Value,
+    pub created_at: String,
+}
+```
+
+**草案待 DDD Review 拍板项**:
+- `AgentId(u64)` vs `AgentId(String)`(string 形式更便于与 im-core UUID 对齐,u64 内存更紧凑)——待 DDD Review 拍板
+- `AgentPosition` 仅 2D 坐标,是否需要 z / rotation / scale 表达 3D 场景?——待 DDD Review 拍板
+- `MessageBuffer.messages` 是否分桶(已读 / 未读 / 系统消息)?——待 DDD Review 拍板
+- `AgentStatus.last_active` 持久化策略(Valkey 缓存 vs 内存)?——待 DDD Review 拍板
+
+### X.2 ECS System 草案
+
+| System | 输入 | 输出 | 触发时机 | 草案备注 |
+|---|---|---|---|---|
+| `agent_spawn_system` | `WsConnection`(WS 收到 agent 列表帧) | 创建 Entity + 挂 `AgentId` / `AgentStatus` / `AgentPosition` / `MessageBuffer` | WS 收到 `agent_list` 帧(协议细节见 §3,本节**不**展开) | 草案,实际可能拆为 `agent_spawn_from_initial` + `agent_spawn_from_incremental` |
+| `agent_message_system` | `WsConnection`(WS `message_new` 帧) + `AgentRegistry` | 找到目标 agent Entity,`MessageBuffer.push` | 每次 WS `message_new` 帧到达 | 草案,反序列化与错误处理需 v0.3+ 细化 |
+| `agent_render_system` | 所有含 `AgentPosition` + `AgentStatus` 的 Entity | 渲染输出(Bevy 2D sprite / 3D mesh,草案) | 每帧,FixedPostUpdate 或 Update stage | 草案,具体渲染管线(Bevy 2D vs 3D vs 自定义)留 v0.3+ 拍板 |
+| `ui_chat_panel_system` | `UiState.selected_agent_id` + `AgentRegistry` + 各 Entity 的 `MessageBuffer` | 渲染左侧 agent 列表 + 中间消息流(早期飞书风格) | 每帧,Update stage | 草案,UI 框架选择(bevy_egui / 自定义 Text2d / bevy_ui)留 v0.3+ 拍板 |
+| `ws_heartbeat_system` | `WsConnection` | 每 30s 发送 `{ "type": "ping", "ts": ... }` | Timer,FixedUpdate 1s tick | 草案,30s 间隔与 §3 WS 协议一致;具体 timer 资源 vs Timer Component 待 v0.3+ 细化 |
+
+**草案待 DDD Review 拍板项**:
+- System 切片粒度(草案 5 个,实际可能拆分更细,例如 `agent_message_system` 拆为 deserialize / route / append 三段)——待 DDD Review 拍板
+- `agent_render_system` 用 Bevy 内置 2D 渲染 vs 自定义 WGSL shader——待 DDD Review 拍板
+- `ui_chat_panel_system` 选型(bevy_egui 快速原型 vs 自定义 Text2d 精细控制)——待 DDD Review 拍板
+
+### X.3 ECS Resource 草案
+
+```rust
+// 草案,与 §3 WS 协议对接细节待 v0.3+ 实施
+use bevy::prelude::*;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::mpsc;  // 草案,具体通道库待 v0.3+ 拍板
+
+#[derive(Resource)]
+pub struct WsConnection {
+    // 草案:WS 客户端抽象(具体实现用 tokio-tungstenite vs actix-ws vs 其他 待 v0.3+ 拍板)
+    pub inbound_rx: mpsc::UnboundedReceiver<WsFrame>,
+    pub outbound_tx: mpsc::UnboundedSender<WsFrame>,
+    // 连接状态机:草案(Connecting / Authenticating / Open / Reconnecting / Closed)
+    pub state: WsConnState,
+}
+
+#[derive(Resource, Default)]
+pub struct AgentRegistry {
+    pub agent_id_to_entity: HashMap<u64, Entity>,
+    // 草案:是否需要反向索引 entity -> agent_id?——待 DDD Review 拍板
+}
+
+#[derive(Resource, Default)]
+pub struct UiState {
+    pub selected_agent_id: Option<u64>,
+    // 草案:会话状态(打开的 chat panel / 输入框草稿 / 滚动位置)——待 DDD Review 拍板
+    pub conversation_state: HashMap<u64, ConversationPanelState>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConversationPanelState {
+    pub draft: String,
+    pub scroll_offset: f32,
+}
+
+// WsFrame:占位类型,实际定义应对齐 §3.1/§3.2 帧结构,
+// v0.2 不展开,留 v0.3+ 实施。
+#[derive(Debug, Clone)]
+pub struct WsFrame(pub serde_json::Value);
+
+#[derive(Debug, Clone)]
+pub enum WsConnState {
+    Connecting,
+    Authenticating,
+    Open,
+    Reconnecting { attempt: u32 },
+    Closed,
+}
+```
+
+**草案待 DDD Review 拍板项**:
+- `WsConnection` 用 tokio-tungstenite(草案倾向)还是 actix-ws(与 §9.4 `im-gateway` 端 actix_ws 对称)?——待 DDD Review 拍板
+- `AgentRegistry` 是否独立 Resource 还是挂 World-level metadata?——待 DDD Review 拍板
+- `UiState.conversation_state` HashMap 选型 vs LRU cache(1M agent 内存预算)——待 DDD Review 拍板
+
+### X.4 性能预算(草案,Bevy 默认 2D 渲染,实测数据待 DDD Review 拍板)
+
+> **未经实测,所有数字为草案,仅作 v0.3+ 实施时的目标参考。** 实际压测数据需在 v0.3+ 实施后回填,届时同步 SRS §49 SLO 候选表。
+
+**目标规模**:1M agent entity @ 60 FPS(每帧 16.67ms 预算)
+
+| 子系统 | 单帧预算(草案) | 草案备注 |
+|---|---|---|
+| spawn / despawn(`agent_spawn_system` 等) | 0.5ms | 草案,实际可能按需 batch |
+| 消息分发(`agent_message_system`) | 0.5ms | 草案,HashMap 路由 O(1) |
+| 渲染(`agent_render_system`) | 8ms | 草案,基于 Bevy 默认 2D 渲染管线的常见比例 |
+| UI(`ui_chat_panel_system`) | 2ms | 草案,假设只渲染当前选中 agent 的消息流 |
+| 心跳(`ws_heartbeat_system`) | 0.1ms | 草案,Timer-only 系统,极轻量 |
+| **合计** | **11.1ms / 16.67ms** | 草案,留 5.57ms 余量给 GC / 调度 / WS I/O |
+
+**内存预算**(草案):
+- 单 agent Component 内存占用 ≈ 200 字节(`AgentId` 8B + `AgentStatus` ~32B + `AgentPosition` 8B + `MessageBuffer` ~152B 含 10 条消息缓冲)
+- 1M agent × 200B = 200 MB(远低于 SRS 1 GB 预算,草案,留余量给 system overhead / 资源加载)
+
+**草案待 DDD Review 拍板项**:
+- 16.67ms 60 FPS 目标 vs 30 FPS(游戏客户端常见 30 FPS 更稳)?——待 DDD Review 拍板
+- 200 字节/agent 估算(实际取决于 `MessageBuffer` 容量与 `ImMessage` 字段大小)?——待 DDD Review 拍板
+- 8ms render 预算(Bevy 2D vs 3D 差距大)?——待 DDD Review 拍板
+
+### X.5 文件结构草案
+
+> **本节为 v0.2 文档草案定义,实际新增 `crates/bevy-client` crate 留 v0.3+ 实施**。当前 8 crate workspace 不含此 crate,本节**不**修改 `Cargo.toml`。
+
+```
+crates/bevy-client/                    # 草案路径,留 v0.3+ 实施
+├── src/
+│   ├── main.rs                        # Bevy App 入口
+│   ├── components/                    # Component 定义(见 X.1)
+│   ├── systems/                       # System 实现(见 X.2)
+│   ├── resources/                     # Resource 定义(见 X.3)
+│   ├── ui/                            # 早期飞书风格 UI(草案)
+│   └── ws/                            # tokio-tungstenite 客户端(草案,见 X.3 拍板项)
+├── Cargo.toml                         # 草案,workspace member 留 v0.3+ 实施
+└── tests/                             # 草案,集成测试留 v0.3+ 落地
+```
+
+**草案待 DDD Review 拍板项**:
+- `crates/bevy-client` 路径与命名(是否拆为 `bevy-client` + `bevy-client-ui` 两 crate)?——待 DDD Review 拍板
+- 与 im-gateway WS 协议对接细节(草案参考 §3,客户端实现留 v0.3+)——已知缺口
+- 早期飞书风格 UI 的具体表现(颜色 / 字体 / 间距 / 头像布局)?——待 DDD Review 拍板
+
+### X.6 已知缺口(必查项,DDD Review 必看)
+
+> 以下项均为 v0.2 显式未覆盖的范围,缺标比错标安全——**不**自行脑补,留 DDD Review 拍板或 v0.3+ 实施。
+
+1. **Component 字段草案**:`AgentId` / `AgentStatus` / `AgentPosition` / `MessageBuffer` 字段为草案,未与 im-gateway 真实协议对齐,DDD Review 必查。
+2. **System 切片草案**:5 个 System 粒度为草案,实际可能拆分更细(例如 `agent_message_system` 拆 deserialize / route / append)。
+3. **性能数字草案**:16.67ms / 200 MB / 8ms render 全部未经实测,仅基于 Bevy 默认 2D 渲染 + 1M entity 粗算;实测数据需 v0.3+ 实施后回填。
+4. **`crates/bevy-client` 路径草案**:当前 8 crate workspace 不含此 crate,**v0.2 仅在文档定义**,实际新增 crate 留 v0.3+ 实施。本节**不**修改 `Cargo.toml`。
+5. **与 im-gateway WS 协议对接细节**:§3 v0.1 Draft 已覆盖完整 WS 帧定义;**Bevy 客户端侧**的反序列化、错误处理、重连策略 v0.2 暂以 `WsFrame(serde_json::Value)` 占位,实际实现留 v0.3+。
+6. **Physis 物理引擎整合**:**不**包含在 v0.2 范围,Physis 整合方案留 v0.3+ 议(避免在 ECS 草案未定型时混入物理集成复杂度)。
+7. **UI 框架选型**:bevy_egui / 自定义 Text2d / bevy_ui 三选一,草案倾向 bevy_egui(快速原型),DDD Review 必查。
+8. **WS 客户端库选型**:tokio-tungstenite(草案倾向) vs actix-ws,需考虑与 §9.4 `im-gateway` 端 actix_ws 的对称性,DDD Review 必查。
+9. **1M entity 渲染管线**:Bevy 默认 2D 渲染 vs 自定义 WGSL shader vs Bevy 3D 场景图,DDD Review 必查。
+10. **错误处理边界**:ECS System 内 WS 错误 / 反序列化错误的处理策略(回滚 Entity / 标记 dirty / 静默丢弃 + 日志),草案未覆盖,DDD Review 必查。
+
+### X.7 与上游文档的追溯关系(草案)
+
+> 草案追溯表,非最终值,DDD Review 拍板后固化。
+
+| 本节章节 | 内容 | 对应 SRS 需求 ID(草案) | 对应 BasicDesign 章节(草案) | 对应 v0.1 Draft 章节 |
+|---|---|---|---|---|
+| X.1 ECS Component | agent / message 状态表达 | (新增,需求 ID 待 DDD Review 分配) | §12(SDK 客户端架构,草案) | §3.2 `message_new` 帧,§4 Message JSON Schema |
+| X.2 ECS System | spawn / message / render / UI / heartbeat | IM-FR-001(实时消息), IM-PRES-002(typing), NET-FR-001(心跳) | §12 | §3.1 客户端帧(ping/send_message 等),§9.4 WsSession |
+| X.3 ECS Resource | WsConnection / AgentRegistry / UiState | IM-FR-005(增量同步,与 AgentRegistry 对接), NET-FR-001(WS 连接) | §12 | §3 WS 协议,§9.4 WsSession |
+| X.4 性能预算 | 1M entity @ 60 FPS | (新增,SLO 需求 ID 待 DDD Review 分配) | §15 Observability | §10.3 可观测性配置 |
+| X.5 文件结构 | `crates/bevy-client` | — | §12 | §1 代码仓库结构(v0.1 Draft 8 crate 不含此 crate,v0.2 草案新增) |
+
+**v0.2 修订历史**:
+- 2026-08-27:Mavis 接手 agent per DEC-008 新增 §X Bevy 客户端 ECS 模块设计草案(只增不删 v0.1 Draft §1-§12)。修订者:Mavis 接手 agent per DEC-008。
+
