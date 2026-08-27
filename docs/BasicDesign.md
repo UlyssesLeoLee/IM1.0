@@ -1,10 +1,19 @@
 # 可嵌入式游戏 IM 平台 基本设计书（Basic Design）
 
-版本：v0.1 Draft ｜ 范围：**MVP**（对应 `docs/SRS.md` 第45章 MVP Scope）
+版本：v0.2 ｜ 范围：**MVP**（对应 `docs/SRS.md` 第45章 MVP Scope）
 上游依据：`docs/SRS.md`（产品/需求）、`docs/LiveKit-Voice-Subsystem.md`（语音，V1起纳入，本版本仅预留接口边界）
 技术栈基线（不可变更）：Rust（主）+ Python（仅AI扩展，MVP不启用）+ Next.js（Web Dashboard）+ K3s + PostgreSQL + Valkey + NATS JetStream + MinIO，全部依赖须开源可商用。
 
 本文档面向详细设计与编码阶段，粒度到：服务边界、进程内模块、数据表结构、API 契约草案、消息队列 Topic、部署拓扑、配置项。不包含语音子系统的详细设计（见 LiveKit 文档，其详细设计另行输出）。
+
+---
+
+## 修订历史
+
+| 版本 | 日期 | 修订者 | 摘要 |
+|---|---|---|---|
+| v0.1 Draft | （v0.1 Draft 既有） | — | 初稿（v0.1 Draft 既有内容，本版本未改动） |
+| v0.2 | 2026-08-27 | 修订者: Mavis 接手 agent per DEC-008 | 新增 §X 客户端技术选型（Bevy 0.14 百万 agent 仿真客户端）+ §Y ECS 渲染层架构 + §Z 百万 agent IM 消息数据流。**只增不删** v0.1 Draft 既有内容。 |
 
 ---
 
@@ -461,3 +470,126 @@ impl AppConfig {
 - 本设计未在 `conversations`/`messages` 表中引入任何游戏专有字段，符合 SRS `IM-CONV-002`。
 - Extension Runtime 骨架已预留事件订阅隔离机制，符合 `EXT-FR-002`，但具体沙箱强度（进程级/WASM）留待 ADR-005 决议后在详细设计中落地，本设计不预先假设。
 - Voice Control Service（LiveKit文档）与本设计的 im-core 共享租户/用户模型，但作为独立服务不在本版本部署清单中（V1加入），本设计的 `users`/`environments` 表结构已预留被语音子系统复用的兼容性（无需修改即可被引用）。
+
+---
+
+## X. 客户端技术选型：Next.js → Bevy 0.14（百万 agent 仿真客户端新增）
+
+> 本节为 v0.2 新增。v0.1 Draft §开头"技术栈基线"行（`Next.js (Web Dashboard) + K3s + PostgreSQL + Valkey + NATS JetStream + MinIO`）**保持原样不动**。本节只增补说明 Bevy 0.14 作为百万 agent 仿真客户端，**不**改写原"技术栈基线"行。
+
+### X.1 选型结论
+
+- **新增客户端**：Bevy 0.14（Rust ECS 游戏引擎，原生 .exe / .app）。
+- **保留客户端**：Next.js Web Dashboard = 运营控制台 / Full Client Web 版（v0.1 Draft 既有）。
+
+### X.2 分工（明确边界）
+
+| 客户端 | 角色 | 形态 | 目标用户 |
+|---|---|---|---|
+| **Next.js Web Dashboard** | 运营控制台 / Full Client Web 版（管理类功能） | 浏览器 SPA | 运营人员、文本优先的 Full Client 用户 |
+| **Bevy 0.14 原生客户端** | 百万 agent 实时仿真客户端 | 原生 .exe / .app（**不**做 WASM 浏览器版） | 仿真场景下需要承载百万 entity 的玩家 / 运营演示 |
+
+### X.3 选型理由
+
+- **Bevy ECS 支持百万 entity 实时仿真**（@60 FPS，**未经实测，性能数字待 DDD Review 拍板**）。
+- 原生 Rust 栈与 im-core/im-gateway（Rust）一致，**共享 im-common crate**（Token 解析、协议帧解码、错误类型），降低跨语言边界开销。
+- Bevy 0.14 生态稳定、Plugin 体系成熟（rendering / UI / asset / hierarchy 等子 crate 完整）。
+
+### X.4 显式不做
+
+- **不**做 Bevy WASM 浏览器版本：Bevy 官方主推原生 .exe / .app；WASM bundle 体积过大，浏览器侧百万 entity 性能不可控。
+- **不**改写 v0.1 Draft §开头"技术栈基线"行：Bevy 客户端是**新增维度**（玩家侧仿真终端），不是替代 Dashboard 的基础设施。
+
+### X.5 已知缺口（DDD Review 必查）
+
+- Bevy 0.14 vs Bevy 0.13 / 0.15 版本选型 = **待 DDD Review 拍板**（决策记录在 `git log -p --follow` 中由 DDD Review 评审后入档）。
+- 百万 agent @60 FPS 性能数字 = **未经实测**，需 DDD Review 决定是否在 v0.3 安排 Benchmark POC。
+- Bevy 客户端的 Project Status / Roadmap = **另议, 留 v0.3+**。
+
+---
+
+## Y. 架构补充：ECS 渲染层（百万 agent 仿真客户端）
+
+> 本节为 v0.2 新增，**不**修改 v0.1 Draft §2 "系统总览"既有内容。架构图（ASCII）作为补充视图追加在此。
+
+### Y.1 Bevy 客户端架构视图
+
+```
+[Bevy 0.14 客户端（v0.2 新增）]
+├── Bevy ECS 仿真层
+│   ├── Component: AgentId / Position / Status / MessageBuffer（草案, 待 DDD Review 拍板）
+│   ├── Resource:  IM 消息流（接收自 im-gateway）
+│   └── System:    渲染 / 消息处理 / 状态机（每帧更新）
+├── 渲染层（bevy_render）
+│   └── 2D / 3D 场景绘制、相机、光照
+├── UI 层（bevy_ui, 早期飞书风格）
+│   ├── 会话列表、消息列表、输入栏
+│   └── 与 Next.js Dashboard UI 风格不强制一致
+└── 通信层
+    ├── tokio-tungstenite WS 客户端（actix-ws 后端, Bevy 侧用 tokio-tungstenite）
+    └── tonic gRPC 客户端（控制面, MVP 主要为 WS）
+        │
+        ▼ 通过 im-gateway 与 im-core 通信
+[im-gateway] → [im-core]（v0.1 Draft §2 既有, 本节不重复）
+```
+
+### Y.2 ECS Component 草案（**待 DDD Review 拍板**）
+
+| Component | 字段草案 | 含义 |
+|---|---|---|
+| `AgentId` | `user_id: Uuid` | IM `users.id` 映射 |
+| `Position` | `x: f32, y: f32`（2D）/ `x, y, z: f32`（3D） | 仿真世界坐标 |
+| `Status` | `state: enum {Online, Away, Dnd, Offline}` | 映射 IM `presence` |
+| `MessageBuffer` | `pending: VecDeque<ImMessage>` | 接收自 im-gateway 尚未消费的消息 |
+
+> 草案, 详细字段 / Bundle / System 调度图 留待 `DetailedDesign.md §Bevy` 章节落地。
+
+### Y.3 通信协议分工
+
+- **WS（tokio-tungstenite / actix-ws）** = 实时消息下行（`message_new` / `presence_update` / `typing` 等），百万 agent 扇出的主路径。
+- **gRPC（tonic）** = 控制面（Token 刷新、设备注册等低频操作），**WS 优先, gRPC 留给控制面**。
+
+---
+
+## Z. 数据流：百万 agent IM 消息
+
+> 本节为 v0.2 新增。描述从 im-gateway 到 Bevy ECS 的端到端消息路径。
+
+### Z.1 端到端数据流
+
+```
+im-gateway (WS 终结)
+    │  WebSocket Frame: { type: "message_new", message: {...} }
+    ▼
+Bevy 客户端 tokio-tungstenite WS 客户端
+    │  解析 JSON Frame → 解码为内部 `ImMessage` 结构
+    ▼
+Bevy ECS Resource: MessageStream (mpsc channel, 接收 task → 渲染 task)
+    │  System "ingest_messages" 每帧 drain → 写入目标 agent entity 的 `MessageBuffer`
+    ▼
+Bevy UI System (bevy_ui)
+    │  从 `MessageBuffer` 弹出 → 渲染到 UI 树（会话列表 / 消息面板）
+    ▼
+Bevy 渲染 System (bevy_render)
+    │  每帧按 `Position` 重绘 agent 位置（IM 消息触发位移 / 状态机变更）
+```
+
+### Z.2 实体映射
+
+- **ECS entity per agent**（百万 entity 直接对位 `users`）。
+- 每个 entity 持有 `AgentId + Position + Status + MessageBuffer` Component Bundle（草案）。
+- agent 离场 → entity despawn；agent 进场 → entity spawn（由 `presence_update` 事件驱动）。
+
+### Z.3 性能与背压（草案, **待 DDD Review 拍板**）
+
+- mpsc channel buffer size = 待压测后定（候选 1024 / 4096 / 16384）。
+- 背压策略：buffer 满时**丢弃最旧非关键消息**（`presence_update` 允许丢，`message_new` 不允许丢）。
+- 渲染 System 帧率与消息 ingestion 解耦（独立 stage），避免 ingest 抖动卡渲染。
+
+### Z.4 已知缺口
+
+- ECS Component 字段（`AgentId / Position / Status / MessageBuffer`）= **草案, 待 DDD Review 拍板**。
+- 百万 agent 性能数字（@60 FPS）= **未经实测, 待 DDD Review 拍板**。
+- WS / gRPC 通信分工 = **WS 优先, gRPC 留给控制面**（per Ulysses 2026-08-27 12:36 JST 指令）。
+- Bevy 客户端的 Project Status / Roadmap = **另议, 留 v0.3+**。
+- Next.js Dashboard 与 Bevy 客户端关系 = **并存, Next.js 运营, Bevy 仿真**。
