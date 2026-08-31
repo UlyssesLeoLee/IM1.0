@@ -51,7 +51,7 @@ sqlx = { version = "0.9", features = [
 
 # ---- 缓存 / KV ----
 # NOTE: redis 0.27 的 tls-rustls feature 与 tokio_rustls 不兼容(MVP 暂不启用 TLS,V1+ 处理)
-redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.6", features = ["tokio-comp", "connection-manager"] }
 
 # ---- 事件总线 ----
 # 2026-08-26 升级:0.37.0 → 0.50.0(0.37.0 在 cargo 1.98 上编译期 STATUS_STACK_BUFFER_OVERRUN
