@@ -8,6 +8,7 @@ members = [
     "crates/im-presence",
     "crates/im-media",
     "crates/extension-runtime",
+    "crates/im-testkit",
 ]
 resolver = "2"
 
@@ -136,6 +137,7 @@ im-gateway = { path = "crates/im-gateway" }
 im-presence = { path = "crates/im-presence" }
 im-media = { path = "crates/im-media" }
 extension-runtime = { path = "crates/extension-runtime" }
+im-testkit = { path = "crates/im-testkit" }
 
 # ---- 共享编译 profile ----
 [profile.release]

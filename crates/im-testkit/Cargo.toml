@@ -1,0 +1,44 @@
+[package]
+name = "im-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "IM1.0 共享 mock 库 —— WS 帧 / gRPC / REST / fixture / assertion / mock server (仅 dev 用,不发布)"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[dependencies]
+# ---- 内部被测对象(可作为 dev/test 依赖,但 testkit 自身也引用以构建 fixture) ----
+im-common = { workspace = true }
+im-protocol = { workspace = true }
+im-proto = { workspace = true }
+
+# ---- Web 框架(供 server 模块起 mock im-gateway) ----
+actix-web = { workspace = true }
+actix-ws = { workspace = true }
+
+# ---- 异步运行时 ----
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# ---- 序列化 / ID / 时间 ----
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+# ---- 错误 ----
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# ---- HTTP 客户端(供 im-gateway 集成测试 assert 验真) ----
+# 2026-08-31: 加 reqwest 0.12 JSON feature(测试只读)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+[dev-dependencies]
+# testkit 自身 smoke 测试时 im-core 也要可引用(虽然 fixture 路径已经覆盖)
+im-core = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
