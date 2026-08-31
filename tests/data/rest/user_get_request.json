@@ -1,0 +1,4 @@
+{
+  "user_id": "1a2e6679-7425-40de-944b-e07fc1f90ae7",
+  "_comment": "REST user-get REQUEST QUERY for GET /v1/users/{user_id}. Authorization: Bearer <access_token> required. Returns public profile only; no email/phone/PII (per aux-02 §F.4 users table)."
+}

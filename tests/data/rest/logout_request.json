@@ -1,0 +1,5 @@
+{
+  "refresh_token": "rt_9b8e6679-7425-40de-944b-e07fc1f90ae7",
+  "everywhere": true,
+  "_comment": "REST logout REQUEST body for POST /v1/auth/logout. everywhere=true revokes ALL device_sessions for the user; false revokes only the current one. Idempotent — already-revoked returns 204."
+}

@@ -1,0 +1,7 @@
+{
+  "environment_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "external_provider": "steam",
+  "external_uid": "76561198000000000",
+  "display_name": "Player1",
+  "_comment": "gRPC token-exchange REQUEST body (game-server -> im-gateway). Modeled as JSON for fixture purposes; the real wire format is protobuf per aux-13 §2 package im.core.v1. Maps to the body of REST POST /v1/auth/token/exchange (§3.1) when delivered over gRPC."
+}

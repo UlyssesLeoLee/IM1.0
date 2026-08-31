@@ -1,0 +1,7 @@
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxYTJlNjY3OS03NDI1LTQwZGUtOTQ0Yi1lMDdmYzFmOTBhZTciLCJleHAiOjE2OTI1MjgzMDB9.mock-signature",
+  "refresh_token": "rt_9b8e6679-7425-40de-944b-e07fc1f90ae7",
+  "user_id": "1a2e6679-7425-40de-944b-e07fc1f90ae7",
+  "expires_in": 900,
+  "_comment": "gRPC token-exchange RESPONSE. Mirrors aux-13 §3.1 REST response (200). refresh_token is opaque; access_token is JWT (HS256) validated by im-gateway on every WS auth frame and REST call."
+}

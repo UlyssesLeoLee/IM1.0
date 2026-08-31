@@ -1,0 +1,15 @@
+{
+  "type": "conversation_create",
+  "req_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  "kind": "group",
+  "member_user_ids": [
+    "1a2e6679-7425-40de-944b-e07fc1f90ae7",
+    "2b3e6679-7425-40de-944b-e07fc1f90ae7",
+    "3c4e6679-7425-40de-944b-e07fc1f90ae7"
+  ],
+  "metadata": {
+    "game.type": "guild",
+    "game.game_id": "5d5e6679-7425-40de-944b-e07fc1f90ae7"
+  },
+  "_comment": "WebSocket create-conversation frame (client -> server). NOT in aux-13 §1.1 directly (REST POST /v1/conversations §3.3 is canonical); provided for WS parity per DetailedDesign.md §3 + aux-13 §4.2 metadata namespace."
+}

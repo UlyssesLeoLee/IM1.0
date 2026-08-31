@@ -1,0 +1,7 @@
+{
+  "type": "friend_request",
+  "req_id": "99999999-9999-4999-8999-999999999999",
+  "recipient_id": "2b3e6679-7425-40de-944b-e07fc1f90ae7",
+  "message": "Hi, let's be friends",
+  "_comment": "WebSocket friend request frame (client -> server). NOT directly in aux-13 §1.1.x (which covers message + presence + reaction only); modeled per DetailedDesign.md §4.6 + aux-13 §1.1 pattern (req_id + typed payload). friend_requests table in migration 0003 is the backing store."
+}

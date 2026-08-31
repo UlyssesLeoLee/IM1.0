@@ -1,0 +1,7 @@
+{
+  "device_session_id": "9b8e6679-7425-40de-944b-e07fc1f90ae7",
+  "refresh_token_hash": "argon2id$v=19$m=19456,t=2,p=1$randomsalt$mockhashvalue",
+  "refresh_token": "rt_9b8e6679-7425-40de-944b-e07fc1f90ae7",
+  "expires_at_unix": 1692546000,
+  "_comment": "gRPC device-register RESPONSE. The client receives refresh_token ONCE; server only stores the argon2id hash. Active UNIQUE(user_id, refresh_token_hash) in device_sessions ensures single-active-session per device."
+}

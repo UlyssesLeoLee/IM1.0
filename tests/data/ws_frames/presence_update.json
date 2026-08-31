@@ -1,0 +1,6 @@
+{
+  "type": "presence_update",
+  "user_id": "2b3e6679-7425-40de-944b-e07fc1f90ae7",
+  "status": "online",
+  "_comment": "WebSocket presence broadcast (server -> client). Per aux-13 v1.1.0 §1.2.9. status in {online, offline, away, busy, invisible}."
+}

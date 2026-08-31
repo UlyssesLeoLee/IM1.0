@@ -1,0 +1,6 @@
+{
+  "type": "auth",
+  "req_id": "11111111-1111-4111-8111-111111111111",
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxYTJlNjY3OS03NDI1LTQwZGUtOTQ0Yi1lMDdmYzFmOTBhZTciLCJleHAiOjE2OTI1MjgzMDB9.mock-signature",
+  "_comment": "WebSocket auth frame (client -> server). Per aux-13 v1.1.0 §1.1.1. access_token is a JWT validated by im-gateway via im-core gRPC ValidateAccessToken."
+}

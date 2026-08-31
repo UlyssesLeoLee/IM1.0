@@ -1,0 +1,7 @@
+{
+  "type": "conversation_join",
+  "req_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  "conversation_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "invited_user_id": "3c4e6679-7425-40de-944b-e07fc1f90ae7",
+  "_comment": "WebSocket invite-join frame (client -> server, owner/admin only). NOT in aux-13 §1.1 directly; modeled for parity with REST path (DetailedDesign.md §5 + conversation_members table in migration 0004)."
+}

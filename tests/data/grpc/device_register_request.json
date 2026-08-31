@@ -1,0 +1,7 @@
+{
+  "user_id": "1a2e6679-7425-40de-944b-e07fc1f90ae7",
+  "device_fingerprint": "sha256:8f2c1b9d4e7a3f5b6c8d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b",
+  "platform": "ios",
+  "app_version": "1.4.2",
+  "_comment": "gRPC device-register REQUEST (mobile SDK -> im-gateway). Persists a row into device_sessions (migration 0002) with refresh_token_hash. device_fingerprint is advisory (length<=256)."
+}
