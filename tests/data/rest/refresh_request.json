@@ -1,0 +1,4 @@
+{
+  "refresh_token": "rt_9b8e6679-7425-40de-944b-e07fc1f90ae7",
+  "_comment": "REST refresh REQUEST body for POST /v1/auth/refresh. Server hashes the token with argon2id + pepper, looks up the active device_session row, and rotates the refresh_token (revoke old, mint new)."
+}

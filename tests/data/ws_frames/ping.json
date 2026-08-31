@@ -1,0 +1,5 @@
+{
+  "type": "ping",
+  "ts": 1692528000000,
+  "_comment": "WebSocket heartbeat (client -> server). Per aux-13 v1.1.0 §1.1.8. Client sends every 30s; server times out at 60s with no frames."
+}

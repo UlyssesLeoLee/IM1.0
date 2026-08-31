@@ -1,0 +1,10 @@
+{
+  "type": "ack",
+  "req_id": "22222222-2222-4222-8222-222222222222",
+  "ok": true,
+  "data": {
+    "message_id": "8a7e6679-7425-40de-944b-e07fc1f90ae7",
+    "sequence": 42
+  },
+  "_comment": "WebSocket ack for a successful write op (server -> client). Per aux-13 v1.1.0 §1.2.2. req_id matches the client-generated UUID; data shape varies by the original request type."
+}

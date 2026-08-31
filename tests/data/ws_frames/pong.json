@@ -1,0 +1,5 @@
+{
+  "type": "pong",
+  "ts": 1692528000000,
+  "_comment": "WebSocket heartbeat response (server -> client). Per aux-13 v1.1.0 §1.2.11. Echoes back the timestamp."
+}

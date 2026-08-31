@@ -1,0 +1,7 @@
+{
+  "environment_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "external_provider": "steam",
+  "external_uid": "76561198000000000",
+  "display_name": "Player1",
+  "_comment": "REST login REQUEST body for POST /v1/auth/token/exchange. Per aux-13 §3.1. Real calls must also carry X-IM-Server-Signature + X-IM-Timestamp + X-IM-Nonce headers (HMAC-SHA256 of body using server_secret)."
+}

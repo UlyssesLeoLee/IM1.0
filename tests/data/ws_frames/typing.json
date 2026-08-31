@@ -1,0 +1,6 @@
+{
+  "type": "typing",
+  "conversation_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "user_id": "2b3e6679-7425-40de-944b-e07fc1f90ae7",
+  "_comment": "WebSocket typing indicator (server -> client fanout). Per aux-13 v1.1.0 §1.2.10. Client-side request form (req_id + conversation_id) is in §1.1.7."
+}

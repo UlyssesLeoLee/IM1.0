@@ -1,0 +1,6 @@
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxYTJlNjY3OS03NDI1LTQwZGUtOTQ0Yi1lMDdmYzFmOTBhZTciLCJleHAiOjE2OTI1MjgzMDB9.refreshed-signature",
+  "refresh_token": "rt_8c7e6679-7425-40de-944b-e07fc1f90ae7",
+  "expires_in": 900,
+  "_comment": "REST refresh RESPONSE (200). The new refresh_token is single-use; replay of the old one returns 401 (token.revoked)."
+}

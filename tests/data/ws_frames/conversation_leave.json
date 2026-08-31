@@ -1,0 +1,6 @@
+{
+  "type": "conversation_leave",
+  "req_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+  "conversation_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "_comment": "WebSocket leave-conversation frame (client -> server). NOT in aux-13 §1.1 directly; deletes row from conversation_members (migration 0004) for the requesting user."
+}

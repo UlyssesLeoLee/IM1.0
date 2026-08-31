@@ -1,0 +1,17 @@
+{
+  "type": "message_new",
+  "message": {
+    "id": "8a7e6679-7425-40de-944b-e07fc1f90ae7",
+    "conversation_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+    "sequence": 42,
+    "sender_id": "1a2e6679-7425-40de-944b-e07fc1f90ae7",
+    "kind": "text",
+    "content": { "text": "你好" },
+    "reply_to": null,
+    "state": "sent",
+    "created_at": "2026-08-23T00:00:00Z",
+    "edited_at": null,
+    "reactions": []
+  },
+  "_comment": "WebSocket broadcast of a new message (server -> client). Per aux-13 v1.1.0 §1.2.5. State machine: sent -> delivered -> read -> recalled -> deleted."
+}

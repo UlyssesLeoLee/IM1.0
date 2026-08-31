@@ -1,0 +1,7 @@
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxYTJlNjY3OS03NDI1LTQwZGUtOTQ0Yi1lMDdmYzFmOTBhZTciLCJleHAiOjE2OTI1MjgzMDB9.mock-signature",
+  "refresh_token": "rt_9b8e6679-7425-40de-944b-e07fc1f90ae7",
+  "user_id": "1a2e6679-7425-40de-944b-e07fc1f90ae7",
+  "expires_in": 900,
+  "_comment": "REST login RESPONSE (200). Per aux-13 §3.1. access_token TTL = 900s; refresh_token TTL governed by environment.settings.token.refresh_ttl_seconds (BasicDesign §14.3)."
+}

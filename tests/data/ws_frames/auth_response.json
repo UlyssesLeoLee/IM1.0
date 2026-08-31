@@ -1,0 +1,5 @@
+{
+  "type": "connected",
+  "session_id": "9b8e6679-7425-40de-944b-e07fc1f90ae7",
+  "_comment": "WebSocket auth success response (server -> client). Per aux-13 v1.1.0 §1.2.1. session_id == device_sessions.id; client may correlate logs by it."
+}
