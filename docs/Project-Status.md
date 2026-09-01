@@ -8,6 +8,7 @@
 > - `Workflow-RACI.md` —— 角色责任分配
 > - `Day1-Task-List.md` —— Day 1 任务清单
 > - `Platform-Specifics.md` —— GitHub / K3s 平台特定配置
+> - `132-wbs.md` —— WBS 工作分解结构 (Phase A-H 全量, token 单位)
 
 ---
 
@@ -16,6 +17,7 @@
 | 版本 | 日期 | 修订人 | 变更 |
 |---|---|---|---|
 | 1.0.0 | 2026-08-20 | (Mavis 辅助) | Day 1 Kickoff 决议 |
+| 1.1.0 | 2026-09-01 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 132-wbs.md 关联;决策待办 7 项 (§2.2) 仍空缺,卡 H-1 截止日 |
 
 ---
 
