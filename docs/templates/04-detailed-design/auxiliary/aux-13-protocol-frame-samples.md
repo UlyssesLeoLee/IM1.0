@@ -5,8 +5,15 @@ title_zh: 协议帧样例集 (IM1.0)
 phase: 04-detailed-design-aux
 owners: Tech Lead
 status: Filled (v1.0.0)
-version: 1.1.0
+version: 1.1.1
 related_activities: 46 API 详细, 28 API 仕様, 29 IF 詳細
+patch_note: |
+  2026-09-01 B-4 协议冻结补丁 [PROTOCOL-FROZEN-PATCH]:
+  补 ImplementationSpec §16 P2-3 标记的缺失样例 — RespondFriendRequest
+  gRPC request + POST /v1/friends/requests/{id}/respond REST body。
+  不新增协议元素(端点 / RPC 早于 2026-08-26 [PROTOCOL-FROZEN] 冻结),
+  仅补 [PROTOCOL-FROZEN] 状态下遗漏的样例。aux-13 §7 流程豁免理由:
+  "补缺失样例,非新元素"。
 ---
 
 # aux-13. プロトコルフレームサンプル集 (IM1.0) / 协议帧样例集 (IM1.0)
@@ -398,7 +405,79 @@ message MarkReadRequest {
 }
 ```
 
-### 2.5 错误 → gRPC Code 映射
+### 2.5 `RespondFriendRequest`(好友申请接受/拒绝) — B-4 补 (2026-09-01)
+
+> **补丁来源**:ImplementationSpec §16 P2-3 已知缺口 — `respond_friend_request`
+> gRPC/REST 端点的 body `{accept: bool}` 在 v1.1.0 冻结前未补样例。
+> 本节为 `[PROTOCOL-FROZEN-PATCH]`(见 §10 change log),端点本身早在
+> `crates/im-proto/proto/core.proto` (commit `c6cdc76` 2026-08-24
+> 填实) 与 `ImplementationSpec §3.1.4` (POST 路径) 同步冻结,
+> 本节仅补"调用样例"。
+
+完整 proto 定义(`crates/im-proto/proto/core.proto` §Relationship 块):
+
+```protobuf
+message RespondFriendRequestRequest {
+  string request_id = 1;     // friend_requests.id
+  string responder_id = 2;   // 来自 im-gateway 校验后的 claims
+                            // 必须 == friend_requests.recipient_id
+                            // 否则 PERMISSION_DENIED
+  bool accept = 3;          // true = 接受, false = 拒绝
+                            // 其他状态(accepted/rejected) 重发 → FAILED_PRECONDITION
+                            // (INVALID_STATE_TRANSITION)
+}
+
+message BlockUserRequest {
+  string user_id = 1;
+  string target_id = 2;
+}
+
+message ListFriendsRequest {
+  string user_id = 1;
+  string cursor = 2;          // 首次传空,后续传响应的 next_cursor
+  int32 limit = 3;            // default 50, max 200
+}
+
+message Friend {
+  string user_id = 1;
+  string display_name = 2;
+  string state = 3;           // accepted / blocked(被当前 user 拉黑的不返回)
+  google.protobuf.Timestamp since = 4;
+}
+
+message ListFriendsResponse {
+  repeated Friend friends = 1;
+  string next_cursor = 2;
+}
+
+service CoreService {
+  // ---- Relationship (3) ----
+  rpc SendFriendRequest(SendFriendRequestRequest) returns (google.protobuf.Empty);
+  rpc RespondFriendRequest(RespondFriendRequestRequest) returns (google.protobuf.Empty);
+  rpc BlockUser(BlockUserRequest) returns (google.protobuf.Empty);
+  rpc ListFriends(ListFriendsRequest) returns (ListFriendsResponse);
+}
+```
+
+**gRPC 调用示例**(im-gateway ⇄ im-core, plaintext 调试用):
+
+```bash
+grpcurl -plaintext -d '{
+  "request_id":   "7c9e6679-7425-40de-944b-e07fc1f90ae7",
+  "responder_id": "2b3e6679-7425-40de-944b-e07fc1f90ae7",
+  "accept":       true
+}' \
+  localhost:9001 im.core.v1.CoreService/RespondFriendRequest
+```
+
+**响应**: `google.protobuf.Empty` (空) — 成功。
+
+**错误码映射**(对应 `aux-03` §B):
+- `NOT_FOUND` (`FRIEND_REQUEST_NOT_FOUND`):`request_id` 不存在
+- `PERMISSION_DENIED` (`FORBIDDEN`):`responder_id != recipient_id`
+- `FAILED_PRECONDITION` (`INVALID_STATE_TRANSITION`):`state != 'pending'`
+
+### 2.6 错误 → gRPC Code 映射
 
 按 `aux-03 §B` 的 HTTP 列同构映射到 `tonic::Code`,`im-gateway` 边界转换:
 
@@ -603,7 +682,96 @@ Content-Type: application/json
 }
 ```
 
-### 3.7 通用错误响应格式
+### 3.7 `POST /v1/friends/requests/{id}/respond`(好友申请接受/拒绝) — B-4 补 (2026-09-01)
+
+> **补丁来源**:ImplementationSpec §16 P2-3 已知缺口 — `respond_friend_request`
+> REST 端点的 body `{accept: bool}` 在 v1.1.0 冻结前未补样例。
+> 端点路径已在 `ImplementationSpec §3.1.4` 表格内冻结,
+> 本节为 `[PROTOCOL-FROZEN-PATCH]`(见 §10 change log),仅补 body/响应/错误样例。
+
+**完整 curl 示例(接受)**:
+
+```http
+POST /v1/friends/requests/7c9e6679-7425-40de-944b-e07fc1f90ae7/respond HTTP/1.1
+Host: api.{tenant}.example.com
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+Content-Type: application/json
+
+{
+  "accept": true
+}
+```
+
+**完整 curl 示例(拒绝)**:
+
+```http
+POST /v1/friends/requests/7c9e6679-7425-40de-944b-e07fc1f90ae7/respond HTTP/1.1
+Host: api.{tenant}.example.com
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+Content-Type: application/json
+
+{
+  "accept": false
+}
+```
+
+**响应 (204 No Content,接受/拒绝 均无 body)**:
+
+```http
+HTTP/1.1 204 No Content
+```
+
+> 接受时:服务端在事务内同时 UPDATE `friend_requests.state='accepted'` +
+> INSERT `friendships` (env, sender_id, friend_id) + INSERT (env, recipient_id, friend_id)
+> 两条对偶记录,见 `migrations/0003_create_friend_requests_and_friendships.sql`。
+> 拒绝时:仅 UPDATE `friend_requests.state='rejected'`,**不**插入 friendships。
+
+**错误响应**(对应 `aux-03` §B):
+
+**404 FRIEND_REQUEST_NOT_FOUND**(request_id 不存在):
+
+```json
+{
+  "code": "FRIEND_REQUEST_NOT_FOUND",
+  "message": "friend.respond.not_found",
+  "trace_id": "tr_01HXY...",
+  "ts": 1692528000000
+}
+```
+
+**403 FORBIDDEN**(调用者不是 recipient):
+
+```json
+{
+  "code": "FORBIDDEN",
+  "message": "friend.respond.not_recipient",
+  "trace_id": "tr_01HXY...",
+  "ts": 1692528000000,
+  "details": [
+    { "field": "responder_id", "reason": "must_equal_recipient_id" }
+  ]
+}
+```
+
+**409 INVALID_STATE_TRANSITION**(request.state != 'pending'):
+
+```json
+{
+  "code": "INVALID_STATE_TRANSITION",
+  "message": "friend.respond.already_decided",
+  "trace_id": "tr_01HXY...",
+  "ts": 1692528000000,
+  "details": [
+    { "field": "state", "reason": "expected_pending_actual_accepted" }
+  ]
+}
+```
+
+**速率限制**:`RATE_LIMITED` (HTTP 429) — 同一 responder_id 1 分钟内最多 30 次 respond(由 D-4 Valkey 令牌桶强制)。
+
+**幂等性**:重复 respond 已 accepted/rejected 的 request 返回 409 `INVALID_STATE_TRANSITION`(**不**走 IDEMPOTENCY_CONFLICT 成功语义 — 与 send_message 不同,因为社交关系是不可重放副作用)。
+
+### 3.8 通用错误响应格式
 
 所有 REST 错误响应(4xx / 5xx)统一格式:
 
@@ -750,3 +918,4 @@ grpcurl -plaintext -d '{"access_token":"eyJ..."}' \
 |---|---|---|---|
 | 1.0.0 | YYYY-MM-DD | (模板初版) | 初版通用模板 |
 | 1.1.0 | 2026-08-23 | Mavis 辅助 | 填实 IM1.0:§1 WS 12 个帧(双向);§2 gRPC 4 个核心 RPC + proto 示例;§3 REST 7 个端点 + 错误通用格式;§4 JSON Schema 6 种 kind + Conversation metadata 命名空间;§5 调试命令 wscat/grpcurl/curl;§6 协议版本与冻结流程;全表命名从 `room_id`/`chat_rooms` 改为 `conversation_id`/`conversations` 对齐 aux-01 |
+| 1.1.1 | 2026-09-01 | 架构师 (Mavis 接手 agent per DEC-008) | **[PROTOCOL-FROZEN-PATCH]** B-4 补丁(aux-13 §7 流程豁免,理由:补缺失样例非新元素):新增 §2.5 gRPC `RespondFriendRequest` 样例 + proto 块(原错误映射表 §2.5 → §2.6);新增 §3.7 REST `POST /v1/friends/requests/{id}/respond` 接受/拒绝 curl + 204/404/403/409 错误样例(原通用错误格式 §3.7 → §3.8);修复 ImplementationSpec §16 P2-3 已知缺口;不新增协议元素,端点与 RPC 早在 2026-08-26 [PROTOCOL-FROZEN] (commit 12c7662) 冻结 |
