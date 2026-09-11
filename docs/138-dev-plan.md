@@ -1,0 +1,227 @@
+---
+doc_id: 138
+title_zh: 合并 + 清理后 IM1.0 开发计划
+phase: 15-management
+activity_no: 138
+owners: 架构师 (Mavis 接手 agent per DEC-008)
+status: Active
+version: 1.0.0
+date: 2026-09-11 JST
+---
+
+# 138. 合并 + 清理后 IM1.0 开发计划
+
+> **触发**: 2026-09-11 JST 6 个 WBS lane 分支合并到 main + 本地分支/worktree 清理后
+> **责任**: 架构师 (Mavis 接手 agent per DEC-008) 编制 / PM (Ulysses / 1 人公司 12 角色 per DEC-008) 修订
+> **上游**: 132-wbs.md v1.0.0 (WBS 主体, 41 项) + 135-wbs-lane1-final-report.md (lane1 报告) + 136-wbs-lane1-verifier-report.md (lane1 走读) + docs/decisions/H-1..H-6 (决策项) + docs/research/H-4, H-5 (调研)
+> **下游**: 134-issue-list, 144-baseline-registry, 133-progress-report
+
+## 0. 合并动作摘要 (已完成, 2026-09-11 JST)
+
+| # | 分支 | commits | 内容 | merge 状态 |
+|---|---|---|---|---|
+| 1 | `feat/auto-20260901-f2fd4c51` | 1 | 132-wbs.md v1.0.0 (WBS 主体) + Day1/Project-Status 引用 | ✅ clean merge |
+| 2 | `feat/wbs-lane1-main` | 7 | F-1 Blocker 文档 + B-1 SQL migrations verified + C-1 6 PgRepository + C-2 MessageService 5 步实装 + 22 集成测试 + 走读/最终报告 | ✅ clean merge |
+| 3 | `feat/wbs-lane2-aux` | 10 | aux-04..aux-12 共 9 份 IM1.0 专用文档 v1.1.0 填实 (state machine / CRC card / 算法性能模型 / SQL 优化 / 批处理+重试+DLQ / log cookbook / DD Review checklist / 时序图 / 配置项规格 46 项) | ✅ clean merge |
+| 4 | `feat/wbs-lane3-decision` | 6 | H-1 deadline 选项 + H-3 PoC scope 选项 + H-4 NFR 调研 + H-5 法规调研 + H-6 observability 选项 | ✅ clean merge |
+| 5 | `feat/wbs-lane4-protocol` | 4 | B-3 friend_requests UNIQUE 选项 + aux-13 [PROTOCOL-FROZEN-PATCH] 补 respond_friend_request 样例 + F-2 k3s dev preflight checklist | ✅ clean merge |
+| 6 | `wt-day3-cleanup` | 2 | DAY-3-PLUS.md (3 套协议端到端 + 灰度发布排期) + 代签规则反转 v0.2 | ✅ clean merge |
+
+**清理** (Ulysses 2026-09-11 JST 指令"合并分枝后清理它们"):
+- 6 个本地分支已删 (`git branch -d`)
+- 6 个 worktree 已删 (`git worktree remove --force`, 含 wbs-lane1-main/_verifier_report.md 临时草稿 27.5KB)
+- 7 个旧分支 (docs/*-v02 / feat/b1-db-migration / feat/test-*/testkit-crate) 保留 (+0/-0 状态, 历史治理命名)
+
+**验证** (合并后):
+- ✅ `cargo check --workspace`: 42.32s, 0 error 0 warning
+- ✅ `cargo test --workspace --no-fail-fast`: 21 个 test binary 通过 (112 tests) + 2 个 binary 失败 (22 tests) 全部因 WSL PG 18.6 未启动
+- 失败根因: `connect to PG 18.6 (run scripts/init-pg18-b1-all.sh first): Io(Custom { kind: UnexpectedEof, error: "expected to read 5 bytes, got 0 bytes at EOF" })`
+- 失败 list: `message_service_test` (7) + `pg_repos_integration` (15+1 passed), 跟 lane1 报告的 135 tests 一致, 纯环境依赖
+
+## 1. 已完成 (Done, 4 项)
+
+per 135-wbs-lane1-final-report.md §1 + 136 verifier 走读 P0=0 P1=0 P2=6:
+
+| WBS ID | 任务 | commit | token 实际 | 状态 |
+|---|---|---|---|---|
+| **F-1** | Docker daemon bridge 修复 | `5256e08` | ~80K (诊断 + 文档, 无代码改动) | **Blocked + 文档** (per 135 §5) |
+| **B-1** | 6 SQL migrations 在真 PG 18.6 跑过 (WSL initdb, port 5544) | `b5a79ea` | ~250K | **Done** (135 §6) |
+| **C-1** | 6 PgRepository (User/DeviceSession/Friendship/Conversation/Message/Reaction) + PgSequenceAllocator 实装 | `03f614a` | ~900K | **Done** (135 §7) |
+| **C-2** | `MessageService::send_message` 5 步实装 | `fbbd2fa` | ~450K | **Done** (135 §8) |
+
+> **token 实际** (~1.68M, vs max 2.4M) — 正常区间, 无复盘
+
+## 2. WBS 全景状态 (per 132-wbs.md v1.0.0)
+
+| Phase | 项数 | 已 Done | In Progress | Todo | Blocked | 完成度 |
+|---|---|---|---|---|---|---|
+| A · 启动收尾 (1) | 1 (A-1) | 0 | 0 | 1 | 0 | 0% |
+| B · 数据 + 协议 (4) | 4 (B-1..4) | 1 (B-1) | 0 | 3 (B-2/3/4) | 0 | 25% |
+| C · 核心实现 (12) | 12 (C-1..12) | 2 (C-1/2) | 0 | 10 | 0 | 17% |
+| D · 配置 + 观测 (4) | 4 (D-1..4) | 0 | 0 | 4 | 0 | 0% |
+| E · 测试补齐 (4) | 4 (E-1..4) | 0 | 0 | 4 | 0 | 0% |
+| F · 部署验证 (4) | 4 (F-1..4) | 0 | 0 | 0 | 4 (F-1..4 全 Blocked) | 0% |
+| G · V1 移交 (6) | 6 (G-1..6) | 0 | 0 | 2 (G-1/3) | 4 (G-2/4/5/6) | 0% |
+| H · 决策待办 (7) | 7 (H-1..7) | 0 | 0 | 7 (待 PM) | 0 | 0% |
+| **合计** | **41** | **3** | **0** | **30** | **8** | **7%** |
+
+> F-1 严格说是 "Blocked + 文档", 归到 Blocked 桶里; 实际工程价值 (diag 脚本 + known-issue 文档) 已交付, 只是 Docker daemon bridge 修复需 Ulysses 手动。
+
+## 3. 关键路径 (Critical Path) 剩余
+
+per 132-wbs.md §6:
+
+```
+H-1 (决策) → H-3 (决策) → C-1 ✅ → C-2 ✅ → C-9 → C-11 → D-3 → E-3 → F-2 → F-3
+       ↓      ↓
+       B-1 ✅ ──────(依赖 F-1, 已绕开)
+       ↓
+       F-1 (Blocked)
+```
+
+**已完成节点**: H-1 (草案) / H-3 (草案) / B-1 / C-1 / C-2
+
+**剩余节点** (按关键路径顺序):
+1. **C-9** `POST/GET /v1/conversations/{id}/messages` (250K-500K tokens) — **predecessor C-2 ✅, C-8**, 起点
+2. **C-11** `WsSession` 实装 + actix-ws 0.3 接入 12 帧 (400K-800K) — predecessor C-2 ✅, C-9
+3. **D-3** NATS JetStream 真实实现 (300K-600K) — predecessor C-1 ✅, F-2
+4. **E-3** 端到端 smoke (2 终端收发, 150K-300K) — predecessor C-11, D-3, F-2
+5. **F-2** K3s dev namespace 端到端跑通 (400K-800K) — **predecessor F-1 (Blocker) + D-1 + D-2**, Blocker
+6. **F-3** CI `deploy-dev` job 真触发 (200K-400K) — predecessor F-2 + D-3 + E-3 + E-4
+
+**关键路径剩余 token 预算 (max 估)**: 500K + 800K + 600K + 300K + 800K + 400K = **3.4M tokens** (~3.4 周, per 1M/周产能)
+
+## 4. 关键 Blocker 列表
+
+### 4.1 F-1 Docker daemon bridge (Blocker, 主卡点)
+
+per 135-wbs-lane1-final-report.md §5 + docs/deployment-bridge-known-issue.md:
+
+| 现象 | 状态 |
+|---|---|
+| Docker Desktop 进程 | Running (×4) |
+| WSL `docker-desktop` distro | Running |
+| com.docker.service (Windows) | Stopped, StartType=Manual |
+| Named pipe `\\.\pipe\dockerDesktopLinuxEngine` | **未生成** (root cause) |
+| `docker info` 8s timeout | TIMEOUT |
+| `Start-Service com.docker.service` | 失败 |
+| `Start-Process Docker Desktop.exe` + wait 90s | 进程在跑, pipe 仍未生成 |
+
+**修复路径 (Ulysses 手动, 5 分钟)**:
+1. `Stop-Process` 所有 docker 进程
+2. 启动 Docker Desktop
+3. 等托盘变绿
+4. 跑 `pwsh scripts/diag-docker-bridge.ps1` 验证
+
+**影响**: F-1 解锁 → F-2 / F-3 / F-4 全顺延 (Phase F 4 项全 Blocked, 占 WBS 8/41 = 20%)
+
+### 4.2 WSL PG 18.6 未启动 (环境依赖, 非 Blocker)
+
+per 135 §3.1 + §6: lane1 用 WSL Ubuntu PG 18.6 initdb 独立集群 (port 5544) 绕开 F-1。当前 WSL PG 进程未运行, 影响:
+
+- `cargo test --workspace` 22 个集成测试 fail (message_service 7 + pg_repos_integration 15)
+- **fix path**: `bash scripts/restart-pg18-b1-all.sh` 或 `bash scripts/init-pg18-b1.sh` + `bash scripts/verify-pg18-b1.sh`
+- 报告路径: `tests/pg18-b1-migration-report.md`
+
+## 5. PM (Ulysses) 决策待办 (Phase H, 7 项)
+
+per 132-wbs.md §5.8 + docs/decisions/H-1..H-6 + docs/research/H-4/H-5:
+
+| ID | 任务 | 文档 | 状态 | 优先级 |
+|---|---|---|---|---|
+| **H-1** | 经营 / 投资人截止日决策 | `docs/decisions/H-1-deadline-options.md` (5 选项 + 推荐 C 12 周) | Draft for PM | **紧迫** |
+| **H-2** | 团队成员具体姓名 + 联系方式 (1 人公司则 N/A per DEC-008) | — | Draft for PM | 紧迫 |
+| **H-3** | 第一个客户 PoC 范围 + 验收标准 | `docs/decisions/H-3-poc-scope-options.md` (5 PoC + 推荐 PoC-01) | Draft for PM | 紧迫 |
+| **H-4** | NFR 具体数字 (从竞品推导) | `docs/research/H-4-nfr-benchmarks.md` | Draft for PM | 中 |
+| **H-5** | 法规适配范围 (中/日/北美) | `docs/research/H-5-regulatory-landscape.md` | Draft for PM | 中 |
+| **H-6** | 监控/日志/IM 沟通工具选型 | `docs/decisions/H-6-observability-stack-options.md` (5 Stack + 推荐 D/B) | Draft for PM | 中 |
+| **H-7** | 实名认证 / 短信网关供应商 | — (无独立 doc, 等 H-5) | Draft for PM | 低 |
+
+**关键卡点**: H-1 → H-3 → C-1 (已 ✅) → C-2 (已 ✅) → C-9 (下一步) — H-1 + H-3 拍板才能进 C-9 起跑
+
+**per 9/1 14:58 JST 守门**: 拍板必 ask_user 给推荐项; Mavis 已在 H-1/H-3/H-6 文档里给"3-5 选项 + 推荐"模板, 等 Ulysses 用 ask_user 选
+
+## 6. 接下来 7 天建议执行顺序
+
+**Day 1 (今天)**: 已完成合并 + 清理 + 计划, 等 Ulysses:
+- 拍板 push origin main (推荐 / 等显式确认)
+- 重启 Docker Desktop 解 F-1 (5 分钟)
+- 跑 `bash scripts/restart-pg18-b1-all.sh` 启动 PG 18.6 (3 分钟)
+- 重跑 `cargo test --workspace` 验证 135 全过
+
+**Day 2-3 (待 PM 拍板)**: 等 H-1 / H-3 决策, 同步推进:
+- B-2 im-core service/repository 至少 3 处引用 aux-02 §F 字段 (100K-200K)
+- B-3 friend_requests UNIQUE 跨 state 重发策略 (决策, 5K-20K, 已有 B-3 决策文档)
+- B-4 respond_friend_request REST body 样例补 aux-13 (30K-60K)
+- A-1 aux-04..12 共 9 份文档 (lane2 已合, 实施时按需查)
+
+**Day 4-7**: 关键路径起跑
+- C-8 / C-9 / C-10 HTTP handler 实装 (550K-1.1M)
+- C-3 / C-4 / C-5 / C-6 / C-7 auth 系列 (600K-1.2M)
+- D-1 AppConfig::load() (200K-400K) — 配 D-2 tracing_init
+- D-2 tracing_init::init() (120K-240K)
+
+**Week 2**: WS + 端到端
+- C-11 WsSession 实装 (400K-800K)
+- C-12 WS 心跳 (80K-160K)
+- D-3 EventPublisher NATS JetStream (300K-600K) — F-1 解锁后接
+- D-4 速率限制 (200K-400K)
+- E-1 单元测试覆盖 ≥ 80% (400K-800K)
+
+**Week 3+**: 部署 + 决策后
+- F-2 K3s dev namespace 端到端 (F-1 解锁后)
+- F-3 CI deploy-dev 触发
+- F-4 healthz/readyz + 监控
+- E-2 集成测试 (300K-600K)
+- E-3 端到端 smoke
+- E-4 安全/边界测试
+
+## 7. token 预算 (per 132-wbs.md §5.0 + §6)
+
+| 阶段 | 状态 | token 实际/预算 |
+|---|---|---|
+| lane1 (F-1 + B-1 + C-1 + C-2) | Done + 1 Blocker | 1.68M / 2.4M (max) — 正常 |
+| 已用总计 | 1.68M | 占 1.7 周产能 |
+| 关键路径剩余 | H-3 起跑 → F-3 | **3.4M tokens** (~3.4 周) |
+| Phase A + B 剩余 | A-1 + B-2/3/4 | 935K-1.78M (~1 周) |
+| Phase C 剩余 (C-3..12) | 10 项 | 2.15M-4.5M (~2-4.5 周) |
+| Phase D (D-1..4) | 4 项 | 820K-1.64M (~1 周) |
+| Phase E (E-1..4) | 4 项 | 1.05M-2.1M (~1-2 周) |
+| Phase F (F-2..4, F-1 待解) | 3 项 + F-1 修复 | 730K-1.56M (~1 周) |
+| **全量剩余 (per 132 §6)** | 5.31M - 1.68M (lane1) = **3.63M 关键路径** + ~7M Phase C-G | 总 21.2M - 1.68M = **19.5M tokens** (~19.5 周) |
+| **Mavis 1 人公司 1M/周** | | 关键路径 ~3.6 周可上 MVP; 全量 ~19.5 周 (远 2-3 周 MVP 预算, 需 Phase G 推迟到 V1 阶段, per 132 §6) |
+
+## 8. 已知缺口 (per 缺标比错标原则)
+
+per 135 §9 (10 项) + 136 verifier 走读 (P0=0 P1=0 P2=6) 整理:
+
+| # | 缺口 | 影响 | 修复路径 |
+|---|---|---|---|
+| 1 | F-1 Docker daemon bridge Blocker | F-2/F-3/F-4 顺延 | Ulysses 重启 Docker Desktop |
+| 2 | C-2 DM friend 关系 check_block stub (返 false) | DM 完整 friend 校验在 im-gateway 边界补 | C-9 阶段实装 RelationshipService |
+| 3 | B-1 用 WSL init 集群 (非 K3s PG) | F-1 修复后 F-2 复跑同验证 | F-2 任务覆盖 |
+| 4 | C-1 PgUserRepository 集成测试未实测 NULL extid 行为 | P1-2 修复语义需 insert 2 Guest 验 | C-1 增补 / E-1 覆盖率测 |
+| 5 | C-1 PgUserRepository 未实测 updated_at 触发器 | 需 UPDATE 一次验 | E-1 阶段 |
+| 6 | C-1 messages.reply_to FK ON DELETE SET NULL 未实测 | 需 INSERT 两条删 first | E-1 阶段 |
+| 7 | audit_logs.tenant_id 无 FK (per 0006 设计) | V1 评估加 FK | 暂保留 |
+| 8 | C-1 DeviceSessionRepository.find_by_refresh_token_hash 接受 user_id, IdentityService::refresh 传 nil placeholder bug | refresh 流程实装要对接 JWT claims.sub 解析 | C-3 阶段 |
+| 9 | C-2 edit_message UPDATE 仍是 placeholder | 留 C-9 阶段 (PATCH message/{id}) | C-9 |
+| 10 | C-2 send_message 不限流 | D-4 阶段接 Valkey token bucket | D-4 |
+| 11 | **新增**: WSL PG 18.6 当前未启动 | cargo test 22 fail | `bash scripts/restart-pg18-b1-all.sh` |
+| 12 | **新增**: origin/main 未同步本次合并 | 本地领先 6 个 commit | 等 Ulysses 拍板 push |
+
+## 9. 关联文档 (References)
+
+- 上游: 132-wbs.md v1.0.0 (WBS 主体)
+- 平行: 135-wbs-lane1-final-report.md (lane1 报告) + 136-wbs-lane1-verifier-report.md (lane1 走读)
+- 决策: docs/decisions/H-1..H-6 + docs/research/H-4/H-5
+- 协议: aux-13-protocol-frame-samples.md (v1.1.1 [PROTOCOL-FROZEN-PATCH])
+- 部署: docs/deploy/k3s-dev-preflight-checklist.md (F-2 解锁前置)
+- 缺口: 135 §9 + 136 + 本文档 §8
+- 下游: 134-issue-list / 144-baseline-registry / 133-progress-report
+
+## 10. 变更记录 (Change Log)
+
+| 版本 | 日期 | 修订人 | 内容 |
+|---|---|---|---|
+| 1.0.0 | 2026-09-11 JST | 架构师 (Mavis 接手 agent per DEC-008) | 初版: 6 lane 合并 + 清理后, 全 WBS 41 项状态盘点, 关键路径剩余, Blocker 列表, PM 决策项, 7 天执行建议, token 预算, 12 项已知缺口 |
