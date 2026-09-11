@@ -7,6 +7,9 @@
 > - 消息持久化,刷新后能查历史
 >
 > **参考**:`docs/Project-Status.md` §1.1
+>
+> **WBS 全量索引**:`docs/132-wbs.md` v1.0.0 (Phase A-H, 41 项, token 单位, 完整 predecessor/successor/lag)
+> 本清单只覆盖 Day 1-14 MVP (Phase A-F);Phase G V1 移交 / Phase H 决策待办 见 132-wbs.md
 
 ---
 
