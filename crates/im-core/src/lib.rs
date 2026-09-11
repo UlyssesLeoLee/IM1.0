@@ -19,6 +19,7 @@ pub mod conversation;
 pub mod event;
 pub mod identity;
 pub mod message;
+pub mod reaction;
 pub mod relationship;
 pub mod settings;
 

@@ -3,6 +3,7 @@
 //! 依据: ImplementationSpec §7.4.3 + DetailedDesign §9.1
 
 pub mod content;
+pub mod pg;
 pub mod repository;
 pub mod sequence;
 pub mod service;

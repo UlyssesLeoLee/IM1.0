@@ -3,6 +3,7 @@
 //! 依据: ImplementationSpec §7.4.1
 
 pub mod password;
+pub mod pg;
 pub mod repository;
 pub mod service;
 pub mod token;
