@@ -5,11 +5,56 @@ phase: 15-management
 activity_no: 138
 owners: 架构师 (Mavis 接手 agent per DEC-008)
 status: Active
-version: 1.8.0
+version: 1.9.0
 date: 2026-09-19 JST
 ---
 
 # 138. IM1.0 开发计划 (持续维护)
+
+## v1.9.0 增量 (2026-09-19 JST, Mavis 父代理亲自推策略转换)
+
+> **触发**: 3 worker 子代理 (`bg_4bca7cf8...` worker-A, `bg_5e924f70...` worker-B, `bg_290969dc...` worker-C) 全部 failed (浏览器层 `net::ERR_CONNECTION_CLOSED` 截断, 跟 v1.5.0 第一批 + v1.6.0 第二批失败模式一致). Ulysses 2026-09-19 JST 拍板 "Mavis 父代理亲自推 (推荐)" (per 9/5 04:03 立即执行).
+
+> **3 worker 失败模式分析** (per守门 #7 + 9/8 15:29 自驱):
+> | Worker | 实际产出 | 失败点 |
+> |---|---|---|
+> | worker-A (C-3+C-4) | ⚠️ 80% 成果: state.rs 扩展 + auth_handlers.rs DTO+tests (~16KB, handler body 待补) + WORK_SUMMARY.md | 截断在 cargo check 等待中 |
+> | worker-B (C-5+C-6+C-7) | ❌ 净空跑: 探索 + IdentityService refresh bug fix 思路 (进 WORK_SUMMARY.md 也没有, 因 worker 还没写), 0 代码 | 截断在 cargo check 等待中 |
+> | worker-C (C-11 WsSession) | ❌ 净空跑: WORK_SUMMARY.md (5518 bytes) 但 0 代码 | 截断在 cargo check 等待中 |
+> | **失败根因**: 子代理浏览器层 ERR_CONNECTION_CLOSED 在长 cargo check 等待中触发, 跟子代理本身能力无关 | | |
+> | **累计**: 4 次 worker 子代理派出 (含 v1.6.0), 失败率 100%. 切方案 | | |
+
+> **Mavis 父代理亲自推** (per 9/8 第 7 次强化, 微决策 Mavis 自驱):
+> - **批次 A**: 补完 worker-A 80% 成果 (C-3 + C-4 handler body) + 推 C-5 + C-6 + C-7 (worker-B 净空跑, Mavis 重做)
+>   - 文件: `crates/im-gateway/src/http/auth_handlers.rs` (扩写 handler body + 加 C-5/6/7 handler) + `state.rs` (扩 IdentityService 字段) + `mod.rs` (注册 5 个 auth 路由)
+>   - token 估: 600-800K (含补完 A + 全 B)
+>   - **修 138 §8 缺口 #8**: IdentityService::refresh placeholder bug (worker-B 已分析清楚 — 加 DeviceSessionRepository::find_by_id 方法 + IdentityService::refresh 改用它)
+> - **批次 B**: 推 C-11 WsSession driver
+>   - 文件: `crates/im-gateway/src/ws/handler.rs` (actix-ws 0.3 端点 /v1/ws) + `ws/router.rs` + 集成 C-12 skeleton
+>   - token 估: 400-800K
+> - **Mavis 总估**: 1-1.5M tokens (按 1M/周产能 = 1-1.5 周), 跟第二批原预算 1-2M 一致
+> 
+> **派工策略调整**:
+> - 不再路子代理 (rejected, 4 次失败累计)
+> - Mavis 父代理直接实装, 用自己的编辑工具 (read/edit/write) 而非 task()
+> - worktree 复用 `wt-mvp-backend-core-2a` (worker-A 有 80% 保留, 不浪费)
+> - worktree `wt-mvp-backend-core-2b` + `wt-mvp-backend-core-2c` 清理 (净空跑无产出)
+> - branch `wt/lane-backend-core-2b` + `wt/lane-backend-core-2c` 删除
+> - branch `wt/lane-backend-core-2` + `wt/lane-backend-core-2a` 保留, 后续合并二合一
+
+> **执行步骤** (Mavis 父代理立即跑, 不轮询):
+> 1. 清理 wt-mvp-backend-core-2b/2c + 删分支 (worktree 复用策略)
+> 2. 在 wt-mvp-backend-core-2a worktree 实装 C-3 + C-4 handler body (批扩 worker-A 已写 DTO)
+> 3. 同 worktree 实装 C-5 + C-6 + C-7 handler
+> 4. 同 worktree 修 138 §8 缺口 #8 (DeviceSessionRepository::find_by_id + IdentityService::refresh)
+> 5. 同 worktree 实装 C-11 WsSession driver
+> 6. 集成 cargo check + clippy + test
+> 7. 提交 + merge main + 清理 + 升 v1.10.0
+> 
+> **预期产出** (v1.10.0):
+> - C-3..C-7 + C-11 全 Done (10/12 C 阶段 = 83%)
+> - 关键路径剩余 2.64M → ~0.6M tokens (~0.6 周)
+> - 修 138 §8 缺口 #8 (IdentityService::refresh bug)
 
 ## v1.8.0 增量 (2026-09-19 JST, 拆 3 worker 立即执行)
 
@@ -527,3 +572,4 @@ per 9/8 15:29 JST 第 7 次强化 (Mavis 自驱不被动等指令), 拍板不一
 | 1.6.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板 "开 lane-backend-core 第二批 (推荐)". 新增 §v1.6.0 增量: 范围 C-3..C-7 auth 系列 (5 endpoint, 600-1200K tokens) + C-11 WsSession driver actix-ws 0.3 收发循环 (400-800K tokens), 总计 1-2M tokens (远低于关键路径剩余 2.64M). 1 个 worker 子代理同时推 (上下文可承载 8 crates 全图). worktree `wt/lane-backend-core-2` off main. |
 | 1.7.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | lane-backend-core 第二批 worker `bg_89f6c6c1...` 报告 succeeded 但实际净空跑 (worktree git status 干净, 无 WORK_SUMMARY, 子代理最后停在探索阶段). per 守门 #7 max 2 retries + 9/8 15:29 自驱不静默, **不假装成功**. 新增 §v1.7.0 增量: 重置第二批状态 → Waiting, 不清理 worktree, 3 方案拆小待 Ulysses 拍板 (a 拆 3 worker 200-800K 各 / b 单 worker 强制每步 git commit / c Mavis 亲自推 C-3..C-7 + 留 C-11 worker). |
 | 1.8.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板"拆 3 个小 worker (推荐)" (per 9/5 04:03 立即执行不犹豫). 新增 §v1.8.0 增量: worker-A C-3+C-4 (270-540K) + worker-B C-5+C-6+C-7 (330-660K) + worker-C C-11 WsSession driver (400-800K), 3 个 worktree 分支 `wt/lane-backend-core-2{a,b,c}` 同时后台派出, 每 worker 强制"Step N 写完 → 立即 git status 自查"防净空跑. |
+| 1.9.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | 3 worker 子代理全部 failed (`net::ERR_CONNECTION_CLOSED` 浏览器截断, 累计 4 次失败率 100%, 切方案). Ulysses 拍板"Mavis 父代理亲自推 (推荐)" (per 9/8 第 7 次强化自驱). 新增 §v1.9.0 增量: Mavis 父代理直接实装, worktree 复用 `wt-mvp-backend-core-2a` (worker-A 80% 保留) + 清理 2b/2c + 实装 C-3..C-7 + C-11 + 修 138 §8 缺口 #8. 总估 1-1.5M tokens, 跟第二批原预算一致. 升 v1.10.0 落档 Done. |
