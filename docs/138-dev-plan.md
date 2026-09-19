@@ -5,11 +5,38 @@ phase: 15-management
 activity_no: 138
 owners: 架构师 (Mavis 接手 agent per DEC-008)
 status: Active
-version: 1.2.0
+version: 1.3.0
 date: 2026-09-19 JST
 ---
 
 # 138. IM1.0 开发计划 (持续维护)
+
+## v1.3.0 增量 (2026-09-19 JST, H-5 三区域 3 项二次拍板闭环)
+
+> **触发**: Ulysses 2026-09-19 JST 二次拍板 3 项 flag 全落推荐项, v1.2.0 三项缺口解除.
+
+> **3 项二次拍板落地**:
+
+| Flag | 内容 | Ulysses 选 | 落地动作 |
+|---|---|---|---|
+| **Flag-A** | H-7 是否升级三区域支持 | **升级 H-7 三区域 (推荐)** | Mavis 输出 `docs/research/sms-provider-three-region.md` (CN=阿里云 / JP=Twilio 或 NTT SMS / NA=Twilio Verify), 注册 cost + 工程量评估. **不进 MVP 代码, 仅调研 + provider abstraction 预留接口**, V1 阶段实装 NA/JP 供应商 |
+| **Flag-B** | H-5 三区域法务授权 | **推荐 (Mavis 调研文档, Ulysses 全人处理)** | Mavis 代起 5 域 Lead 真人身份 per 守门 #14 v3+v4, 输出 `docs/research/H-5-three-region-compliance-checklist.md` (CN PIPL + JP 電通事業法 + NA COPPA/CCPA 三区域合规清单). Ulysses 按文档接律师. Mavis 不直接联系外部律师 (per 9/8 守门 host 状态改变) |
+| **Flag-C** | MVP 12 周预算调整 | **12 周不变, 三区域推 V1 (推荐)** | MVP = 12M tokens / 12 周 = 1M tokens/周 (per H-1 C 选项), 三区域上线推 V1 阶段 (2027+). **关键路径不变**, 关键路径 3.4M tokens 剩余 (per §3). H-7 三区域预留接口 (Flag-A 落地的 abstraction), 不增加 MVP token |
+
+> **v1.3.0 综合落地**:
+> - **H-7 现状**: 阿里云 CN-only (per H-7 原拍板). Flag-A 落地后, MVP 阶段代码增 H-7 interface abstraction, 但供应商仍只实装 阿里云 CN. NA/JP 供应商预留 = V1 范围扩展.
+> - **H-5 现状**: CN+JP+NA 三区域 (per H-5 原拍板). Flag-B 落地后, Mavis 调研文档 + Ulysses 接律师. 调研文档不进 MVP 关键路径, 法律实装 (合规声明 + 内容审核) 推 V1.
+> - **MVP 12 周**: 12M tokens / 12 周 = 1M/周. **关键路径剩余 3.4M tokens ≈ 3.4 周**, 剩余 8.6 周富余支撑 lane-backend-core / lane-infra-k3s / lane-deploy-acceptance 三条主 lane + lane-frontend-demo (V1 占位).
+> - **flag 解除**: §9.3 v1.2.0 三项 flag 标记为 **✅ Closed** (per 守门 #1 v15 触达饱和必新事件触发, 升级 v1.3.0).
+
+> **3.4M token 关键路径剩余 (现有 lane 分配)**:
+> - C-9 + C-11 + C-12 + D-3 + F-2 + F-3 + F-4 = 3.4M tokens (per §3)
+> - Phase A-1 + B-2/3/4 = 1.78M tokens (per §7)
+> - Phase E-1..E-4 = 2.1M tokens (per §7) — 测试补齐, 必须同步推
+> - lane-backend-core: C-3..C-7 + C-8/10/12 = ~2.5M tokens, 跟关键路径 80% 重叠
+> - lane-infra-k3s: F-2 + D-1/D-2 + F-3/F-4 = ~2M tokens, F-1 解锁后启动
+> - lane-deploy-acceptance: E-1..E-4 = ~2.1M tokens, 跟 backend 80% 重叠
+> - lane-frontend-demo: 等 backend 落 C-9 后开 (V1 占位)
 
 ## v1.2.0 增量 (2026-09-19 JST, H 阶段 7 项 PM 拍板落地)
 
@@ -288,6 +315,12 @@ per 9/8 15:29 JST 第 7 次强化 (Mavis 自驱不被动等指令), 拍板不一
 > 2. H-5 法务咨询授权 (Mavis 可联系外部律师? 预算上限? 推荐 vs Ulysses 自接?)
 > 3. MVP 12 周预算调整 (+3 周 三区域工程量, 还是 +6 周 三区域 + 升级 H-7 = +3M+1M = 4M tokens)
 
+> **v1.3.0 (2026-09-19 JST) flag 闭环状态**: 3 项 flag Ulysses 全拍推荐项, **✅ Closed**:
+> - Flag-A (H-7 三区域升级) → ✅ Closed: Mavis 落 provider abstraction 调研 + V1 预留, 不增加 MVP 关键路径 token
+> - Flag-B (H-5 法务授权) → ✅ Closed: Mavis 出调研文档, Ulysses 自接律师
+> - Flag-C (MVP 12 周预算) → ✅ Closed: 12 周不变, 三区域推 V1
+> - H-5/H-7 不再卡关键路径, lane-backend-core 可启动
+
 ## 9. 关联文档 (References)
 
 - 上游: 132-wbs.md v1.0.0 (WBS 主体)
@@ -305,3 +338,4 @@ per 9/8 15:29 JST 第 7 次强化 (Mavis 自驱不被动等指令), 拍板不一
 | 1.0.0 | 2026-09-11 JST | 架构师 (Mavis 接手 agent per DEC-008) | 初版: 6 lane 合并 + 清理后, 全 WBS 41 项状态盘点, 关键路径剩余, Blocker 列表, PM 决策项, 7 天执行建议, token 预算, 12 项已知缺口 |
 | 1.1.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板"继续推进 IM Server MVP + worktree 并行 + worker 子代理". 新增 §9.1 worktree 4 lane 映射 + §9.2 拍板回执. 商业产品级 App + Web 作 V1 范围扩展, 不进 MVP 关键路径. 文档基线升至 v1.1.0, 修订历史栏 author=Ulysses / 审批=架构师(Mavis 接手 agent per DEC-008)+自审 / 修订人=Ulysses(1 人公司 12 角色 per DEC-008). |
 | 1.2.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses H 阶段 7 项拍板全落地 (6 推荐项 + 1 非推荐项). 新增 §v1.2.0 增量 7 项拍板汇总表 + §9.3 拍板不一致 flag (H-5 三区域 vs H-7 CN-only, 3 项缺口 → 待 Ulysses 二次拍板). H 阶段从 Todo → Active. |
+| 1.3.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses H-5 三区域 3 项二次拍板全落推荐项, v1.2.0 flag 闭环 ✅ Closed. 新增 §v1.3.0 增量 + flag 闭环状态. lane-backend-core 起跑绿灯. |
