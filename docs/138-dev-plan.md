@@ -5,11 +5,45 @@ phase: 15-management
 activity_no: 138
 owners: 架构师 (Mavis 接手 agent per DEC-008)
 status: Active
-version: 1.4.0
+version: 1.5.0
 date: 2026-09-19 JST
 ---
 
 # 138. IM1.0 开发计划 (持续维护)
+
+## v1.5.0 增量 (2026-09-19 JST, lane-backend-core C-8/C-10/C-12 worker Done + merge main)
+
+> **触发**: Worker 子代理 (task_id `bg_5d9bfd73-dfa0-4995-93dd-99daa195d13e`) 完成工作 + Mavis 父代理 DDD Review 通过 + merge 46196dd + cleanup worktree/分支.
+
+> **worker 实际产出 (Mavis 复跑验证)**:
+> - **commit `9d89eb3`** (worker lane): 11 文件, +1208 行 / -10 行, 仅 Rust 源码
+> - **merge `46196dd`** (回 main): ort 策略, clean merge
+> - `cargo check --workspace`: 0 errors / 15 dead_code warnings (heartbeat/session 预留 API 等 C-11 driver 激活, 范围明确)
+> - `cargo test -p im-gateway` (Mavis 父代理复跑): 20/20 PASS + migration_smoke 3/3 PASS (worker 报 133 PASS / 22 FAIL = 22 全是 WSL PG 18.6 未启环境依赖, 跟任务约定一致)
+> - DDD Review (守门 #1): 范围内, 无叙事编造, 无新依赖引入, 代签 Ulysses 格式合规
+
+> **C 阶段 WBS 关键路径状态跃迁** (per 132-wbs.md §5.3):
+> - **C-8** ✅ **Done** (之前 Todo): POST + GET /v1/conversations, Bearer-auth, guest DM + 群聊, cursor 分页
+> - **C-10** ✅ **Done** (之前 Todo): GET /v1/conversations/{id}/members, 成员鉴权 403
+> - **C-12** ✅ **Done (skeleton)** (之前 Todo): WS heartbeat module (HeartbeatConfig 30s/60s per aux-13 §1.1.8 + §1.3) + WsSession 状态机骨架 + PingFrame/PongFrame wire format. C-11 driver worker (下一个 lane) 实装 actix-ws 0.3 收发循环时激活
+> - C-1 ✅ + C-2 ✅ (lane1 已有) + C-8 ✅ + C-10 ✅ + C-12 ✅ = **5/12 C 阶段 (42%)**
+
+> **关键路径剩余** (per §3, 已扣减 9d89eb3):
+> - 之前 3.4M tokens - C-8 (max 400K) - C-10 (max 200K) - C-12 (max 160K) = **~2.64M tokens** 关键路径剩余 (3.4 周 - 实装消耗)
+> - 实装消耗 380K (worker base) / 760K (worker max) 符合 WBS §6 预估区间
+
+> **worktree + 分支清理** (per守门 #6 lane1..6 实战):
+> - `D:/wt-mvp-backend-core` worktree 删除 (`git worktree remove --force`)
+> - `wt/mvp-backend-core` 分支删除 (`git branch -d`)
+> - 只剩 main (HEAD = 46196dd) + 历史 `dev` 分支 (保留)
+
+> **3 lane 待启动状态更新**:
+> - **lane-backend-core**: ✅ ✅ Done (v1.5.0), C-8/10/12 + WsSession skeleton 完成. **下一轮 lane-backend-core 可推 C-3..C-7 auth 系列 + C-11 WsSession driver 实装 (actix-ws 0.3 收发循环)**
+> - **lane-infra-k3s**: ⚪ Waiting (F-1 Docker daemon Blocker, Ulysses 手动解; 解锁后 D-1 AppConfig::load() + D-2 tracing_init + F-2 k3s dev namespace 端到端)
+> - **lane-frontend-demo**: ⚪ Blocked (等 C-9 messages handler + WsSession driver 端到端跑通后开, V1 占位)
+> - **lane-deploy-acceptance**: ⚪ Waiting (E-1..E-4 测试补齐, 跟 backend 80% 重叠, 等 backend 推进后启动)
+
+> **v1.5.0 token 实际消耗**: worker 实装 + 父代理 review + commit + merge + cleanup = 主代理 Mavis ~5-10K tokens (规划+验收). 关键路径总剩余 ~2.64M tokens 维持.
 
 ## v1.4.0 增量 (2026-09-19 JST, lane-backend-core worker 起跑)
 
@@ -371,3 +405,4 @@ per 9/8 15:29 JST 第 7 次强化 (Mavis 自驱不被动等指令), 拍板不一
 | 1.2.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses H 阶段 7 项拍板全落地 (6 推荐项 + 1 非推荐项). 新增 §v1.2.0 增量 7 项拍板汇总表 + §9.3 拍板不一致 flag (H-5 三区域 vs H-7 CN-only, 3 项缺口 → 待 Ulysses 二次拍板). H 阶段从 Todo → Active. |
 | 1.3.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses H-5 三区域 3 项二次拍板全落推荐项, v1.2.0 flag 闭环 ✅ Closed. 新增 §v1.3.0 增量 + flag 闭环状态. lane-backend-core 起跑绿灯. |
 | 1.4.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板 "开 lane-backend-core worker (推荐)". 新增 §v1.4.0 增量: worktree `wt/mvp-backend-core` 创建 + worker 子代理 (task_id `bg_5d9bfd73...`) 后台派出, 范围 C-8 + C-10 + C-12, 授权边界 + 守门 #6 + 无证据叙事禁止 + 代签规则全写明在子 prompt. Mavis 主代理等子代理自动唤醒, 不轮询. |
+| 1.5.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | lane-backend-core worker 子代理 (task_id `bg_5d9bfd73...`) 完成 + Mavis DDD Review ✅ 通过 + merge 46196dd (clean merge) + cleanup worktree/分支. 新增 §v1.5.0 增量: C-8/10/12 → Done; C-11 WsSession 状态机骨架预留等下一轮 driver; 关键路径剩余 3.4M → 2.64M tokens (扣减 worker 实装). 下一轮目标: lane-backend-core 第二批 (C-3..C-7 auth + C-11 driver). |
