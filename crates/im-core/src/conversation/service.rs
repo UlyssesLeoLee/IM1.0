@@ -35,6 +35,13 @@ impl ConversationService {
         Self { repo }
     }
 
+    /// 暴露底层 repo(用于跨 service 显式调用,如 C-10 list_members)
+    /// MVP Day 3:留给 im-gateway 直接 list_members 用,C-9 之后考虑把 list_members
+    /// 提升到 service 层(避免泄漏 repo)
+    pub fn repo(&self) -> &Arc<dyn ConversationRepository> {
+        &self.repo
+    }
+
     pub async fn create_dm(
         &self,
         env: EnvironmentId,
