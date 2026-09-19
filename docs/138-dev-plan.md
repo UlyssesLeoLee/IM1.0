@@ -5,11 +5,42 @@ phase: 15-management
 activity_no: 138
 owners: 架构师 (Mavis 接手 agent per DEC-008)
 status: Active
-version: 1.3.0
+version: 1.4.0
 date: 2026-09-19 JST
 ---
 
 # 138. IM1.0 开发计划 (持续维护)
+
+## v1.4.0 增量 (2026-09-19 JST, lane-backend-core worker 起跑)
+
+> **触发**: Ulysses 2026-09-19 JST 15:44 拍板 "开 lane-backend-core worker (推荐)", Mavis 立即执行.
+
+> **执行动作 (2026-09-19 JST 15:45-15:50)**:
+> 1. **创建 worktree** `wt/mvp-backend-core` 分支 off main (HEAD = f64b870), 路径 `D:/wt-mvp-backend-core`
+> 2. **验证入口依赖**: `crates/im-gateway/src/{main.rs, error.rs, http/mod.rs}` + `crates/im-core/src/repository/conversation.rs` + `crates/im-protocol/` — 全部就绪
+> 3. **派 worker 子代理** (task_id `bg_5d9bfd73-dfa0-4995-93dd-99daa195d13e`, 后台跑, 自动唤醒主人):
+>    - **范围**: C-8 + C-10 + C-12 (HTTP handlers + WS heartbeat placeholder), 跟 WBS 132-wbs.md §5.3.2 对齐
+>    - **token 预算**: base 380K / max 760K (per 132-wbs.md §6 关键路径表, 远低于关键路径剩余 3.4M)
+>    - **授权边界** (写明在子 prompt): 只动 Rust 代码 + Cargo.toml + dev test, 不 commit / 不 force push / 不重命名现有 crate, 不引入新依赖除非必要, 不写 docs, 不联系外部服务, 不动 Docker/WSL/系统服务, 不打印 env
+>    - **"无证据叙事=禁止"** (8/26 守门): 禁止编造历史叙事 / 编造 token 数 / 编造 BAS 引用
+>    - **代签规则** (守门 #14 v3+v4 9/11): author=Ulysses (1 人公司 12 角色 per DEC-008) / 修订人=Ulysses
+>    - **期望产出**: WORK_SUMMARY.md (在 worktree 根) + 改动文件清单 + cargo check/clippy/test 输出 + 已知缺口
+>    - **不动**: 不 commit (留给 Mavis 父做) / 不动 docs/ / 不动 WSL/Docker / 不引入新依赖除非必要 + 注明
+> 4. **Mavis 父代理**:
+>    - 不轮询, 等子代理完成自动唤醒 (per 9/8 守门, 子代理完成 → 自动续段)
+>    - 子代理返回后, 接手做: 工作量验收 + WORK_SUMMARY.md 复核 + 已知缺口填补 + git commit (代签 Ulysses + 自审)
+>    - 不动 Docker/WSL/系统服务, 不写 docs (除 dev-plan v1.4.x 增量)
+
+> **lane-backend-core 状态**: In Progress (worker 已派出, 后台跑)
+> **其他 3 lane 状态**:
+> - lane-infra-k3s: Waiting (F-1 Docker daemon Blocker, Ulysses 手动解)
+> - lane-frontend-demo: Blocked (等 backend 落 C-9 后开, V1 占位)
+> - lane-deploy-acceptance: Waiting (E-1..E-4 测试补齐, 跟 backend 80% 重叠, 等 backend 推进后启动)
+
+> **v1.4.0 token 预算增量**:
+> - lane-backend-core: 380-760K tokens (此 worker)
+> - 累计支出 (per §10 修订历史): v1.0.0 + v1.1.0 + v1.2.0 + v1.3.0 + v1.4.0 = ~5 doc commits (~10K tokens / commit = 50K tokens docs 增量, 微不足道)
+> - 关键路径剩余: 3.4M tokens ≈ 3.4 周 (per §3 + §7)
 
 ## v1.3.0 增量 (2026-09-19 JST, H-5 三区域 3 项二次拍板闭环)
 
@@ -339,3 +370,4 @@ per 9/8 15:29 JST 第 7 次强化 (Mavis 自驱不被动等指令), 拍板不一
 | 1.1.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板"继续推进 IM Server MVP + worktree 并行 + worker 子代理". 新增 §9.1 worktree 4 lane 映射 + §9.2 拍板回执. 商业产品级 App + Web 作 V1 范围扩展, 不进 MVP 关键路径. 文档基线升至 v1.1.0, 修订历史栏 author=Ulysses / 审批=架构师(Mavis 接手 agent per DEC-008)+自审 / 修订人=Ulysses(1 人公司 12 角色 per DEC-008). |
 | 1.2.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses H 阶段 7 项拍板全落地 (6 推荐项 + 1 非推荐项). 新增 §v1.2.0 增量 7 项拍板汇总表 + §9.3 拍板不一致 flag (H-5 三区域 vs H-7 CN-only, 3 项缺口 → 待 Ulysses 二次拍板). H 阶段从 Todo → Active. |
 | 1.3.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses H-5 三区域 3 项二次拍板全落推荐项, v1.2.0 flag 闭环 ✅ Closed. 新增 §v1.3.0 增量 + flag 闭环状态. lane-backend-core 起跑绿灯. |
+| 1.4.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板 "开 lane-backend-core worker (推荐)". 新增 §v1.4.0 增量: worktree `wt/mvp-backend-core` 创建 + worker 子代理 (task_id `bg_5d9bfd73...`) 后台派出, 范围 C-8 + C-10 + C-12, 授权边界 + 守门 #6 + 无证据叙事禁止 + 代签规则全写明在子 prompt. Mavis 主代理等子代理自动唤醒, 不轮询. |
