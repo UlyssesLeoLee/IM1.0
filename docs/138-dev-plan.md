@@ -5,11 +5,38 @@ phase: 15-management
 activity_no: 138
 owners: 架构师 (Mavis 接手 agent per DEC-008)
 status: Active
-version: 1.10.0
+version: 1.11.0
 date: 2026-09-19 JST
 ---
 
 # 138. IM1.0 开发计划 (持续维护)
+
+## v1.11.0 增量 (2026-09-19 JST, Mavis 父代理亲自推 C-9 起跑)
+
+> **触发**: Ulysses 2026-09-19 JST 拍板 "Mavis 推 C-9 (推荐)" (per 9/5 04:03 立即执行不犹豫). per 9/8 第 7 次强化自驱.
+
+> **C-9 范围** (per 132-wbs.md §5.3.2):
+> - **C-9** POST `/v1/conversations/{id}/messages` (发消息)
+> - **C-9** GET `/v1/conversations/{id}/messages?after_sequence=&limit=` (历史拉取)
+> - 走 `MessageService::send_message` (C-2 ✅ 已实装)
+> - 走 `ConversationRepository::list_messages` + sequence allocator
+> - Bearer 鉴权 (`AuthedUser` extractor)
+> - 验证: member of conversation 才发 / 拉
+> - DTO: `SendMessageRequest { kind, content, reply_to? }` + `MessageResponse { id, conversation_id, sender_id, sequence, kind, content, created_at, edited_at?, recalled_at? }`
+> - aux-13 §3.4 历史拉取 spec
+> - token 范围: base 250K / max 500K
+
+> **派生**:
+> - Mavis 父代理亲自推 (worker 子代理 4 次失败累计, 不再用)
+> - 新 worktree `wt/lane-backend-core-3` off main HEAD `db99704`
+> - 实装完成 → commit + merge + cleanup + 升 v1.12.0
+> - 关键路径剩余 1-1.5M tokens, C-9 消耗后剩 ~0.5-1M (PoC-01 关键路径基本完成)
+
+> **lane 状态**:
+> - 🟢 lane-backend-core 第三批 (C-9 messages handler) — In Progress
+> - ⚪ lane-infra-k3s — Waiting (F-1 Blocker)
+> - ⚪ lane-frontend-demo — Blocked (等 C-9 落地 + WS 端到端)
+> - ⚪ lane-deploy-acceptance — Waiting (E-1..E-4 测试补齐)
 
 ## v1.10.0 增量 (2026-09-19 JST, lane-backend-core 第二批 C-3..C-7 + C-11 Done + merge main)
 
@@ -617,3 +644,4 @@ per 9/8 15:29 JST 第 7 次强化 (Mavis 自驱不被动等指令), 拍板不一
 | 1.8.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板"拆 3 个小 worker (推荐)" (per 9/5 04:03 立即执行不犹豫). 新增 §v1.8.0 增量: worker-A C-3+C-4 (270-540K) + worker-B C-5+C-6+C-7 (330-660K) + worker-C C-11 WsSession driver (400-800K), 3 个 worktree 分支 `wt/lane-backend-core-2{a,b,c}` 同时后台派出, 每 worker 强制"Step N 写完 → 立即 git status 自查"防净空跑. |
 | 1.9.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | 3 worker 子代理全部 failed (`net::ERR_CONNECTION_CLOSED` 浏览器截断, 累计 4 次失败率 100%, 切方案). Ulysses 拍板"Mavis 父代理亲自推 (推荐)" (per 9/8 第 7 次强化自驱). 新增 §v1.9.0 增量: Mavis 父代理直接实装, worktree 复用 `wt-mvp-backend-core-2a` (worker-A 80% 保留) + 清理 2b/2c + 实装 C-3..C-7 + C-11 + 修 138 §8 缺口 #8. 总估 1-1.5M tokens, 跟第二批原预算一致. 升 v1.10.0 落档 Done. |
 | 1.10.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Mavis 父代理亲自推实装完成, commit `c31825f` + merge `ffb7025` (clean merge) + cleanup. 新增 §v1.10.0 增量: C-3..C-7 + C-11 全 Done (11/12 C 阶段 = 92%), 修 138 §8 缺口 #8 (IdentityService::refresh placeholder bug → find_by_id), 已知缺口 #2 device_session_id JWT claim 留 V1. 测试 im-gateway 40/40 PASS + migration_smoke 3/3 PASS. 关键路径剩余 2.64M → 1-1.5M tokens. |
+| 1.11.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板 "Mavis 推 C-9 (推荐)" (per 9/5 04:03 立即执行). 新增 §v1.11.0 增量: C-9 messages handler (POST/GET `/v1/conversations/{id}/messages`, 250-500K tokens), 走 MessageService + ConversationRepository + Bearer 鉴权 + member 校验. 新 worktree `wt/lane-backend-core-3` off main HEAD `db99704`. Mavis 父代理亲自推 (worker 子代理 4 次失败累计, 不再用). |
