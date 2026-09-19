@@ -5,11 +5,49 @@ phase: 15-management
 activity_no: 138
 owners: 架构师 (Mavis 接手 agent per DEC-008)
 status: Active
-version: 1.6.0
+version: 1.7.0
 date: 2026-09-19 JST
 ---
 
 # 138. IM1.0 开发计划 (持续维护)
+
+## v1.7.0 增量 (2026-09-19 JST, lane-backend-core 第二批 worker 净空跑显式 flag)
+
+> **触发**: Worker 子代理 `bg_89f6c6c1-70fa-401e-b7e6-73941166de9f` 报告 "succeeded" 但实际净空跑 — 只有探索无代码产出 (per 守门 #7 max 2 retries + 9/8 15:29 自驱不静默).
+
+> **事实 (per 缺标比错标)**:
+> - worker 子代理 task_status = `succeeded`, session `mvs_b3e1e611051b4ba388d2bf0b91a3504f`
+> - worktree `D:/wt-mvp-backend-core-2` **git status 干净**: 0 modified, 0 new files
+> - **无 `WORK_SUMMARY.md`** (worker 报告信号文件缺失)
+> - 子代理最后输出: "Now let me read the WS skeleton and the identity service in parallel." (探索阶段, 没有代码产出)
+> - 总耗时 ~5 分钟 (跟 1-2M tokens 实装范围不匹配 — 净空跑信号)
+
+> **模式分析 (守门 #7 错误恢复, max 2 retries 触发)**:
+> | 任务 | 报告状态 | 实际产出 |
+> |---|---|---|
+> | 第一批 `bg_5d9bfd73...` | failed | ✅ 完整 WORK_SUMMARY + ~39KB Rust 代码 (+1208 行) |
+> | 第二批 `bg_89f6c6c1...` | succeeded | ❌ 净空跑 (无任何改动) |
+> | **失败模式**: 子代理在大量探查需求下, 上下文预算提前耗尽或 task 步骤预算用尽, 报告 succeeded 实际无产出 | | |
+> | **Mavis 防范**: 每个 worker 子代理 prompt 必须显式要求 "Step N 写完文件 → 立即检查 git status", 不要等到末尾整体汇报 | | |
+
+> **Lane-backend-core 第二批状态**: 重置回 Waiting (未产出)。worktree `wt-mvp-backend-core-2` 仍存在, 分支 `wt/lane-backend-core-2` 保留 (未污染)。
+
+> **Mavis 主动动作 (per 守门 #7 + 9/8 自驱)**:
+> 1. **不静默**: 显式 flag 给 Ulysses (本节), 不假装第二批成功
+> 2. **不复用同一失败模型**: 不能再派一个 1-2M tokens 单 worker, 必须拆小任务
+> 3. **拆小执行建议**:
+>    - **方案 a (推荐)**: 拆 3 个小 worker, 每个 200-400K tokens:
+>      - worker-A: C-3 + C-4 (POST /auth/token + /auth/guest), 270-540K tokens
+>      - worker-B: C-5 + C-6 + C-7 (refresh + link + logout), 330-660K tokens
+>      - worker-C: C-11 WsSession driver (actix-ws 0.3), 400-800K tokens
+>    - **方案 b**: 单 worker 但 prompt 加 "每步必须 git commit 才计入进度, 否则视为未完成"
+>    - **方案 c**: Mavis 主代理亲自推 C-3..C-7 (Mavis 1 人公司 1M tokens/周可承载), 留给 C-11 worker
+> 4. **环境依赖持续**: WSL PG 18.6 未启 (per 135 §3.1), auth 系列 worker 测试时 PG 集成测试依然会 fail, 这是已知不需要修
+> 5. **不清理 worktree**: 留给下一轮复用 (避免重复 git worktree add 开销)
+
+> **关键路径剩余不变**: 2.64M tokens (第二批还没消耗)
+
+> **下次决策**: Ulysses 拍板拆法 (方案 a/b/c), Mavis 立即按拍板分派
 
 ## v1.6.0 增量 (2026-09-19 JST, lane-backend-core 第二批起跑)
 
@@ -454,3 +492,4 @@ per 9/8 15:29 JST 第 7 次强化 (Mavis 自驱不被动等指令), 拍板不一
 | 1.4.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板 "开 lane-backend-core worker (推荐)". 新增 §v1.4.0 增量: worktree `wt/mvp-backend-core` 创建 + worker 子代理 (task_id `bg_5d9bfd73...`) 后台派出, 范围 C-8 + C-10 + C-12, 授权边界 + 守门 #6 + 无证据叙事禁止 + 代签规则全写明在子 prompt. Mavis 主代理等子代理自动唤醒, 不轮询. |
 | 1.5.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | lane-backend-core worker 子代理 (task_id `bg_5d9bfd73...`) 完成 + Mavis DDD Review ✅ 通过 + merge 46196dd (clean merge) + cleanup worktree/分支. 新增 §v1.5.0 增量: C-8/10/12 → Done; C-11 WsSession 状态机骨架预留等下一轮 driver; 关键路径剩余 3.4M → 2.64M tokens (扣减 worker 实装). 下一轮目标: lane-backend-core 第二批 (C-3..C-7 auth + C-11 driver). |
 | 1.6.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板 "开 lane-backend-core 第二批 (推荐)". 新增 §v1.6.0 增量: 范围 C-3..C-7 auth 系列 (5 endpoint, 600-1200K tokens) + C-11 WsSession driver actix-ws 0.3 收发循环 (400-800K tokens), 总计 1-2M tokens (远低于关键路径剩余 2.64M). 1 个 worker 子代理同时推 (上下文可承载 8 crates 全图). worktree `wt/lane-backend-core-2` off main. |
+| 1.7.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | lane-backend-core 第二批 worker `bg_89f6c6c1...` 报告 succeeded 但实际净空跑 (worktree git status 干净, 无 WORK_SUMMARY, 子代理最后停在探索阶段). per 守门 #7 max 2 retries + 9/8 15:29 自驱不静默, **不假装成功**. 新增 §v1.7.0 增量: 重置第二批状态 → Waiting, 不清理 worktree, 3 方案拆小待 Ulysses 拍板 (a 拆 3 worker 200-800K 各 / b 单 worker 强制每步 git commit / c Mavis 亲自推 C-3..C-7 + 留 C-11 worker). |
