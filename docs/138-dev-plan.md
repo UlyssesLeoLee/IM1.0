@@ -5,11 +5,47 @@ phase: 15-management
 activity_no: 138
 owners: 架构师 (Mavis 接手 agent per DEC-008)
 status: Active
-version: 1.12.0
+version: 1.13.0
 date: 2026-09-19 JST
 ---
 
 # 138. IM1.0 开发计划 (持续维护)
+
+## v1.13.0 增量 (2026-09-19 JST, Mavis 父代理亲自推 D-1 wire-up 起跑)
+
+> **触发**: Ulysses 2026-09-19 JST 拍板 "D-1 wire-up (推荐)" (per 9/5 04:03 立即执行). per 9/8 第 7 次强化自驱.
+
+> **D-1 范围** (per 132-wbs.md §5.4):
+> - D-1 `im_common::config::AppConfig::load()` 实装 (figment + dotenvy + 双密钥 JSON)
+>   - 配置文件: `config/default.toml` + `config/local.toml` (gitignored) + env vars
+>   - 配置项 (per aux-12 配置项规格 46 项):
+>     - `http_port` (u16, 默认 8080)
+>     - `postgres_url` (String)
+>     - `server_secrets` (HashMap<EnvironmentId, SecretString>) — MVP mock secrets
+>     - `jwt_signing_keys` (Vec<SigningKey>) — 双密钥 (v1 + v2 轮换)
+>     - `refresh_pepper` (SecretString)
+>     - `event_publisher` (kind: stub | nats)
+>     - 等等
+> - D-1 main.rs wire-up:
+>   - 替换 hardcode 8080 fallback
+>   - 构造 PgPool → PgUserRepository / PgDeviceSessionRepository / PgMessageRepository / PgSequenceAllocator
+>   - 构造 EventPublisher stub (MVP 不连 NATS, 后续 D-3)
+>   - 构造 ConversationService + MessageService + IdentityService + TokenService
+>   - 注入 AppState::new(conversation_service, message_service, token_service, identity_service)
+> - token 范围: base 200K / max 400K
+
+> **派生**:
+> - Mavis 父代理亲自推
+> - 新 worktree `wt/lane-config-wireup` off main HEAD `62079bc`
+> - 实装完成 → commit + merge + cleanup + 升 v1.14.0
+> - 不引入 figment / dotenvy 是新依赖, commit message 注明
+> - 关键路径剩余 ~0.5-1M tokens, D-1 消耗后剩 ~0.1-0.6M
+
+> **lane 状态**:
+> - 🟢 lane-config-wireup (D-1) — In Progress
+> - ⚪ lane-infra-k3s — Waiting (F-1 Blocker)
+> - ⚪ lane-frontend-demo — Blocked (现在 D-1 完成后 main bin 可启动, WS 端到端可跑)
+> - ⚪ lane-deploy-acceptance — Waiting
 
 ## v1.12.0 增量 (2026-09-19 JST, lane-backend-core 第三批 C-9 Done + merge main)
 
@@ -698,3 +734,4 @@ per 9/8 15:29 JST 第 7 次强化 (Mavis 自驱不被动等指令), 拍板不一
 | 1.10.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Mavis 父代理亲自推实装完成, commit `c31825f` + merge `ffb7025` (clean merge) + cleanup. 新增 §v1.10.0 增量: C-3..C-7 + C-11 全 Done (11/12 C 阶段 = 92%), 修 138 §8 缺口 #8 (IdentityService::refresh placeholder bug → find_by_id), 已知缺口 #2 device_session_id JWT claim 留 V1. 测试 im-gateway 40/40 PASS + migration_smoke 3/3 PASS. 关键路径剩余 2.64M → 1-1.5M tokens. |
 | 1.11.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板 "Mavis 推 C-9 (推荐)" (per 9/5 04:03 立即执行). 新增 §v1.11.0 增量: C-9 messages handler (POST/GET `/v1/conversations/{id}/messages`, 250-500K tokens), 走 MessageService + ConversationRepository + Bearer 鉴权 + member 校验. 新 worktree `wt/lane-backend-core-3` off main HEAD `db99704`. Mavis 父代理亲自推 (worker 子代理 4 次失败累计, 不再用). |
 | 1.12.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Mavis 父代理亲自推 C-9 完成, commit `2e41ecb` + merge `49fe9b5` (clean merge) + cleanup. 新增 §v1.12.0 增量: POST/GET `/v1/conversations/{id}/messages` 实装, AppState 加 message_service. **C 阶段 12/12 Done (100%)**. 测试 cargo check 0 errors, cargo test 超时 (守门 #7 切方案 commit based on check). 关键路径剩余 ~0.5-1M tokens. 下一轮 D-1 wire-up + F-2 k3s + lane-frontend-demo 候选. |
+| 1.13.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板 "D-1 wire-up (推荐)" (per 9/5 04:03 立即执行). 新增 §v1.13.0 增量: D-1 `AppConfig::load()` 实装 (figment + dotenvy + 双密钥 JSON) + main.rs wire-up (PgPool + Pg repos + EventPublisher stub + Service 实例化 + AppState 注入), 200-400K tokens. 新 worktree `wt/lane-config-wireup` off main HEAD `62079bc`. Mavis 父代理亲自推. |
