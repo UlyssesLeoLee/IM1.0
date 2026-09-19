@@ -5,11 +5,31 @@ phase: 15-management
 activity_no: 138
 owners: 架构师 (Mavis 接手 agent per DEC-008)
 status: Active
-version: 1.0.0
-date: 2026-09-11 JST
+version: 1.1.0
+date: 2026-09-19 JST
 ---
 
-# 138. 合并 + 清理后 IM1.0 开发计划
+# 138. IM1.0 开发计划 (持续维护)
+
+## v1.1.0 增量 (2026-09-19 JST)
+
+> **触发**: Ulysses 2026-09-19 14:33 JST 拍板"推进 dev 到能达到商业产品标准,有 App 和网页版, 可拆分任务并行处理", 后续 ask_user 落定 3 项推荐项.
+
+> **3 项 Ulysses 拍板** (2026-09-19 JST, ask_user 推荐项全中):
+> 1. **target_product**: 继续推进 IM Server MVP (推荐) — 不重起炉, 用现有 IM1.0 crates 作为产品主体.
+> 2. **split_means**: worktree 分支并行 (推荐) — 复用 9/9-11 lane1..6 实战模式, 后续开 4 条 worktree 同时推 (lane1=后端核心 / lane2=基础设施 / lane3=产品前端 / lane4=部署验收).
+> 3. **delegation**: Mavis 主 + worker 子代理 (推荐) — 守门 #6 (8/27) + #14 v2+v3+v4 (9/3-9/11) 实战验证, 子代理授权边界写明"无证据叙事=禁止".
+
+> **新增工作量 (v1.1.0)**:
+> - 商业产品级 K3s 上多端 demo 客户端 (营销站 + Demo App) — Mavis 推荐作为 V1 范围扩展, 不进 MVP 关键路径.
+> - MVP 关键路径不变 — per H-1 推荐 C 12 周, H-3 推荐 PoC-01 (双终端 DM), 关键路径 3.4M tokens 剩余.
+> - worktree 并行新增 4 lane: lane-backend-core / lane-infra-k3s / lane-frontend-demo / lane-deploy-acceptance. 跟 Phase C/D/E/F 映射 (见 §11).
+
+## v1.0.0 主体 (2026-09-11 JST, 见后续章节)
+
+[truncated 8 lines for downstream reference]
+
+# 138. 合并 + 清理后 IM1.0 开发计划 (v1.0.0 主体)
 
 > **触发**: 2026-09-11 JST 6 个 WBS lane 分支合并到 main + 本地分支/worktree 清理后
 > **责任**: 架构师 (Mavis 接手 agent per DEC-008) 编制 / PM (Ulysses / 1 人公司 12 角色 per DEC-008) 修订
@@ -210,6 +230,31 @@ per 135 §9 (10 项) + 136 verifier 走读 (P0=0 P1=0 P2=6) 整理:
 | 11 | **新增**: WSL PG 18.6 当前未启动 | cargo test 22 fail | `bash scripts/restart-pg18-b1-all.sh` |
 | 12 | **新增**: origin/main 未同步本次合并 | 本地领先 6 个 commit | 等 Ulysses 拍板 push |
 
+## 9.1 v1.1.0 worktree 并行 lane 映射 (2026-09-19 JST, Ulysses 拍板推荐项全中)
+
+per split_means + delegation 推荐项, 复用 9/9-11 lane1..6 实战模式开新 4 lane. 每条 lane = 1 个 worktree + 1 个 worker 子代理 + Mavis 主代理验收.
+
+| Lane | Worktree 分支 | WBS 范围 | worker 子代理 | 验收人 | 入口依赖 |
+|---|---|---|---|---|---|
+| **lane-backend-core** | `wt/mvp-backend-core` | C-3..C-7 + C-8/10 + C-12 (HTTP handlers + auth + 心跳) | worker | Mavis + verifier | C-1 ✅ + C-2 ✅ |
+| **lane-infra-k3s** | `wt/mvp-infra-k3s` | F-1 解锁后 F-2/F-3/F-4 + D-1/D-2 配置 + 观测 | worker | Mavis + verifier | F-1 解锁 |
+| **lane-frontend-demo** | `wt/mvp-frontend-demo` | 商业产品级营销站 (Next.js) + Demo App (React Native / Capacitor 套壳, per 9/1 envoy 偏好走独立 deployment) | worker | Mavis + verifier | C-8 + C-9 真跑通后 |
+| **lane-deploy-acceptance** | `wt/mvp-deploy-acceptance` | E-1/2/3/4 测试补齐 + healthz/readyz + CI deploy-dev | worker | Mavis + verifier | lane-backend-core 完 |
+
+> **lane-frontend-demo 备注**: 商业产品级 App + Web 是 V1 范围扩展, 不进 MVP 关键路径 (per H-1 推荐 C 12 周, MVP = PoC-01 双终端 DM). 此 lane 等 lane-backend-core 落地 C-8/C-9 稳定后再开 — 避免在 API 协议冻结前烧 token 做 UI.
+>
+> **envoy 独立 deployment**: per 9/1 13:03/13:05 JST, 前端 dist 部署走 envoy (不 nginx, 不 istio sidecar). lane-frontend-demo 默认产物 = Next.js dist/ + envoy deployment yaml + ClusterIP svc.
+
+## 9.2 v1.1.0 Ulysses 拍板回执 (2026-09-19 JST)
+
+```
+target_product opt1 (推荐) — 继续推进 IM Server MVP
+split_means opt1 (推荐) — worktree 分支并行
+delegation opt1 (推荐) — Mavis 主 + worker 子代理
+```
+
+3 项推荐项全中. Mavis 9/8 第 6 次强化 (15:19 JST) — Ulysses 全部决策 Mavis 代理, 不再重问. 但 H 阶段 7 项拍板为关键路径上游 Blocker, 按 9/1 14:58 JST 守门拍板必 ask_user 给推荐项, 仍需 1 次性 ask_user 让 Ulysses 拍完.
+
 ## 9. 关联文档 (References)
 
 - 上游: 132-wbs.md v1.0.0 (WBS 主体)
@@ -225,3 +270,4 @@ per 135 §9 (10 项) + 136 verifier 走读 (P0=0 P1=0 P2=6) 整理:
 | 版本 | 日期 | 修订人 | 内容 |
 |---|---|---|---|
 | 1.0.0 | 2026-09-11 JST | 架构师 (Mavis 接手 agent per DEC-008) | 初版: 6 lane 合并 + 清理后, 全 WBS 41 项状态盘点, 关键路径剩余, Blocker 列表, PM 决策项, 7 天执行建议, token 预算, 12 项已知缺口 |
+| 1.1.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板"继续推进 IM Server MVP + worktree 并行 + worker 子代理". 新增 §9.1 worktree 4 lane 映射 + §9.2 拍板回执. 商业产品级 App + Web 作 V1 范围扩展, 不进 MVP 关键路径. 文档基线升至 v1.1.0, 修订历史栏 author=Ulysses / 审批=架构师(Mavis 接手 agent per DEC-008)+自审 / 修订人=Ulysses(1 人公司 12 角色 per DEC-008). |
