@@ -5,11 +5,58 @@ phase: 15-management
 activity_no: 138
 owners: 架构师 (Mavis 接手 agent per DEC-008)
 status: Active
-version: 1.5.0
+version: 1.6.0
 date: 2026-09-19 JST
 ---
 
 # 138. IM1.0 开发计划 (持续维护)
+
+## v1.6.0 增量 (2026-09-19 JST, lane-backend-core 第二批起跑)
+
+> **触发**: Ulysses 2026-09-19 JST 拍板 "开 lane-backend-core 第二批 (推荐)", Mavis 立即执行 (per 9/8 第 7 次强化自驱).
+
+> **第二批范围** (per 132-wbs.md §5.3.2):
+> 1. **C-3..C-7 auth 系列** (5 endpoint):
+>    - C-3 POST `/v1/auth/token` (token_exchange, guest + 平台账号) — base 150K / max 300K
+>    - C-4 POST `/v1/auth/guest` (匿名注册) — base 120K / max 240K
+>    - C-5 POST `/v1/auth/refresh` (refresh_token 流转 access_token) — base 100K / max 200K
+>    - C-6 POST `/v1/auth/link` (匿名账号关联平台账号) — base 150K / max 300K
+>    - C-7 POST `/v1/auth/logout` (撤销设备会话) — base 80K / max 160K
+>    - **小计**: base 600K / max 1200K
+> 2. **C-11 WsSession driver** (actix-ws 0.3 收发循环实装):
+>    - actix-ws 0.3 Text/Binary 收发循环
+>    - im-core gRPC 客户端调用
+>    - auth state machine 激活 (mark_authenticated 调用)
+>    - heartbeat 集成 (C-12 skeleton 激活)
+>    - ForceDisconnect 广播 hook
+>    - base 400K / max 800K
+> - **C-11 总计**: base 400K / max 800K
+
+> **第二批总计**: base 1000K / max 2000K (1M-2M tokens 区间, 跟 132-wbs.md §6 关键路径剩余 2.64M tokens 兼容)
+
+> **派工策略** (per守门 #14 v3+v4):
+> - **1 个 worker 子代理** 同时推 C-3..C-7 + C-11 (合计 1-2M tokens, 单 worker 容量够, 上下文可承载 8 个 crates 全图)
+> - **worktree**: `wt/lane-backend-core-2` off main (HEAD = 3c1ddac)
+> - **授权边界** 同守门 #14 v3+v4:
+>   - 只动 Rust 代码 + Cargo.toml
+>   - 不 commit (留给 Mavis 父做)
+>   - 不引入新依赖除非必要 + commit 注明
+>   - 不动 docs/ migrations/ scripts/ deploy/ docker/
+>   - 不动 Docker/WSL/系统服务
+>   - 无证据叙事禁止 (8/26 守门)
+>   - 代签 Ulysses (守门 #14 v3+v4)
+>   - 不打印 env / Get-ChildItem env: (8/27 11:06 守门)
+
+> **执行动作** (Mavis 立即跑, 后台):
+> 1. `git worktree add -b wt/lane-backend-core-2 ../wt-mvp-backend-core-2 main`
+> 2. 派 worker 子代理 (task_id 即将生成)
+> 3. 子代理完成 → Mavis DDD Review → merge → cleanup → 升 v1.7.0
+
+> **lane 状态**:
+> - lane-backend-core 第二批 → 🟢 In Progress (起跑)
+> - lane-infra-k3s → ⚪ Waiting (F-1 Blocker)
+> - lane-frontend-demo → ⚪ Blocked (等第二批完成 + C-9)
+> - lane-deploy-acceptance → ⚪ Waiting (跟 backend 重叠)
 
 ## v1.5.0 增量 (2026-09-19 JST, lane-backend-core C-8/C-10/C-12 worker Done + merge main)
 
@@ -406,3 +453,4 @@ per 9/8 15:29 JST 第 7 次强化 (Mavis 自驱不被动等指令), 拍板不一
 | 1.3.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses H-5 三区域 3 项二次拍板全落推荐项, v1.2.0 flag 闭环 ✅ Closed. 新增 §v1.3.0 增量 + flag 闭环状态. lane-backend-core 起跑绿灯. |
 | 1.4.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板 "开 lane-backend-core worker (推荐)". 新增 §v1.4.0 增量: worktree `wt/mvp-backend-core` 创建 + worker 子代理 (task_id `bg_5d9bfd73...`) 后台派出, 范围 C-8 + C-10 + C-12, 授权边界 + 守门 #6 + 无证据叙事禁止 + 代签规则全写明在子 prompt. Mavis 主代理等子代理自动唤醒, 不轮询. |
 | 1.5.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | lane-backend-core worker 子代理 (task_id `bg_5d9bfd73...`) 完成 + Mavis DDD Review ✅ 通过 + merge 46196dd (clean merge) + cleanup worktree/分支. 新增 §v1.5.0 增量: C-8/10/12 → Done; C-11 WsSession 状态机骨架预留等下一轮 driver; 关键路径剩余 3.4M → 2.64M tokens (扣减 worker 实装). 下一轮目标: lane-backend-core 第二批 (C-3..C-7 auth + C-11 driver). |
+| 1.6.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板 "开 lane-backend-core 第二批 (推荐)". 新增 §v1.6.0 增量: 范围 C-3..C-7 auth 系列 (5 endpoint, 600-1200K tokens) + C-11 WsSession driver actix-ws 0.3 收发循环 (400-800K tokens), 总计 1-2M tokens (远低于关键路径剩余 2.64M). 1 个 worker 子代理同时推 (上下文可承载 8 crates 全图). worktree `wt/lane-backend-core-2` off main. |
