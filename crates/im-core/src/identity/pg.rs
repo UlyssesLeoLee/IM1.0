@@ -275,6 +275,27 @@ impl DeviceSessionRepository for PgDeviceSessionRepository {
         Ok(row.map(DeviceSessionRow::into_session))
     }
 
+    async fn find_by_id(
+        &self,
+        id: DeviceSessionId,
+    ) -> Result<Option<DeviceSession>, im_common::AppError> {
+        // 2026-09-19 lane-backend-core-2 (per 138 §8 缺口 #8 fix)
+        // IdentityService::refresh 用此方法直接按 session_id 查 session,
+        // 避免之前 placeholder bug (传 UserId::nil + 空 hash 永远返回 None)
+        let row: Option<DeviceSessionRow> = sqlx::query_as(
+            r#"
+            SELECT id, user_id, device_fingerprint, created_at, revoked_at
+            FROM device_sessions
+            WHERE id = $1
+            "#,
+        )
+        .bind(id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(row.map(DeviceSessionRow::into_session))
+    }
+
     async fn revoke(&self, id: DeviceSessionId) -> Result<(), im_common::AppError> {
         let n = sqlx::query(
             r#"

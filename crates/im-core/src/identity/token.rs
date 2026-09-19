@@ -30,6 +30,14 @@ pub trait DeviceSessionRepository: Send + Sync {
         refresh_token_hash: &str,
     ) -> Result<Option<DeviceSession>, im_common::AppError>;
     async fn revoke(&self, id: im_common::ids::DeviceSessionId) -> Result<(), im_common::AppError>;
+    /// 按 session id 直接查 (per 138 §8 缺口 #8 + 2026-09-19 lane-backend-core-2 修 IdentityService::refresh placeholder bug)
+    ///
+    /// refresh_token 格式 `<session_id>.<raw>`, 解析 session_id 后用此方法查 session
+    /// (避免 caller 传 UserId::nil 占位 bug)
+    async fn find_by_id(
+        &self,
+        id: im_common::ids::DeviceSessionId,
+    ) -> Result<Option<DeviceSession>, im_common::AppError>;
 }
 
 /// JWT 签名密钥(含 kid, 用于轮换期双密钥校验)
