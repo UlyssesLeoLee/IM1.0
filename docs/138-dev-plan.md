@@ -5,11 +5,29 @@ phase: 15-management
 activity_no: 138
 owners: 架构师 (Mavis 接手 agent per DEC-008)
 status: Active
-version: 1.1.0
+version: 1.2.0
 date: 2026-09-19 JST
 ---
 
 # 138. IM1.0 开发计划 (持续维护)
+
+## v1.2.0 增量 (2026-09-19 JST, H 阶段 7 项 PM 拍板落地)
+
+> **触发**: Ulysses 2026-09-19 14:33 JST 起 ask_user 拍板 7 项 + Mavis 落档 1 项不一致 flag.
+
+> **H 阶段 7 项拍板落地** (per 9/1 14:58 JST 守门, 拍板必 ask_user 给推荐项):
+
+| ID | 拍板项 | Ulysses 选 | 推荐项? | 落地动作 |
+|---|---|---|---|---|
+| **H-1** | 截止日 | C: 12 周后 2026-11-26 | ✅ 是 | MVP = 12 周 12M tokens, internal demo Day 10 + PoC 验收 Day 12 |
+| **H-2** | 团队 | N/A 1 人公司 | ✅ 是 | RACI 仅 PM (Ulysses), 其余 11 角色由 Ulysses 兼任 per DEC-008; 联系人 = Mavis 接手 agent per 守门 #14 v3+v4 |
+| **H-3** | 首个客户 PoC | PoC-01 双终端 DM | ✅ 是 | Mavis 1 人公司 2 周 3M tokens 可完成; PoC-01 = C-1/2/3/4/7/8/9/11 + D-2 + E-3 共 10 WBS |
+| **H-4** | NFR 数量 | 接入 H-4 推荐值 | ✅ 是 | P99 发送 < 100ms, P99 推送 < 1s, 万级租户同时在线, 99.95% 月度可用 (SLO) |
+| **H-5** | 法规适配 | **CN+JP+NA 三区域** | ⚠️ **非推荐项** | +3M tokens 工程量 + 法务咨询缺口; 见 §9.3 缺口 |
+| **H-6** | 监控+日志+IM 栈 | Slack + 自建 K3s | ✅ 是 | per 9/1 13:05 JST 守门 envoy 独立 deployment; $0/月 + token 成本 4-8K/周 |
+| **H-7** | 实名认证/短信 | 阿里云 CN 仅 | ✅ 是 (但冲突 H-5) | 见 §9.3 缺口 |
+
+> **H 阶段 7 项拍板汇总**: 6 项推荐项 + 1 项非推荐项 (H-5 三区域). H 阶段从 "Todo 紧迫" → "Active 已拍板".
 
 ## v1.1.0 增量 (2026-09-19 JST)
 
@@ -255,6 +273,21 @@ delegation opt1 (推荐) — Mavis 主 + worker 子代理
 
 3 项推荐项全中. Mavis 9/8 第 6 次强化 (15:19 JST) — Ulysses 全部决策 Mavis 代理, 不再重问. 但 H 阶段 7 项拍板为关键路径上游 Blocker, 按 9/1 14:58 JST 守门拍板必 ask_user 给推荐项, 仍需 1 次性 ask_user 让 Ulysses 拍完.
 
+## 9.3 v1.2.0 拍板不一致 flag (2026-09-19 JST, Mavis 显式 flag)
+
+per 9/8 15:29 JST 第 7 次强化 (Mavis 自驱不被动等指令), 拍板不一致必须显式 flag, 不静默执行. Ulysses 选 H-5 = CN+JP+NA 三区域 (非推荐项), 跟 H-7 = 阿里云 CN 仅 冲突:
+
+| 冲突项 | H-5 选 | H-7 选 | 冲突内容 | Mavis 主动动作 |
+|---|---|---|---|---|
+| **A. 实名/短信供应商** | CN+JP+NA 三区域 | 阿里云 CN 仅 | NA 区域无阿里云, 必须 Twilio / AWS SNS; JP 需 TEL 验证; CN 可用阿里云 | Mavis 默认按 H-7 = 阿里云 CN 推进, NA/JP 区域扩展列入 V1 范围, **但因 H-5 三区域拍板必须升级 H-7 区域支持** |
+| **B. 工程量缺口** | 三区域 +3M tokens (per H-5 选项描述) | Mavis 1 人公司 1M tokens/周 | 1 人公司 +3M tokens = 多花 3 周, 偏离 MVP 12 周总预算 (24%) | **Mavis 不会自动加这 3 周, 也不会砍掉三区域**, 给 Ulysses 二次拍板 (per 9/5 04:03 JST 守门: 拍板必带推荐项) |
+| **C. 法务咨询缺口** | 三区域 = CN+JP+NA | 1 人公司无外部法务 | JP《電通事業法》+ NA COPPA + 加州 CCPA 需要本地律师 + 内容审核供应商 | Mavis 已知缺口, 不擅自联系外部律师 (per 9/8 守门 host 状态改变 ask_user) |
+
+> **v1.2.0 flag 待 Ulysses 二次拍板**:
+> 1. H-7 区域支持 (CN-only → CN+JP+NA 升级? 需要 Mavis 加 1M tokens 区域供应商接入工作量)
+> 2. H-5 法务咨询授权 (Mavis 可联系外部律师? 预算上限? 推荐 vs Ulysses 自接?)
+> 3. MVP 12 周预算调整 (+3 周 三区域工程量, 还是 +6 周 三区域 + 升级 H-7 = +3M+1M = 4M tokens)
+
 ## 9. 关联文档 (References)
 
 - 上游: 132-wbs.md v1.0.0 (WBS 主体)
@@ -271,3 +304,4 @@ delegation opt1 (推荐) — Mavis 主 + worker 子代理
 |---|---|---|---|
 | 1.0.0 | 2026-09-11 JST | 架构师 (Mavis 接手 agent per DEC-008) | 初版: 6 lane 合并 + 清理后, 全 WBS 41 项状态盘点, 关键路径剩余, Blocker 列表, PM 决策项, 7 天执行建议, token 预算, 12 项已知缺口 |
 | 1.1.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses 拍板"继续推进 IM Server MVP + worktree 并行 + worker 子代理". 新增 §9.1 worktree 4 lane 映射 + §9.2 拍板回执. 商业产品级 App + Web 作 V1 范围扩展, 不进 MVP 关键路径. 文档基线升至 v1.1.0, 修订历史栏 author=Ulysses / 审批=架构师(Mavis 接手 agent per DEC-008)+自审 / 修订人=Ulysses(1 人公司 12 角色 per DEC-008). |
+| 1.2.0 | 2026-09-19 JST | 架构师 (Mavis 接手 agent per DEC-008) | Ulysses H 阶段 7 项拍板全落地 (6 推荐项 + 1 非推荐项). 新增 §v1.2.0 增量 7 项拍板汇总表 + §9.3 拍板不一致 flag (H-5 三区域 vs H-7 CN-only, 3 项缺口 → 待 Ulysses 二次拍板). H 阶段从 Todo → Active. |
