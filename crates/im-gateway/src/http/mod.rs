@@ -2,16 +2,18 @@
 //!
 //! 依据: ImplementationSpec §3.1 + aux-13 §3
 //!
-//! ## 注册范围 (per 132-wbs.md §5.3 + 2026-09-19 lane-backend-core-2 实装)
+//! ## 注册范围 (per 132-wbs.md §5.3 + 2026-09-19 lane-backend-core 实装)
 //! MVP Day 3: C-8 / C-10 / C-12 wired
-//! MVP Day 4 (lane-backend-core-2, Mavis 父代理亲自推): C-3..C-7 + C-11 wired
-//! 留给后续: C-9 messages handler (lane-messages)
+//! MVP Day 4 (lane-backend-core-2): C-3..C-7 + C-11 wired
+//! MVP Day 5 (lane-backend-core-3): C-9 wired
+//! 留给后续: E-1..E-4 测试补齐, F-2 k3s namespace
 
 pub mod auth;
 pub mod auth_handlers;
 pub mod conversations;
 pub mod error_response;
 pub mod members;
+pub mod messages;
 pub mod state;
 
 use actix_web::web;
@@ -33,17 +35,25 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
             .route("/logout", actix_web::web::post().to(auth_handlers::logout)),
     );
 
-    // 会话(5) — MVP Day 3 实装 C-8 + C-10
-    //   C-9 messages POST/GET    → 后续 worker 实装 (留给 lane-messages)
-    //   C-8 conversations POST   → 本 PR 实装(创建 dm/group/channel)
-    //   C-8 conversations GET    → 本 PR 实装(列出当前用户所有会话)
-    //   C-10 conversations/{id}/members GET → 本 PR 实装
+    // 会话(5) — MVP Day 3+5 实装 C-8 + C-9 + C-10
+    //   C-9 messages POST/GET    → lane-backend-core-3 实装 (本 PR)
+    //   C-8 conversations POST   → 已有实装(创建 dm/group/channel)
+    //   C-8 conversations GET    → 已有实装(列出当前用户所有会话)
+    //   C-10 conversations/{id}/members GET → 已有实装
+    //   GET conversations/{id}   → 仍走 placeholder (out-of-scope)
     cfg.service(
         actix_web::web::scope("/conversations")
             .route("", actix_web::web::post().to(conversations::create))
             .route("", actix_web::web::get().to(conversations::list))
             .route("/{id}", actix_web::web::get().to(crate::placeholder::conv_get))
-            .route("/{id}/messages", actix_web::web::get().to(crate::placeholder::msg_list))
+            .route(
+                "/{id}/messages",
+                actix_web::web::post().to(messages::send_message),
+            )
+            .route(
+                "/{id}/messages",
+                actix_web::web::get().to(messages::list_messages),
+            )
             .route(
                 "/{id}/members",
                 actix_web::web::get().to(members::list),

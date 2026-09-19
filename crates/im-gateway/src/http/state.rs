@@ -25,12 +25,18 @@ use im_core::conversation::service::ConversationService;
 use im_core::identity::pg::{PgDeviceSessionRepository, PgUserRepository};
 use im_core::identity::service::IdentityService;
 use im_core::identity::token::TokenService;
+use im_core::message::service::MessageService;
 
 /// im-gateway 共享 handler 状态(用 `web::Data<AppState>` 注入)
 #[derive(Clone)]
 pub struct AppState {
-    /// Conversation 服务(C-8 / C-10 用)
+    /// Conversation 服务(C-8 / C-10 / C-9 list member check)
     pub conversation_service: Arc<ConversationService>,
+
+    /// Message 服务(C-9 send + list)
+    /// 注: MessageService 不是泛型 struct (per service.rs:49), 内部字段已 type-erased,
+    ///     用具体类型不需要 generic 参数
+    pub message_service: Arc<MessageService>,
 
     /// Token 验证服务(C-8 + C-10 Bearer 鉴权 + C-3/C-4 签发)
     pub token_service: Arc<TokenService>,
@@ -46,11 +52,13 @@ impl AppState {
     /// 构造最小可用 AppState (Day 4 + D-1 衔接)
     pub fn new(
         conversation_service: Arc<ConversationService>,
+        message_service: Arc<MessageService>,
         token_service: Arc<TokenService>,
         identity_service: Arc<IdentityService<PgUserRepository, PgDeviceSessionRepository>>,
     ) -> Self {
         Self {
             conversation_service,
+            message_service,
             token_service,
             identity_service,
         }
