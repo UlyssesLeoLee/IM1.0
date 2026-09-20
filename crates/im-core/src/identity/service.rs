@@ -5,6 +5,7 @@
 //! ## 责任
 //! - Server-to-Server Token Exchange (GAME-ID-003 红线)
 //! - Guest 注册
+//! - **2026-09-20 C-3 WBS 新增**: username/password register + RS256 JWT 签发
 //! - Refresh Token Rotation
 //! - Guest Upgrade (LinkAccount)
 
@@ -16,11 +17,21 @@ use uuid::Uuid;
 use im_common::ids::{EnvironmentId, UserId};
 use im_common::AppError;
 
+use super::password::{hash_password, validate_password_strength, validate_username};
 use super::repository::{
     ExternalIdentity, User, UserKind, UserRepository, UserState,
 };
 use super::token::{AccessToken, DeviceSessionRepository, TokenPair, TokenService};
 use crate::common::repository::*; // 留位,后续会用到
+
+/// Register 命令(username/password 路径,2026-09-20 C-3 WBS)
+#[derive(Debug, Clone)]
+pub struct RegisterCommand {
+    pub environment_id: EnvironmentId,
+    pub username: String,
+    pub password: String,
+    pub display_name: Option<String>,
+}
 
 /// Server Exchange 命令(Server-to-Server)
 #[derive(Debug, Clone)]
@@ -121,6 +132,47 @@ where
             .user_repo
             .create(environment_id, UserKind::Guest, None, None)
             .await?;
+        self.issue_token_pair(user).await
+    }
+
+    /// Username/password 注册(2026-09-20 C-3 WBS)
+    ///
+    /// 流程:
+    ///   1. 校验 username 格式 + 密码强度
+    ///   2. argon2id 哈希密码
+    ///   3. INSERT user(kind='user', username, password_hash, extid=NULL)
+    ///   4. 创建 DeviceSession(rotation refresh token)
+    ///   5. 签发 access (RS256) + refresh token pair
+    ///
+    /// 错误映射:
+    ///   - 用户名 / 密码格式不合法 → AppError::Validation
+    ///   - (env, username) UNIQUE 命中 → AppError::AccountAlreadyExists (由 PgUserRepository::map_sqlx_error 映射)
+    pub async fn register(&self, cmd: RegisterCommand) -> Result<TokenPair, AppError> {
+        // 1. 校验 username 格式
+        validate_username(&cmd.username).map_err(|e| {
+            AppError::Validation(format!("invalid username '{}': {}", cmd.username, e))
+        })?;
+        // 2. 校验密码强度
+        validate_password_strength(&cmd.password).map_err(|e| {
+            AppError::Validation(format!("weak password: {}", e))
+        })?;
+
+        // 3. argon2id 哈希(耗时操作,默认参数 ~50-200ms;MVP 暂不调成 fast 参数)
+        let password_hash = hash_password(&cmd.password)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("argon2 hash failed: {}", e)))?;
+
+        // 4. INSERT user(若 UNIQUE 违反由 PgUserRepository::map_sqlx_error 转换为 AccountAlreadyExists)
+        let user = self
+            .user_repo
+            .create_with_password(
+                cmd.environment_id,
+                &cmd.username,
+                &password_hash,
+                cmd.display_name.clone(),
+            )
+            .await?;
+
+        // 5. 签发 token pair + 创建 DeviceSession
         self.issue_token_pair(user).await
     }
 
@@ -245,5 +297,11 @@ where
             .find_by_id(user_id)
             .await?
             .ok_or(AppError::NotFound("user".into()))
+    }
+
+    /// 暴露 TokenService 引用,用于边界(gRPC / REST handler)做 access_token 校验
+    /// 不暴露 `&mut`,只允许 issue + validate 类的只读操作
+    pub fn token_service(&self) -> &std::sync::Arc<TokenService> {
+        &self.token_service
     }
 }

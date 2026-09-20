@@ -1,6 +1,12 @@
 //! Token Service — Access / Refresh / Rotation
 //!
 //! 依据: ImplementationSpec §7.4.1 + DetailedDesign §9.2
+//!
+//! 2026-09-20 C-3 WBS 新增: 支持 RS256 算法(用于 username/password 注册登录路径),
+//! 同时保留原 HS256(用于游戏服务器 Token Exchange IM-ID-003)。
+//! 实际算法由 `TokenService::signing_algorithm` 在构造时决定;注册路径注入 RS256 配置,
+//! 游戏服务器路径注入 HS256 配置。
+//! 注意:同一 TokenPair 的 access + refresh 共享同一算法的 signing_key(单算法服务)。
 
 #![allow(dead_code, unused_imports, unused_variables)] // 2026-08-26 Day 2 GATE: 占位模块,clippy -D warnings 通过;V1 实装时移除
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -34,12 +40,37 @@ pub trait DeviceSessionRepository: Send + Sync {
 
 /// JWT 签名密钥(含 kid, 用于轮换期双密钥校验)
 ///
+/// 2026-09-20 C-3 WBS 新增 `algorithm` 字段 + RSA 公钥:
+/// - HS256: key=SecretString(对称)
+/// - RS256: key=SecretString(PKCS8 PEM 编码私钥), public_key=PEM 编码 RSA 公钥
 /// 注:本 PR 暂不引入 im_common::config(secret crate 暂未实装),这里直接定义本地版本
 /// V1 整合时统一从 im_common::config 引用
 #[derive(Debug, Clone)]
 pub struct SigningKey {
     pub kid: String,
     pub key: secrecy::SecretString,
+    /// RS256 用:PKCS8 PEM 编码的 RSA 公钥(用于校验);HS256 时为 None
+    pub public_key: Option<secrecy::SecretString>,
+    /// 算法:HS256(对称, 默认) / RS256(非对称, 用于 username/password 路径)
+    pub algorithm: Algorithm,
+}
+
+impl SigningKey {
+    /// 构造 HS256 对称密钥(用于游戏服务器 Token Exchange)
+    pub fn hs256(kid: impl Into<String>, key: SecretString) -> Self {
+        Self { kid: kid.into(), key, public_key: None, algorithm: Algorithm::HS256 }
+    }
+
+    /// 构造 RS256 非对称密钥对(用于 username/password 注册/登录)
+    /// `key` = PKCS8 PEM 编码私钥(签名);`public_key` = PEM 公钥(校验)
+    pub fn rs256(kid: impl Into<String>, key: SecretString, public_key: SecretString) -> Self {
+        Self {
+            kid: kid.into(),
+            key,
+            public_key: Some(public_key),
+            algorithm: Algorithm::RS256,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -102,11 +133,37 @@ pub struct TokenService {
 impl TokenService {
     pub fn new(signing_keys: Vec<SigningKey>, access_ttl: ChronoDuration, refresh_pepper: SecretString) -> Self {
         assert!(!signing_keys.is_empty(), "at least one signing key required");
+        // 2026-09-20 C-3 WBS 校验:所有 signing_key 算法必须一致
+        // (HS256 TokenService 不能验证 RS256 token,反之亦然;避免混用导致的隐患)
+        let first_algo = signing_keys[0].algorithm;
+        for k in &signing_keys[1..] {
+            assert_eq!(
+                k.algorithm, first_algo,
+                "all signing_keys must use the same algorithm (got {:?} and {:?})",
+                first_algo, k.algorithm
+            );
+        }
+        // RS256 密钥必须提供 public_key(用于校验)
+        if first_algo == Algorithm::RS256 {
+            for k in &signing_keys {
+                assert!(
+                    k.public_key.is_some(),
+                    "RS256 signing_key '{}' missing public_key",
+                    k.kid
+                );
+            }
+        }
         Self {
             signing_keys,
             access_ttl,
             _refresh_pepper: refresh_pepper,
         }
+    }
+
+    /// 当前服务所用的 JWT 算法(HS256 / RS256)
+    #[inline]
+    pub fn signing_algorithm(&self) -> Algorithm {
+        self.signing_keys[0].algorithm
     }
 
     /// 签发 Access Token
@@ -127,15 +184,12 @@ impl TokenService {
             kid: key.kid.clone(),
         };
 
-        let mut header = Header::new(Algorithm::HS256);
+        let mut header = Header::new(key.algorithm);
         header.kid = Some(key.kid.clone());
 
-        let token = encode(
-            &header,
-            &claims,
-            &EncodingKey::from_secret(key.key.expose_secret().as_bytes()),
-        )
-        .map_err(|e| TokenError::Jwt(e.to_string()))?;
+        let encoding_key = encoding_key_for(key)?;
+        let token = encode(&header, &claims, &encoding_key)
+            .map_err(|e| TokenError::Jwt(e.to_string()))?;
 
         Ok(AccessToken(token))
     }
@@ -145,6 +199,7 @@ impl TokenService {
         // 1. 先用未签发 kid 解 header
         let header = jsonwebtoken::decode_header(token).map_err(|e| TokenError::Jwt(e.to_string()))?;
         let kid = header.kid.ok_or_else(|| TokenError::Jwt("missing kid".into()))?;
+        let header_algo = header.alg;
 
         // 2. 找匹配的 signing key
         let key = self
@@ -153,23 +208,55 @@ impl TokenService {
             .find(|k| k.kid == kid)
             .ok_or_else(|| TokenError::UnknownKid(kid.clone()))?;
 
-        // 3. 校验 + 解码
-        let mut validation = Validation::new(Algorithm::HS256);
+        // 3. 算法必须与 TokenService 配置一致
+        if header_algo != key.algorithm {
+            return Err(TokenError::Jwt(format!(
+                "algorithm mismatch: header={:?}, configured={:?}",
+                header_algo, key.algorithm
+            )));
+        }
+
+        // 4. 校验 + 解码
+        let mut validation = Validation::new(key.algorithm);
         validation.validate_exp = true;
-        let data = decode::<TokenClaims>(
-            token,
-            &DecodingKey::from_secret(key.key.expose_secret().as_bytes()),
-            &validation,
-        )
-        .map_err(|e| {
-            if e.to_string().contains("ExpiredSignature") {
-                TokenError::Expired
-            } else {
-                TokenError::Jwt(e.to_string())
-            }
-        })?;
+        let decoding_key = decoding_key_for(key)?;
+        let data = decode::<TokenClaims>(token, &decoding_key, &validation)
+            .map_err(|e| {
+                if e.to_string().contains("ExpiredSignature") {
+                    TokenError::Expired
+                } else {
+                    TokenError::Jwt(e.to_string())
+                }
+            })?;
 
         Ok(data.claims)
+    }
+}
+
+/// 2026-09-20 C-3 WBS: 把 SigningKey 映射到 jsonwebtoken::EncodingKey
+fn encoding_key_for(key: &SigningKey) -> Result<EncodingKey, TokenError> {
+    match key.algorithm {
+        Algorithm::HS256 => Ok(EncodingKey::from_secret(key.key.expose_secret().as_bytes())),
+        Algorithm::RS256 => EncodingKey::from_rsa_pem(key.key.expose_secret().as_bytes())
+            .map_err(|e| TokenError::Jwt(format!("invalid RSA PEM private key: {}", e))),
+        other => Err(TokenError::Jwt(format!("unsupported algorithm: {:?}", other))),
+    }
+}
+
+/// 2026-09-20 C-3 WBS: 把 SigningKey 映射到 jsonwebtoken::DecodingKey
+///   HS256: 用 key;RS256: 用 public_key
+fn decoding_key_for(key: &SigningKey) -> Result<DecodingKey, TokenError> {
+    match key.algorithm {
+        Algorithm::HS256 => Ok(DecodingKey::from_secret(key.key.expose_secret().as_bytes())),
+        Algorithm::RS256 => {
+            let pem = key
+                .public_key
+                .as_ref()
+                .ok_or_else(|| TokenError::Jwt("RS256 missing public_key".into()))?;
+            DecodingKey::from_rsa_pem(pem.expose_secret().as_bytes())
+                .map_err(|e| TokenError::Jwt(format!("invalid RSA PEM public key: {}", e)))
+        }
+        other => Err(TokenError::Jwt(format!("unsupported algorithm: {:?}", other))),
     }
 }
 
@@ -200,15 +287,17 @@ mod tests {
             external_identity: None,
             state: UserState::Active,
             display_name: Some("test".into()),
+            username: Some("test_user".into()),
+            password_hash: None,
             created_at: Utc::now(),
         }
     }
 
     fn key(kid: &str) -> SigningKey {
-        SigningKey {
-            kid: kid.into(),
-            key: SecretString::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()),
-        }
+        SigningKey::hs256(
+            kid,
+            SecretString::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()),
+        )
     }
 
     #[test]

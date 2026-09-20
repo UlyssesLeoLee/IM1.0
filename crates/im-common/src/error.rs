@@ -30,6 +30,8 @@ pub enum ErrorCode {
     AccountBanned,               // 403
     AccountSuspended,            // 403
     AccountMergeConflict,        // 409
+    /// 2026-09-20 C-3 WBS: register dup username (409 Conflict)
+    AccountAlreadyExists,        // 409
     FriendRequestExists,         // 409
     FriendRequestNotFound,       // 404
     UserBlocked,                 // 403
@@ -61,6 +63,7 @@ impl ErrorCode {
             ErrorCode::AccountBanned => "ACCOUNT_BANNED",
             ErrorCode::AccountSuspended => "ACCOUNT_SUSPENDED",
             ErrorCode::AccountMergeConflict => "ACCOUNT_MERGE_CONFLICT",
+            ErrorCode::AccountAlreadyExists => "ACCOUNT_ALREADY_EXISTS",
             ErrorCode::FriendRequestExists => "FRIEND_REQUEST_EXISTS",
             ErrorCode::FriendRequestNotFound => "FRIEND_REQUEST_NOT_FOUND",
             ErrorCode::UserBlocked => "USER_BLOCKED",
@@ -87,7 +90,8 @@ impl ErrorCode {
             InvalidStateTransition
             | RecallWindowExpired
             | AccountMergeConflict
-            | FriendRequestExists => 409,
+            | FriendRequestExists
+            | AccountAlreadyExists => 409,
             RateLimited => 429,
             InternalError => 500,
             ServiceUnavailable => 503,
@@ -111,7 +115,8 @@ impl ErrorCode {
             InvalidStateTransition
             | RecallWindowExpired
             | AccountMergeConflict
-            | FriendRequestExists => "FAILED_PRECONDITION",
+            | FriendRequestExists
+            | AccountAlreadyExists => "FAILED_PRECONDITION",
             RateLimited => "RESOURCE_EXHAUSTED",
             InternalError => "INTERNAL",
             ServiceUnavailable => "UNAVAILABLE",
@@ -143,6 +148,7 @@ impl std::str::FromStr for ErrorCode {
             "ACCOUNT_BANNED" => EC::AccountBanned,
             "ACCOUNT_SUSPENDED" => EC::AccountSuspended,
             "ACCOUNT_MERGE_CONFLICT" => EC::AccountMergeConflict,
+            "ACCOUNT_ALREADY_EXISTS" => EC::AccountAlreadyExists,
             "FRIEND_REQUEST_EXISTS" => EC::FriendRequestExists,
             "FRIEND_REQUEST_NOT_FOUND" => EC::FriendRequestNotFound,
             "USER_BLOCKED" => EC::UserBlocked,
@@ -197,6 +203,12 @@ pub enum AppError {
     #[error("account merge conflict: target external identity already bound")]
     AccountMergeConflict,
 
+    /// 2026-09-20 C-3 WBS: register 时 username 重复 (env, username) UNIQUE 命中
+    /// 也涵盖 device_sessions 同 user 重复 active refresh hash 等其它 unique_violation
+    /// (per crates/im-core/src/identity/pg.rs::map_sqlx_error)
+    #[error("account already exists")]
+    AccountAlreadyExists,
+
     #[error("friend request already exists")]
     FriendRequestExists,
 
@@ -246,6 +258,7 @@ impl AppError {
             AccountBanned => ErrorCode::AccountBanned,
             AccountSuspended => ErrorCode::AccountSuspended,
             AccountMergeConflict => ErrorCode::AccountMergeConflict,
+            AccountAlreadyExists => ErrorCode::AccountAlreadyExists,
             FriendRequestExists => ErrorCode::FriendRequestExists,
             FriendRequestNotFound(_) => ErrorCode::FriendRequestNotFound,
             UserBlocked => ErrorCode::UserBlocked,
@@ -280,8 +293,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn error_code_count_is_21() {
-        // 防止新增错误码时忘了更新总数 — 21 = 2026-08-23 自审后的最终值
+    fn error_code_count_is_22() {
+        // 防止新增错误码时忘了更新总数 — 22 = 2026-09-20 C-3 WBS 新增 AccountAlreadyExists 后的最终值
         let count = [
             ErrorCode::Unauthorized,
             ErrorCode::Forbidden,
@@ -293,6 +306,7 @@ mod tests {
             ErrorCode::AccountBanned,
             ErrorCode::AccountSuspended,
             ErrorCode::AccountMergeConflict,
+            ErrorCode::AccountAlreadyExists,
             ErrorCode::FriendRequestExists,
             ErrorCode::FriendRequestNotFound,
             ErrorCode::UserBlocked,
@@ -306,7 +320,7 @@ mod tests {
             ErrorCode::EnvironmentDisabled,
         ]
         .len();
-        assert_eq!(count, 21, "错误码总数与 aux-03 §B 不一致");
+        assert_eq!(count, 22, "错误码总数与 aux-03 §B 不一致");
     }
 
     #[test]

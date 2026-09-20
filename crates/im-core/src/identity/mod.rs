@@ -8,7 +8,9 @@ pub mod repository;
 pub mod service;
 pub mod token;
 
-pub use password::{hash_password, verify_password, PasswordError};
+pub use password::{
+    hash_password, validate_password_strength, validate_username, verify_password, PasswordError,
+};
 pub use repository::{DeviceSessionRepository, UserRepository};
 pub use service::IdentityService;
 pub use token::{TokenService, AccessToken, RefreshToken, TokenClaims, TokenPair};

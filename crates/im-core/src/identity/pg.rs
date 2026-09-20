@@ -42,7 +42,8 @@ impl UserRepository for PgUserRepository {
     async fn find_by_id(&self, id: UserId) -> Result<Option<User>, AppError> {
         let row: Option<UserRow> = sqlx::query_as(
             r#"
-            SELECT id, environment_id, kind, external_identity, state, display_name, created_at
+            SELECT id, environment_id, kind, external_identity, state, display_name,
+                   username, password_hash, created_at
             FROM users WHERE id = $1
             "#,
         )
@@ -63,7 +64,8 @@ impl UserRepository for PgUserRepository {
         // 用 jsonb path 查询命中
         let row: Option<UserRow> = sqlx::query_as(
             r#"
-            SELECT id, environment_id, kind, external_identity, state, display_name, created_at
+            SELECT id, environment_id, kind, external_identity, state, display_name,
+                   username, password_hash, created_at
             FROM users
             WHERE environment_id = $1
               AND external_identity IS NOT NULL
@@ -74,6 +76,28 @@ impl UserRepository for PgUserRepository {
         .bind(env.0)
         .bind(provider)
         .bind(external_uid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx: {}", e)))?;
+        Ok(row.map(UserRow::into_user))
+    }
+
+    async fn find_by_username(
+        &self,
+        env: EnvironmentId,
+        username: &str,
+    ) -> Result<Option<User>, AppError> {
+        // 2026-09-20 C-3 WBS: 按 (env, username) 查找 user, 用于 register 重复检查 / login
+        let row: Option<UserRow> = sqlx::query_as(
+            r#"
+            SELECT id, environment_id, kind, external_identity, state, display_name,
+                   username, password_hash, created_at
+            FROM users
+            WHERE environment_id = $1 AND username = $2
+            "#,
+        )
+        .bind(env.0)
+        .bind(username)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx: {}", e)))?;
@@ -110,13 +134,43 @@ impl UserRepository for PgUserRepository {
             r#"
             INSERT INTO users (environment_id, kind, external_identity, display_name)
             VALUES ($1, $2, $3, $4)
-            RETURNING id, environment_id, kind, external_identity, state, display_name, created_at
+            RETURNING id, environment_id, kind, external_identity, state, display_name,
+                      username, password_hash, created_at
             "#,
         )
         .bind(env.0)
         .bind(kind_str)
         .bind(ext_json)
         .bind(display_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(row.into_user())
+    }
+
+    async fn create_with_password(
+        &self,
+        env: EnvironmentId,
+        username: &str,
+        password_hash: &str,
+        display_name: Option<String>,
+    ) -> Result<User, AppError> {
+        // 2026-09-20 C-3 WBS: 注册路径,创建 username-based user(kind='user', extid=NULL)
+        //   备注:虽然 extid=NULL, 但因为 username 是 NOT NULL 且 (env, username) 有 UNIQUE 索引,
+        //   重复 register 会被 PG unique violation 拦截,映射为 AppError::AccountAlreadyExists
+        let row: UserRow = sqlx::query_as(
+            r#"
+            INSERT INTO users (environment_id, kind, external_identity, display_name,
+                               username, password_hash)
+            VALUES ($1, 'user', NULL, $2, $3, $4)
+            RETURNING id, environment_id, kind, external_identity, state, display_name,
+                      username, password_hash, created_at
+            "#,
+        )
+        .bind(env.0)
+        .bind(display_name)
+        .bind(username)
+        .bind(password_hash)
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx_error)?;
@@ -152,7 +206,8 @@ impl UserRepository for PgUserRepository {
             r#"
             UPDATE users SET display_name = $1
             WHERE id = $2
-            RETURNING id, environment_id, kind, external_identity, state, display_name, created_at
+            RETURNING id, environment_id, kind, external_identity, state, display_name,
+                      username, password_hash, created_at
             "#,
         )
         .bind(display_name)
@@ -176,6 +231,8 @@ struct UserRow {
     external_identity: Option<JsonValue>,
     state: String,
     display_name: Option<String>,
+    username: Option<String>,
+    password_hash: Option<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -203,6 +260,8 @@ impl UserRow {
             external_identity,
             state,
             display_name: self.display_name,
+            username: self.username,
+            password_hash: self.password_hash,
             created_at: self.created_at,
         }
     }
@@ -320,9 +379,12 @@ impl DeviceSessionRow {
 
 fn map_sqlx_error(e: sqlx::Error) -> AppError {
     match &e {
-        // Unique violation → 业务层用 map_err 进一步映射
-        // 这里保留 Internal,由 caller 决定语义
         sqlx::Error::RowNotFound => AppError::NotFound("row not found".into()),
+        // PG unique_violation (SQLSTATE 23505) → AccountAlreadyExists
+        // 用于 register 时 (env, username) 重复 / device_sessions 同 user_id 下 active refresh hash 重复
+        sqlx::Error::Database(db_err) if db_err.is_unique_violation() => {
+            AppError::AccountAlreadyExists
+        }
         _ => AppError::Internal(anyhow::anyhow!("sqlx: {}", e)),
     }
 }

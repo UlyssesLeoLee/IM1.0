@@ -60,4 +60,7 @@ testcontainers = { workspace = true }
 testcontainers-modules = { workspace = true }
 mockall = { workspace = true }
 proptest = { workspace = true }
+# 2026-09-20 C-3 WBS: integration test 用 rsa + rand 生成 RS256 密钥对(测试隔离,不入仓)
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
