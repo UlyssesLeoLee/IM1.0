@@ -42,7 +42,7 @@ impl UserRepository for PgUserRepository {
     async fn find_by_id(&self, id: UserId) -> Result<Option<User>, AppError> {
         let row: Option<UserRow> = sqlx::query_as(
             r#"
-            SELECT id, environment_id, kind, external_identity, state, display_name, created_at
+            SELECT id, environment_id, kind, external_identity, state, display_name, username, password_hash, created_at
             FROM users WHERE id = $1
             "#,
         )
@@ -63,7 +63,7 @@ impl UserRepository for PgUserRepository {
         // 用 jsonb path 查询命中
         let row: Option<UserRow> = sqlx::query_as(
             r#"
-            SELECT id, environment_id, kind, external_identity, state, display_name, created_at
+            SELECT id, environment_id, kind, external_identity, state, display_name, username, password_hash, created_at
             FROM users
             WHERE environment_id = $1
               AND external_identity IS NOT NULL
@@ -74,6 +74,28 @@ impl UserRepository for PgUserRepository {
         .bind(env.0)
         .bind(provider)
         .bind(external_uid)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx: {}", e)))?;
+        Ok(row.map(UserRow::into_user))
+    }
+
+    async fn find_by_username(
+        &self,
+        env: EnvironmentId,
+        username: &str,
+    ) -> Result<Option<User>, AppError> {
+        // username 查询:仅匹配 password-login 用户(external_identity=NULL, username 非 NULL)
+        // 注意:Guest 用户 username=NULL,会被 WHERE 过滤掉(符合预期)
+        let row: Option<UserRow> = sqlx::query_as(
+            r#"
+            SELECT id, environment_id, kind, external_identity, state, display_name, username, password_hash, created_at
+            FROM users
+            WHERE environment_id = $1 AND username = $2
+            "#,
+        )
+        .bind(env.0)
+        .bind(username)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx: {}", e)))?;
@@ -110,13 +132,43 @@ impl UserRepository for PgUserRepository {
             r#"
             INSERT INTO users (environment_id, kind, external_identity, display_name)
             VALUES ($1, $2, $3, $4)
-            RETURNING id, environment_id, kind, external_identity, state, display_name, created_at
+            RETURNING id, environment_id, kind, external_identity, state, display_name, username, password_hash, created_at
             "#,
         )
         .bind(env.0)
         .bind(kind_str)
         .bind(ext_json)
         .bind(display_name)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(row.into_user())
+    }
+
+    async fn register_with_password(
+        &self,
+        env: EnvironmentId,
+        username: &str,
+        password_hash: &str,
+        display_name: Option<String>,
+    ) -> Result<User, AppError> {
+        // 密码登录模式:
+        //   kind='user', external_identity=NULL(per aux-02 §F.4:User 必填 external_identity)
+        //   但密码登录模式无 external identity(直接 username+password 入场)
+        // 设计选择:沿用 kind='user',external_identity=NULL(C-3 WBS ULYS-144 设计)
+        //   username/password 作为该模式的主身份凭证
+        // dup username → PG UNIQUE(environment_id, username) violation → map_sqlx_error
+        let row: UserRow = sqlx::query_as(
+            r#"
+            INSERT INTO users (environment_id, kind, external_identity, display_name, username, password_hash)
+            VALUES ($1, 'user', NULL, $2, $3, $4)
+            RETURNING id, environment_id, kind, external_identity, state, display_name, username, password_hash, created_at
+            "#,
+        )
+        .bind(env.0)
+        .bind(display_name)
+        .bind(username)
+        .bind(password_hash)
         .fetch_one(&self.pool)
         .await
         .map_err(map_sqlx_error)?;
@@ -152,7 +204,7 @@ impl UserRepository for PgUserRepository {
             r#"
             UPDATE users SET display_name = $1
             WHERE id = $2
-            RETURNING id, environment_id, kind, external_identity, state, display_name, created_at
+            RETURNING id, environment_id, kind, external_identity, state, display_name, username, password_hash, created_at
             "#,
         )
         .bind(display_name)
@@ -176,6 +228,8 @@ struct UserRow {
     external_identity: Option<JsonValue>,
     state: String,
     display_name: Option<String>,
+    username: Option<String>,
+    password_hash: Option<String>,
     created_at: DateTime<Utc>,
 }
 
@@ -203,6 +257,8 @@ impl UserRow {
             external_identity,
             state,
             display_name: self.display_name,
+            username: self.username,
+            password_hash: self.password_hash,
             created_at: self.created_at,
         }
     }
@@ -323,6 +379,15 @@ fn map_sqlx_error(e: sqlx::Error) -> AppError {
         // Unique violation → 业务层用 map_err 进一步映射
         // 这里保留 Internal,由 caller 决定语义
         sqlx::Error::RowNotFound => AppError::NotFound("row not found".into()),
+        sqlx::Error::Database(db_err) => {
+            // PG 23505 = unique_violation — 上层调用者(caller)负责映射到具体语义
+            // 密码注册场景:register_with_password dup username → 上层转 AppError::Validation
+            if db_err.code().as_deref() == Some("23505") {
+                AppError::Internal(anyhow::anyhow!("unique violation: {}", db_err.message()))
+            } else {
+                AppError::Internal(anyhow::anyhow!("sqlx: {}", e))
+            }
+        }
         _ => AppError::Internal(anyhow::anyhow!("sqlx: {}", e)),
     }
 }

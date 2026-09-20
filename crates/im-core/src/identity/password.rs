@@ -2,9 +2,10 @@
 //!
 //! MVP 范围: User 密码(目前仅 Game ID-Token 路径不需要密码,
 //! 但留作 OAuth provider 兼容 / 未来 server-side 账户)
-
 use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
+
+use im_common::AppError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PasswordError {
@@ -14,6 +15,13 @@ pub enum PasswordError {
     Verify(String),
     #[error("invalid hash format: {0}")]
     InvalidHash(String),
+}
+
+/// 密码校验失败统一归到 Unauthorized(不暴露 argon2 内部错误给客户端,避免探测)
+impl From<PasswordError> for AppError {
+    fn from(_e: PasswordError) -> Self {
+        AppError::Unauthorized("invalid username or password".into())
+    }
 }
 
 /// 哈希密码(Argon2id,默认参数)

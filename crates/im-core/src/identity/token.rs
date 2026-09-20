@@ -70,6 +70,7 @@ pub struct TokenClaims {
     pub tenant: String,      // tenant_id
     pub exp: i64,            // unix seconds
     pub iat: i64,            // issued at
+    pub jti: String,         // JWT ID(UUID v4,per RFC 7519)— 确保每张 token 唯一
     pub kind: String,        // user | guest
     pub kid: String,         // signing key id(用于轮换期识别)
 }
@@ -109,6 +110,17 @@ impl TokenService {
         }
     }
 
+    /// 暴露 access_ttl 给调用方(用于 TokenPair.expires_in 等)
+    /// 依据: SRS §11 IM-ID-003 / DetailedDesign §6.4 + C-4 WBS ULYS-145
+    pub fn access_ttl(&self) -> ChronoDuration {
+        self.access_ttl
+    }
+
+    /// 暴露 access_ttl 秒数(TokenPair.expires_in 直接用 i64)
+    pub fn access_ttl_seconds(&self) -> i64 {
+        self.access_ttl.num_seconds()
+    }
+
     /// 签发 Access Token
     pub fn issue_access_token(&self, user: &User) -> Result<AccessToken, TokenError> {
         // 用第 1 个 key 签发(轮换时仍可用 v1 签发,v2 用于校验新发的 v2 token)
@@ -120,6 +132,8 @@ impl TokenService {
             tenant: String::new(), // 由调用方补充,或从 user.environment_id 推
             exp: (now + self.access_ttl).timestamp(),
             iat: now.timestamp(),
+            // 加 jti 让连续签发的 token 唯一(避免两个 consecutive login 的 token byte-identical)
+            jti: Uuid::new_v4().to_string(),
             kind: match user.kind {
                 super::repository::UserKind::User => "user".into(),
                 super::repository::UserKind::Guest => "guest".into(),
@@ -200,6 +214,8 @@ mod tests {
             external_identity: None,
             state: UserState::Active,
             display_name: Some("test".into()),
+            username: None,
+            password_hash: None,
             created_at: Utc::now(),
         }
     }

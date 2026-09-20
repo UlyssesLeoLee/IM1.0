@@ -124,6 +124,67 @@ where
         self.issue_token_pair(user).await
     }
 
+    /// 密码登录认证(依据 SRS §11 IM-ID-001 + DetailedDesign §3 + C-4 WBS ULYS-145)
+    ///
+    /// 流程:
+    /// 1. 用 username 在指定 environment 内查 user
+    /// 2. 不存在 → Unauthorized(不区分用户不存在 vs 密码错误,防 enumeration)
+    /// 3. user.state 校验:仅 active 可登录;banned/suspended/deleted 拒绝
+    /// 4. argon2 验证密码;失败 → Unauthorized
+    /// 5. 签发新 TokenPair(access TTL = TokenService::access_ttl = 900s/15min)
+    ///
+    /// 注意:**不**复用既有 device session(每次登录 = 新设备会话,符合 SRS IM-ID-002 多设备并发;
+    ///       单点登出由 DeviceSession::revoke 实现)
+    pub async fn authenticate(
+        &self,
+        environment_id: EnvironmentId,
+        username: &str,
+        password: &str,
+    ) -> Result<TokenPair, AppError> {
+        // 1. 查 user
+        let user = self
+            .user_repo
+            .find_by_username(environment_id, username)
+            .await?;
+
+        let user = match user {
+            Some(u) => u,
+            None => {
+                // 故意把 "用户不存在" 和 "密码错误" 合并为同一种响应,防 username enumeration
+                return Err(AppError::Unauthorized("invalid username or password".into()));
+            }
+        };
+
+        // 2. state 校验
+        match user.state {
+            UserState::Active => {}
+            UserState::Banned => return Err(AppError::AccountBanned),
+            UserState::Suspended => return Err(AppError::AccountSuspended),
+            UserState::Deleted => {
+                return Err(AppError::Unauthorized("invalid username or password".into()))
+            }
+        }
+
+        // 3. password_hash 必须存在(纯 external-identity 用户走 ServerExchangeToken,不经过此路径)
+        let stored_hash = match user.password_hash.as_deref() {
+            Some(h) => h,
+            None => {
+                // 数据异常:用户有 username 但无 password_hash(理论上 UNIQUE 防,但 schema 允许)
+                return Err(AppError::Unauthorized("invalid username or password".into()));
+            }
+        };
+
+        // 4. 校验密码
+        let password_ok = super::password::verify_password(password, stored_hash)
+            .map_err(AppError::from)?;
+        if !password_ok {
+            return Err(AppError::Unauthorized("invalid username or password".into()));
+        }
+
+        // 5. 签发新 TokenPair(新 device session,符合 SRS IM-ID-002 多设备并发)
+        self.issue_token_pair(user).await
+    }
+
     /// 签发 token pair
     async fn issue_token_pair(&self, user: User) -> Result<TokenPair, AppError> {
         let access = self
@@ -145,7 +206,9 @@ where
                 device_session.id, refresh_raw
             )),
             user_id: user.id,
-            expires_in: 900, // TODO: 读 self.token_service 的 access_ttl
+            // 从 TokenService 读 access_ttl(默认 900s / 15min,per DetailedDesign §6.4)
+            // 之前是硬编码 900;C-4 WBS ULYS-145 改为读 token_service.access_ttl
+            expires_in: self.token_service.access_ttl_seconds(),
         })
     }
 
