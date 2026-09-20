@@ -1,0 +1,18 @@
+# im-gateway 本地开发配置 (copy to config/local.toml 后填入实际值, gitignored)
+# 加载顺序: config/default.toml < config/local.toml < 环境变量 IM_<UPPER_SNAKE>
+
+# 本地 PG (per aux-12 §A.1: dev 默认即可, prod 必须 K3s Secret)
+postgres_url = "postgres://postgres:postgres@localhost:5432/im1"
+
+# 双密钥: kid="v1" active=true 启用, kid="v2" active=true 双密钥轮换期
+# JSON 数组格式,经 IM_JWT_SIGNING_KEYS 环境变量注入:
+# IM_JWT_SIGNING_KEYS='[{"kid":"v1","key":"dev-key-do-not-use-in-prod-v1-32bytes-min","active":true},{"kid":"v2","key":"dev-key-do-not-use-in-prod-v2-32bytes-min","active":false}]'
+jwt_signing_keys = []
+
+# Refresh token pepper (16+ bytes hex 或任意强随机字符串)
+# 经 IM_REFRESH_PEPPER 环境变量注入: IM_REFRESH_PEPPER="dev-pepper-do-not-use-in-prod"
+refresh_pepper = ""
+
+[event_publisher]
+kind = "stub"
+nats_url = ""

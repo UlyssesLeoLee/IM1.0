@@ -5,10 +5,11 @@
 //! - [`ids`] — newtype IDs(UserId / ConversationId / MessageId / ...)
 //! - [`time`] — Utc::now 包装
 //!
-//! ## 后续 PR 补
-//! - `config` — AppConfig load (依赖 figment + dotenvy,本 PR 暂缺)
-//! - `tracing_init` — tracing JSON 初始化
+//! ## 模块
+//! - [`config`] — AppConfig 加载 (D-1 WBS, figment + dotenvy + 双密钥 JSON)
+//! - [`tracing_init`] — tracing JSON 初始化 (后续 PR)
 
+pub mod config;
 pub mod error;
 pub mod ids;
 pub mod time;

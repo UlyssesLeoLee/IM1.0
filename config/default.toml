@@ -1,0 +1,25 @@
+# im-gateway 默认配置 (committed, per aux-12 §A.1 默认值)
+# 注意: 任何密钥 (jwt_signing_keys / refresh_pepper / server_secrets) 都不写在此文件,
+#       全部从环境变量 / K3s Secret 注入 (per aux-12 §A.1 「K3s Secret Key 从 env 读,不进 VCS」).
+
+http_port = 8080
+
+postgres_url = "postgres://postgres:postgres@localhost:5432/im1"
+
+# 双密钥示例 (active = true 启用签发/校验, false 仅校验, 用于轮换期)
+# 实际密钥必须从环境变量 IM__JWT__SIGNING__KEYS 注入,本文件不写.
+jwt_signing_keys = []
+
+# refresh_pepper 必须从环境变量 IM__REFRESH__PEPPER 注入
+refresh_pepper = ""
+
+# event_publisher.kind = "stub" (MVP) | "nats" (V1+)
+# MVP stub 不连 NATS, 仅打印 tracing 日志
+[event_publisher]
+kind = "stub"
+# nats_url 仅 kind = "nats" 时用
+nats_url = ""
+
+access_token_ttl_seconds = 900           # 15 分钟
+refresh_token_ttl_seconds = 2592000     # 30 天
+max_message_size_bytes = 65536           # 64 KiB

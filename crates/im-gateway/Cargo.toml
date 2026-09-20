@@ -45,6 +45,10 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tracing-actix-web = { workspace = true }
 
+# D-1 wire-up: PgPool + Secret 构造
+sqlx = { workspace = true, features = ["runtime-tokio", "postgres"] }
+secrecy = { workspace = true }
+
 # Metrics
 prometheus = { workspace = true }
 

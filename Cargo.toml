@@ -109,7 +109,7 @@ prost-types = "0.13"
 # ---- 配置 / 密钥 ----
 figment = { version = "0.10", features = ["env", "toml"] }
 dotenvy = "0.15"
-secrecy = "0.8"
+secrecy = { version = "0.8", features = ["serde"] }
 
 # ---- 通用工具 ----
 once_cell = "1"
