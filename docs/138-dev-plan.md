@@ -5,11 +5,62 @@ phase: 15-management
 activity_no: 138
 owners: 架构师 (Mavis 接手 agent per DEC-008)
 status: Active
-version: 1.13.0
-date: 2026-09-19 JST
+version: 1.14.0
+date: 2026-09-20 JST
 ---
 
 # 138. IM1.0 开发计划 (持续维护)
+
+## v1.14.0 增量 (2026-09-20 JST, Mavis 父代理亲自推 D-1 + C-6 双双实装落地)
+
+> **触发**: D-1 `AppConfig::load()` + C-6 `link_account` SQL 实装双双落地.
+> **worktree**: `wt/lane-config-wireup` (与 D-1 同步, off main HEAD `62079bc`)
+> **commit**: D-1 = `83ec871`, C-6 = `8ca9b24`
+
+### D-1 `im_common::config::AppConfig::load()` 实装 (figment + dotenvy + 双密钥 JSON)
+
+- 加载顺序: `config/{IM_ENV}.toml` < `config/local.toml` (gitignored) < env vars `IM_<UPPER_SNAKE>`
+  - 例: `IM_HTTP_PORT`, `IM_POSTGRES_URL`, `IM_JWT_SIGNING_KEYS`, `IM_REFRESH_PEPPER`
+- `Secret<String>` 字段用 `#[serde(with = "secret_serde")]` 走 inner String 序列化 (绕开 secrecy 0.8 `SerializableSecret` 限制)
+- `env_value_to_toml()` helper — env 字符串按字面值类型 emit TOML (bool/i64/f64/string), 解决 figment `Env::split("__")` 与单层字段不匹配
+- 14 unit tests (12 default + 2 env)
+
+### D-1 main.rs wire-up
+
+- 替换 hardcode 8080 → `AppConfig::load()` (失败 exit 78, 打印缺 env 提示)
+- 构造 PgPool (`acquire_timeout 3s`) + 4 Service (ConversationService + MessageService + TokenService + IdentityService) + AppState 注入
+- `SigningKeyConfig → SigningKey` 转换 (`Secret::new(key)`), `Secret<String>` 从 cfg 转换 (`Secret::new(v.expose().clone())`)
+- `config/default.toml` (committed) + `config/local.toml.example` + `.gitignore` 加 `config/local.toml`
+
+### C-6 `IdentityService::link_account` UPDATE SQL 实装
+
+- `UserRepository` trait 增 `update_external_identity(user_id, env, external) -> Result<User>` 方法
+- `PgUserRepository` impl: `UPDATE users SET external_identity = $1 WHERE id = $2 AND environment_id = $3 RETURNING ...`
+- `service.rs:244-248` 替换 stub → 调 repo.update_external_identity + issue_token_pair(updated)
+- **PoC-01 双终端 DM 关键路径完整** (per 138 v1.12.0 「关键路径 PoC-01 双终端 DM 后端链路完整」 — 这是最后 1 块)
+- 3 unit tests (InMemoryUserRepo + InMemoryDeviceRepo with `parking_lot::RwLock`):
+  - case 1: 新绑定成功 (`update_external_identity` 写新 ext, mock 状态同步)
+  - case 2: 同 user 续 token fast path (`find_by_external_identity` 命中同 user, 不调 update)
+  - case 3: 冲突 (`ext` 被另一 user 占用, service 返 `AccountMergeConflict`, 不写)
+- 138 §8 缺口列表中 C-6 项勾掉
+
+### lane 状态更新
+
+- 🟢 `lane-config-wireup` (D-1 + C-6) — **Done**
+- 🟢 `lane-frontend-demo` — **Unblocked** (main bin 现在可启动, 等 C-9 messages handler 后实际跑 WS 端到端)
+- ⚪ `lane-infra-k3s` — Waiting (F-1 Docker daemon Blocker, Ulysses 手动解)
+- ⚪ `lane-deploy-acceptance` — Waiting
+
+### 关键路径剩余
+
+- 当前 ~0.1-0.6M tokens (D-1 + C-6 消耗后)
+- 下一轮候选: `lane-infra-k3s` (F-2 + D-2 + F-3/F-4, ~2M tokens) / `lane-deploy-acceptance` / D-3 NATS JetStream 真实实现
+
+### 修订者
+
+架构师 (Mavis 接手 agent per DEC-008)
+
+---
 
 ## v1.13.0 增量 (2026-09-19 JST, Mavis 父代理亲自推 D-1 wire-up 起跑)
 
