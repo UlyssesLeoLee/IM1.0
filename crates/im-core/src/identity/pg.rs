@@ -162,6 +162,63 @@ impl UserRepository for PgUserRepository {
         .map_err(map_sqlx_error)?;
         row.map(UserRow::into_user).ok_or_else(|| AppError::NotFound(format!("user {}", id.0)))
     }
+
+    async fn link_external_identity(
+        &self,
+        id: UserId,
+        external: ExternalIdentity,
+    ) -> Result<User, AppError> {
+        // 1. 先读 user,校验 kind='guest' 与 state=Active
+        let existing: Option<UserRow> = sqlx::query_as(
+            r#"
+            SELECT id, environment_id, kind, external_identity, state, display_name, created_at
+            FROM users WHERE id = $1
+            "#,
+        )
+        .bind(id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let row = existing.ok_or_else(|| AppError::NotFound(format!("user {}", id.0)))?;
+        if row.kind != "guest" {
+            // User 已经绑定过,二次 link 是 Validation 错
+            return Err(AppError::Validation(
+                "user already linked; only guests can upgrade".into(),
+            ));
+        }
+        match row.state.as_str() {
+            "active" => {}
+            // 不暴露存在性: ban / suspended / deleted 统一返回 NotFound
+            _ => return Err(AppError::NotFound(format!("user {}", id.0))),
+        }
+
+        // 2. UPDATE: kind='user' + external_identity = $1
+        let ext_json = serde_json::json!({
+            "provider": external.provider,
+            "external_uid": external.external_uid,
+        });
+        let row: UserRow = sqlx::query_as(
+            r#"
+            UPDATE users
+            SET kind = 'user', external_identity = $1
+            WHERE id = $2
+            RETURNING id, environment_id, kind, external_identity, state, display_name, created_at
+            "#,
+        )
+        .bind(ext_json)
+        .bind(id.0)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| match &e {
+            // PG 23505 unique_violation on uniq_users_env_extid → AccountMergeConflict (409)
+            sqlx::Error::Database(db) if db.code().as_deref() == Some("23505") => {
+                AppError::AccountMergeConflict
+            }
+            _ => AppError::Internal(anyhow::anyhow!("sqlx: {}", e)),
+        })?;
+        Ok(row.into_user())
+    }
 }
 
 // ----------------------------------------------------------------------------

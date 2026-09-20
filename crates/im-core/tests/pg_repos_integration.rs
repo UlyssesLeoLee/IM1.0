@@ -18,8 +18,10 @@ use im_common::ids::{EnvironmentId, MessageId, UserId};
 use im_core::conversation::pg::PgConversationRepository;
 use im_core::conversation::repository::{ConversationKind, ConversationRepository, MemberRole};
 use im_core::identity::pg::{PgDeviceSessionRepository, PgUserRepository};
-use im_core::identity::repository::{ExternalIdentity, UserKind, UserRepository, UserState};
+use im_core::identity::repository::{ExternalIdentity, User, UserKind, UserRepository, UserState};
 use im_core::identity::token::DeviceSessionRepository;
+use im_core::identity::service::IdentityService;
+use im_core::identity::token::TokenService;
 use im_core::message::pg::{PgMessageRepository, PgSequenceAllocator};
 use im_core::message::repository::{MessageRepository, MessageState, NewMessage};
 use im_core::message::sequence::SequenceAllocator;
@@ -524,4 +526,318 @@ async fn reaction_add_remove_idempotent() {
     // 4. remove 幂等(再删返回 false,不报错)
     let removed_again = react_repo.remove(m.id, bob, "👍").await.expect("re-remove failed");
     assert!(!removed_again);
+}
+
+// ============================================================================
+// C-6: IdentityService::link_account (Guest → 正式) 集成测试
+// 依据: SRS §11 IM-ID-005 + GAME-ID-004
+// ============================================================================
+
+use chrono::Duration as ChronoDuration;
+use secrecy::SecretString;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+// SigningKey helper (与 token.rs tests 用同 key, 保持 HS256 兼容)
+mod link_test_token_key {
+    use im_core::identity::token::SigningKey;
+    use secrecy::SecretString;
+    pub fn make(kid: &str) -> SigningKey {
+        SigningKey {
+            kid: kid.into(),
+            key: SecretString::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            ),
+        }
+    }
+}
+use link_test_token_key::make as make_token_key;
+
+/// 单独建一个隔离 env (test 间不共享 env_id → 不冲突)
+async fn make_link_env() -> EnvironmentId {
+    let p = pool().await;
+    let env_id: Uuid = sqlx::query_scalar(
+        r#"
+        WITH t AS (
+            INSERT INTO tenants (id, name) VALUES (gen_random_uuid(), 'link-tenant-' || gen_random_uuid()::text)
+            RETURNING id
+        ), g AS (
+            INSERT INTO games (id, tenant_id, name)
+            SELECT gen_random_uuid(), t.id, 'link-game-' || gen_random_uuid()::text FROM t
+            RETURNING id
+        )
+        INSERT INTO environments (id, game_id, name)
+        SELECT gen_random_uuid(), g.id, 'test' FROM g
+        RETURNING id
+        "#,
+    )
+    .fetch_one(&p)
+    .await
+    .expect("make_link_env failed");
+    EnvironmentId(env_id)
+}
+
+/// 共享 TokenService + Issue access token (用于构造合法的 client access JWT)
+fn issue_test_token(ts: &Arc<TokenService>, user: &User) -> String {
+    ts.issue_access_token(user)
+        .expect("issue_access_token failed")
+        .0
+}
+
+#[tokio::test]
+async fn link_account_guest_upgrade_happy_path() {
+    let user_repo = PgUserRepository::new(pool().await);
+    let ts = Arc::new(TokenService::new(
+        vec![make_token_key("v1")],
+        ChronoDuration::seconds(900),
+        SecretString::new("test-pepper".into()),
+    ));
+    let svc = IdentityService::new(
+        PgUserRepository::new(pool().await),
+        PgDeviceSessionRepository::new(pool().await),
+        ts.clone(),
+        HashMap::new(),
+    );
+
+    // 1. 创建 Guest (kind=guest, extid=NULL)
+    let env_id = make_link_env().await;
+    let guest = user_repo
+        .create(env_id, UserKind::Guest, None, Some("Guest1".into()))
+        .await
+        .expect("create guest failed");
+    assert_eq!(guest.kind, UserKind::Guest);
+    assert!(guest.external_identity.is_none());
+
+    // 2. 用相同 key 的 TokenService 签发 access (模拟 client 持有)
+    let access = issue_test_token(&ts, &guest);
+
+    // 3. link_account
+    let ext = ExternalIdentity {
+        provider: "steam".into(),
+        external_uid: "76561198000000001".into(),
+    };
+    let upgraded = svc
+        .link_account(&access, ext.clone())
+        .await
+        .expect("link_account failed");
+
+    // 4. TokenPair.user_id 保持不变 (IM-ID-005: 保留历史消息)
+    assert_eq!(upgraded.user_id, guest.id, "user_id must persist (保留历史)");
+
+    // 5. DB reload: kind='user' + external_identity 已绑定
+    let reloaded = user_repo
+        .find_by_id(guest.id)
+        .await
+        .expect("find_by_id failed")
+        .expect("user not found");
+    assert_eq!(reloaded.kind, UserKind::User, "kind must be upgraded");
+    let ext2 = reloaded
+        .external_identity
+        .as_ref()
+        .expect("external_identity must be set");
+    assert_eq!(ext2.provider, "steam");
+    assert_eq!(ext2.external_uid, "76561198000000001");
+}
+
+#[tokio::test]
+async fn link_account_merge_conflict_returns_409() {
+    let user_repo = PgUserRepository::new(pool().await);
+    let ts = Arc::new(TokenService::new(
+        vec![make_token_key("v1")],
+        ChronoDuration::seconds(900),
+        SecretString::new("test-pepper".into()),
+    ));
+    let svc = IdentityService::new(
+        PgUserRepository::new(pool().await),
+        PgDeviceSessionRepository::new(pool().await),
+        ts.clone(),
+        HashMap::new(),
+    );
+
+    let env_id = make_link_env().await;
+
+    // Guest A link → 升级成功
+    let guest_a = user_repo
+        .create(env_id, UserKind::Guest, None, Some("GuestA".into()))
+        .await
+        .expect("create guest_a failed");
+    let a_access = issue_test_token(&ts, &guest_a);
+    let ext = ExternalIdentity {
+        provider: "steam".into(),
+        external_uid: "76561198000000002".into(),
+    };
+    let r1 = svc.link_account(&a_access, ext.clone()).await;
+    assert!(r1.is_ok(), "first link should succeed, got: {:?}", r1.err());
+
+    // Guest B 同 (env, steam, 76561198000000002) → AccountMergeConflict
+    let guest_b = user_repo
+        .create(env_id, UserKind::Guest, None, Some("GuestB".into()))
+        .await
+        .expect("create guest_b failed");
+    let b_access = issue_test_token(&ts, &guest_b);
+    let r2 = svc.link_account(&b_access, ext).await;
+    assert!(
+        matches!(r2, Err(im_common::AppError::AccountMergeConflict)),
+        "expected AccountMergeConflict, got: {:?}",
+        r2
+    );
+}
+
+#[tokio::test]
+async fn link_account_banned_user_rejected_as_not_found() {
+    let user_repo = PgUserRepository::new(pool().await);
+    let ts = Arc::new(TokenService::new(
+        vec![make_token_key("v1")],
+        ChronoDuration::seconds(900),
+        SecretString::new("test-pepper".into()),
+    ));
+    let svc = IdentityService::new(
+        PgUserRepository::new(pool().await),
+        PgDeviceSessionRepository::new(pool().await),
+        ts.clone(),
+        HashMap::new(),
+    );
+
+    let env_id = make_link_env().await;
+    let guest = user_repo
+        .create(env_id, UserKind::Guest, None, Some("ToBeBanned".into()))
+        .await
+        .expect("create guest failed");
+    user_repo
+        .update_state(guest.id, UserState::Banned)
+        .await
+        .expect("ban failed");
+
+    // 即使 token 有效, banned user link 必须被拒为 NotFound (不暴露存在性)
+    let access = issue_test_token(&ts, &guest);
+    let r = svc
+        .link_account(
+            &access,
+            ExternalIdentity {
+                provider: "xbox".into(),
+                external_uid: "fatal-uid".into(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(r, Err(im_common::AppError::NotFound(_))),
+        "expected NotFound (don't leak existence), got: {:?}",
+        r
+    );
+}
+
+#[tokio::test]
+async fn link_account_idempotent_same_user() {
+    let user_repo = PgUserRepository::new(pool().await);
+    let ts = Arc::new(TokenService::new(
+        vec![make_token_key("v1")],
+        ChronoDuration::seconds(900),
+        SecretString::new("test-pepper".into()),
+    ));
+    let svc = IdentityService::new(
+        PgUserRepository::new(pool().await),
+        PgDeviceSessionRepository::new(pool().await),
+        ts.clone(),
+        HashMap::new(),
+    );
+
+    let env_id = make_link_env().await;
+    let guest = user_repo
+        .create(env_id, UserKind::Guest, None, Some("IdemGuest".into()))
+        .await
+        .expect("create guest failed");
+    let access = issue_test_token(&ts, &guest);
+
+    let ext = ExternalIdentity {
+        provider: "epic".into(),
+        external_uid: "epic-abc-001".into(),
+    };
+
+    // 第一次 link 升级
+    let r1 = svc.link_account(&access, ext.clone()).await;
+    assert!(r1.is_ok(), "first link should succeed: {:?}", r1.err());
+
+    // 第二次 link 同 (user, ext) → 走 fast-path: 同 user, 续 token pair
+    let r2 = svc.link_account(&access, ext).await;
+    assert!(r2.is_ok(), "idempotent link should succeed: {:?}", r2.err());
+    assert_eq!(r2.unwrap().user_id, guest.id);
+}
+
+#[tokio::test]
+async fn link_account_already_linked_user_returns_validation() {
+    let user_repo = PgUserRepository::new(pool().await);
+    let ts = Arc::new(TokenService::new(
+        vec![make_token_key("v1")],
+        ChronoDuration::seconds(900),
+        SecretString::new("test-pepper".into()),
+    ));
+    let svc = IdentityService::new(
+        PgUserRepository::new(pool().await),
+        PgDeviceSessionRepository::new(pool().await),
+        ts.clone(),
+        HashMap::new(),
+    );
+
+    let env_id = make_link_env().await;
+    // 直接创建 kind='user' 的账号
+    let user = user_repo
+        .create(
+            env_id,
+            UserKind::User,
+            Some(ExternalIdentity {
+                provider: "psn".into(),
+                external_uid: "psn-001".into(),
+            }),
+            Some("PSNUser".into()),
+        )
+        .await
+        .expect("create user failed");
+    let reloaded = user_repo.find_by_id(user.id).await.unwrap().unwrap();
+    let access = issue_test_token(&ts, &reloaded);
+
+    // 对 kind='user' 二次 link → Validation
+    let r = svc
+        .link_account(
+            &access,
+            ExternalIdentity {
+                provider: "xbox".into(),
+                external_uid: "xbox-different-uid".into(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(r, Err(im_common::AppError::Validation(_))),
+        "expected Validation, got: {:?}",
+        r
+    );
+}
+
+#[tokio::test]
+async fn link_account_invalid_token_returns_unauthorized() {
+    let ts = Arc::new(TokenService::new(
+        vec![make_token_key("v1")],
+        ChronoDuration::seconds(900),
+        SecretString::new("test-pepper".into()),
+    ));
+    let svc = IdentityService::new(
+        PgUserRepository::new(pool().await),
+        PgDeviceSessionRepository::new(pool().await),
+        ts,
+        HashMap::new(),
+    );
+
+    let r = svc
+        .link_account(
+            "this-is-not-a-valid-jwt",
+            ExternalIdentity {
+                provider: "steam".into(),
+                external_uid: "x".into(),
+            },
+        )
+        .await;
+    assert!(
+        matches!(r, Err(im_common::AppError::Unauthorized(_))),
+        "expected Unauthorized, got: {:?}",
+        r
+    );
 }

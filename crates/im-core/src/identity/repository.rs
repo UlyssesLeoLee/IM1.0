@@ -73,6 +73,20 @@ pub trait UserRepository: Send + Sync {
         id: UserId,
         display_name: Option<&str>,
     ) -> Result<User, AppError>;
+
+    /// 绑定外部身份 (Guest 升级 / Account Link)
+    ///
+    /// 实现语义:
+    /// - 将 `kind` 从 `guest` 升级为 `user`,并写入 `external_identity`
+    /// - 若同 `(environment_id, external_identity)` 已被其它 user 占用,返回
+    ///   `AppError::Conflict` (映射 SQL `uniq_users_env_extid` 触发)
+    /// - 若 user 已被 ban/suspend,返回 `AppError::NotFound` (不暴露存在性)
+    /// - 不允许对 `kind='user'` 的记录二次绑定 (返回 `AppError::Validation`)
+    async fn link_external_identity(
+        &self,
+        id: UserId,
+        external: ExternalIdentity,
+    ) -> Result<User, AppError>;
 }
 
 /// Device Session Repository trait (在 token.rs 中定义以避免循环)
