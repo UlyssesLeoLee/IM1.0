@@ -22,14 +22,20 @@ tests/
 │   ├── grpc/                       ← 4 个 gRPC RPC JSON 形态 (token_exchange, device_register)
 │   ├── rest/                       ← 7 个 REST 请求/响应 (login/refresh/logout/user_get)
 │   └── sql/                        ← 6 个 SQL fixture (per migrations/0001-0006)
-└── scripts/
-    ├── setup_test_db.ps1           ← 起 PG test db + migration + fixture
-    ├── teardown_test_db.ps1        ← 删 test db (带 im1test_ 前缀安全护栏)
-    ├── start_im_gateway_mock.ps1   ← 启动 im-gateway 连 test db
-    ├── stop_im_gateway.ps1         ← 停止 im-gateway
-    ├── run_all_tests.ps1           ← 编排: setup → cargo test → gateway smoke → teardown
-    ├── wscat_examples.sh           ← WS 端点手工探针 (WSL/Git Bash)
-    └── curl_examples.sh            ← REST 端点手工探针 (WSL/Git Bash)
+├── scripts/
+│   ├── run_ut.ps1 / run_ut.sh      ← [ULYS-138] UT 编排: cargo test --lib, 不需 PG
+│   ├── run_it.ps1 / run_it.sh      ← [ULYS-138] IT 编排: PG 集成测试 + summary
+│   ├── run_all_tests.ps1           ← [ULYS-138] 升级为 UT→IT→ST 三层编排
+│   ├── run_all_tests.sh            ← [ULYS-138] POSIX 等价物
+│   ├── generate_regression_report.ps1 ← [ULYS-138] 离线汇总 ut/it/st summary
+│   ├── setup_test_db.ps1           ← 起 PG test db + migration + fixture
+│   ├── teardown_test_db.ps1        ← 删 test db (带 im1test_ 前缀安全护栏)
+│   ├── start_im_gateway_mock.ps1   ← 启动 im-gateway 连 test db
+│   ├── stop_im_gateway.ps1         ← 停止 im-gateway
+│   ├── wscat_examples.sh           ← WS 端点手工探针 (WSL/Git Bash)
+│   └── curl_examples.sh            ← REST 端点手工探针 (WSL/Git Bash)
+├── logs/                           ← [ULYS-138] 各层日志落盘 (ut-*.log / it-*.log / st-*.log / regression-*.log)
+└── reports/                        ← [ULYS-138] 回归报告落盘 (regression-<stamp>.{md,json})
 ```
 
 ## 3. 文件清单 (37 个)
@@ -84,19 +90,76 @@ tests/
 | `message_fixture.sql` | 0005 | messages / reactions |
 | `audit_log_fixture.sql` | 0006 | audit_logs |
 
-### 3.5 脚本 (7 个)
+### 3.5 脚本 (12 个, [ULYS-138] 升级)
 
-| 文件 | 平台 | 用途 |
-|---|---|---|
-| `setup_test_db.ps1` | Windows | 起 test db + 跑 migration + 灌 fixture |
-| `teardown_test_db.ps1` | Windows | 删 test db (护栏: 仅删 `im1test_*`) |
-| `start_im_gateway_mock.ps1` | Windows | 启动 im-gateway 连 test db |
-| `stop_im_gateway.ps1` | Windows | 停 im-gateway |
-| `run_all_tests.ps1` | Windows | 一键编排 setup → test → smoke → teardown |
-| `wscat_examples.sh` | WSL/Git Bash/Linux/macOS | WS 端点手工探针 |
-| `curl_examples.sh` | WSL/Git Bash/Linux/macOS | REST 端点手工探针 |
+ULYS-138 把原有 5 个 PS1 + 2 个 sh 升级到 12 个 (PS1 + sh 配对) + 1 个报告生成器:
+
+| 文件 | 平台 | 用途 | 阶段 |
+|---|---|---|---|
+| `run_ut.ps1` / `run_ut.sh` | Win / POSIX | cargo test --workspace --lib, 不需 PG | UT |
+| `run_it.ps1` / `run_it.sh` | Win / POSIX | cargo test --workspace --tests, 需 PG | IT |
+| `run_all_tests.ps1` | Win | UT→IT→ST 三层编排 + 回归报告 | ST |
+| `run_all_tests.sh` | POSIX | POSIX 等价 run_all_tests.ps1 | ST |
+| `generate_regression_report.ps1` | Win | 离线汇总 ut/it/st summary 成 md | — |
+| `setup_test_db.ps1` | Win | 起 test db + 跑 migration + 灌 fixture | DB |
+| `teardown_test_db.ps1` | Win | 删 test db (护栏: 仅删 `im1test_*`) | DB |
+| `start_im_gateway_mock.ps1` | Win | 启动 im-gateway 连 test db | ST |
+| `stop_im_gateway.ps1` | Win | 停 im-gateway | ST |
+| `wscat_examples.sh` | POSIX | WS 端点手工探针 | (manual) |
+| `curl_examples.sh` | POSIX | REST 端点手工探针 | (manual) |
+
+**回归测试调用链**:
+
+```
+run_all_tests.{ps1,sh}
+    ├── Layer 1: run_ut.{ps1,sh}    →  cargo test --workspace --lib
+    │      └── 落盘: ut-<stamp>.log + ut-summary-<stamp>.txt
+    ├── Layer 2: run_it.{ps1,sh}    →  cargo test --workspace --tests --test-threads=1
+    │      └── 落盘: it-<stamp>.log + it-summary-<stamp>.txt
+    └── Layer 3: ST (in-script)
+           └── 落盘: st-<stamp>.log
+
+最终: tests/logs/regression-<stamp>.log
+     + tests/reports/regression-<stamp>.md   (人类可读)
+     + tests/reports/regression-<stamp>.json (机器可读)
+```
 
 ## 4. 快速上手
+
+### 4.0 单层运行 (新, [ULYS-138])
+
+```bash
+# UT (不需 PG, 最快, ~秒级)
+bash tests/scripts/run_ut.sh                                       # POSIX
+pwsh tests/scripts/run_ut.ps1                                     # Windows
+
+# IT (需 PG; 默认连 postgres://leo19@127.0.0.1:5544/postgres)
+bash tests/scripts/run_it.sh --setup-db --keep-db                 # POSIX
+pwsh tests/scripts/run_it.ps1 -SetupDb -KeepDb                   # Windows
+
+# 仅跑某一个 integration test
+pwsh tests/scripts/run_it.ps1 -TestName pg_repos_integration
+```
+
+### 4.1 完整回归 (UT → IT → ST, 推荐)
+
+```bash
+# POSIX
+bash tests/scripts/run_all_tests.sh --keep-db 2>&1 | tee /tmp/regression.log
+
+# Windows
+pwsh tests/scripts/run_all_tests.ps1 -KeepDb
+
+# 完整回归报告 (md + json) 落盘:
+#   tests/reports/regression-<YYYYMMDD-HHMMSS>.md
+#   tests/reports/regression-<YYYYMMDD-HHMMSS>.json
+#   tests/logs/regression-<YYYYMMDD-HHMMSS>.log   (master log, 串联 UT/IT/ST)
+
+# 离线归因 (不重跑, 只汇总已有 log):
+pwsh tests/scripts/generate_regression_report.ps1 -Stamp <YYYYMMDD-HHMMSS>
+```
+
+### 4.2 原 shell 脚本手工探针 (per 2026-08-31 原版, 仍保留)
 
 ```powershell
 # 1. 起 test db
@@ -114,7 +177,7 @@ pwsh tests/scripts/stop_im_gateway.ps1 -Force
 pwsh tests/scripts/teardown_test_db.ps1 -Force
 ```
 
-或者一键:
+或者一键 (Windows, 老 entry point, 仍可用, 但推荐 §4.1):
 
 ```powershell
 pwsh tests/scripts/run_all_tests.ps1
@@ -124,12 +187,14 @@ pwsh tests/scripts/run_all_tests.ps1
 
 1. **aux-13 §1 仅引用 12 帧 (实有 18 帧)**: 本目录覆盖 MVP 必测子集,其余 6 帧由 im-testkit crate 内部维护。
 2. **SQL fixture 字段未与 im-core 实际表 schema 100% 对齐**: 字段以 migration `0001-0006` 为准,im-core 实际实现如有列名差异需 Test-3 worker 二次复核。
-3. **PowerShell 脚本跨平台未支持**: macOS / Linux 必须用 `.sh` 脚本;PowerShell 7+ 跨平台需在 Test-3 阶段补 `pwsh` 适配。
+3. **PowerShell 脚本跨平台未支持**: macOS / Linux 必须用 `.sh` 脚本;PowerShell 7+ 跨平台需在 Test-3 阶段补 `pwsh` 适配。[ULYS-138] 部分缓解: 已为 run_ut / run_it / run_all_tests / generate_regression_report 提供 PS1 + sh 配对。
 4. **wscat / curl 工具未在本机实测安装**: 脚本 fail-fast 而不 auto-install,确保不强加副作用。
 5. **setup_test_db.ps1 用 superuser `postgres`**: 未建应用专用 user (`im_test_app`);生产前需收紧 (Test-3 阶段)。
 6. **psql 工具链**已在 PATH 假设;**本机确认**该假设后**未实测执行** `setup_test_db.ps1` (per "不写运行代码"硬约束)。
-7. **start_im_gateway_mock.ps1 未实测启动**: 仅当 `target/release/im-gateway.exe` 或 `target/debug/im-gateway.exe` 存在时才执行,否则优雅退出。
+7. **start_im_gateway_mock.ps1 未实测启动**: 仅当 `target/release/im-gateway.exe` 或 `target/debug/im-gateway.exe` 存在时才执行,否则优雅退出。[ULYS-138] 强化: run_all_tests.ps1 自动从 `target/{debug,release}/im-gateway.exe` + `E:/DevCache/cargo/target/im1.0/{debug,release}/im-gateway.exe` 4 个候选查找, 找不到时 Layer 3 = INCONCLUSIVE 而非 fail。
 8. **im-gateway 端口假设** 18080/18081/19001 — 若 im-gateway 实际默认端口不同,需在 Test-3 阶段对齐。
+9. **[ULYS-138] ST 层暂仅含 healthz smoke**: 完整的 WS/gRPC/REST 协议层 ST 需在 im-gateway 实装 WS / 完整 REST handler 后 (C-9 / C-11) 才能跑;当前 im-gateway 仅放骨架。当前 ST = 仅起 binary → 等 → curl /healthz → 停。
+10. **[ULYS-138] IT 层依赖 PG 18.6**: run_it.{ps1,sh} 假定 PG 在 `postgres://leo19@127.0.0.1:5544/postgres`(per scripts/init-pg18-b1.sh)。若 PG 未启,IT 会失败, 整层失败不会让 UT 也失败 (UT 在前且独立)。
 
 ## 6. 协议引用 (禁止改写, 仅引用)
 

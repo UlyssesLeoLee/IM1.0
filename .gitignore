@@ -89,3 +89,7 @@ sum.txt
 t2.txt
 tout.txt
 fwt.txt
+
+# ===== 测试日志 + 报告 [ULYS-138] =====
+tests/logs/
+tests/reports/
