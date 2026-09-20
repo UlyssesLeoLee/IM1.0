@@ -76,6 +76,13 @@ pub trait UserRepository: Send + Sync {
     /// WBS C-6 link_account SQL 实装: 把 external_identity UPDATE 到 user 记录
     /// (MVP: 仅 external_identity, V1 加 external_linked_at 时间戳需新 migration)
     /// 返更新后的 User (供 service 调 issue_token_pair)
+    ///
+    /// 绑定外部身份 (Guest 升级 / Account Link):
+    /// - 将 `kind` 从 `guest` 升级为 `user`,并写入 `external_identity`
+    /// - 若同 `(environment_id, external_identity)` 已被其它 user 占用,返回
+    ///   `AppError::Conflict` (映射 SQL `uniq_users_env_extid` 触发)
+    /// - 若 user 已被 ban/suspend,返回 `AppError::NotFound` (不暴露存在性)
+    /// - 不允许对 `kind='user'` 的记录二次绑定 (返回 `AppError::Validation`)
     async fn update_external_identity(
         &self,
         id: UserId,

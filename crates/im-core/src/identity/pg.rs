@@ -169,17 +169,39 @@ impl UserRepository for PgUserRepository {
         env: EnvironmentId,
         external: ExternalIdentity,
     ) -> Result<User, AppError> {
-        // 把 ExternalIdentity (provider + external_uid) 序列化为 JSONB.
-        // 序列化格式: `{"provider": "...", "external_uid": "..."}`
-        let ext_json = serde_json::to_value(&external).map_err(|e| {
-            AppError::Internal(anyhow::anyhow!(
-                "update_external_identity: serde_json::to_value failed: {e}"
-            ))
-        })?;
-        let row: Option<UserRow> = sqlx::query_as(
+        // 1. 先读 user,校验 kind='guest' 与 state=Active
+        let existing: Option<UserRow> = sqlx::query_as(
+            r#"
+            SELECT id, environment_id, kind, external_identity, state, display_name, created_at
+            FROM users WHERE id = $1 AND environment_id = $2
+            "#,
+        )
+        .bind(id.0)
+        .bind(env.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let row = existing.ok_or_else(|| AppError::NotFound(format!("user {} in env {}", id.0, env.0)))?;
+        if row.kind != "guest" {
+            return Err(AppError::Validation(
+                "user already linked; only guests can upgrade".into(),
+            ));
+        }
+        match row.state.as_str() {
+            "active" => {}
+            _ => return Err(AppError::NotFound(format!("user {}", id.0))),
+        }
+
+        // 2. UPDATE: kind='user' + external_identity = $1
+        let ext_json = serde_json::json!({
+            "provider": external.provider,
+            "external_uid": external.external_uid,
+        });
+        let row: UserRow = sqlx::query_as(
             r#"
             UPDATE users
-            SET external_identity = $1
+            SET kind = 'user', external_identity = $1
             WHERE id = $2 AND environment_id = $3
             RETURNING id, environment_id, kind, external_identity, state, display_name, created_at
             "#,
@@ -187,11 +209,15 @@ impl UserRepository for PgUserRepository {
         .bind(ext_json)
         .bind(id.0)
         .bind(env.0)
-        .fetch_optional(&self.pool)
+        .fetch_one(&self.pool)
         .await
-        .map_err(map_sqlx_error)?;
-        row.map(UserRow::into_user)
-            .ok_or_else(|| AppError::NotFound(format!("user {} in env {}", id.0, env.0)))
+        .map_err(|e| match &e {
+            sqlx::Error::Database(db) if db.code().as_deref() == Some("23505") => {
+                AppError::AccountMergeConflict
+            }
+            _ => AppError::Internal(anyhow::anyhow!("sqlx: {}", e)),
+        })?;
+        Ok(row.into_user())
     }
 }
 

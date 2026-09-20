@@ -198,12 +198,24 @@ where
         self.issue_token_pair(user).await
     }
 
-    /// Guest Upgrade / Account Link
+    /// Guest Upgrade / Account Link (IM-ID-005, GAME-ID-004)
+    ///
+    /// 业务流程:
+    /// 1. 校验 caller 持有的 access_token(必须是 active 状态)
+    /// 2. caller 必须是 `kind='guest'`(二次 link 返回 Validation)
+    /// 3. 目标 `(env, provider, external_uid)` 必须未被其它 user 占用,否则返回
+    ///    `AccountMergeConflict` (409 — 由 PG `uniq_users_env_extid` 兜底)
+    /// 4. UPDATE users SET kind='user', external_identity=...
+    /// 5. 签发新 TokenPair(同 user,但 access 重新计时)
+    ///
+    /// 返回的 `TokenPair.user_id` 与调用前一致(Guest→正式账号保留 user_id,
+    /// 历史会话/消息保留 — IM-ID-005 红线)。
     pub async fn link_account(
         &self,
         access_token: &str,
         external: ExternalIdentity,
     ) -> Result<TokenPair, AppError> {
+        // 1. 校验 access_token, 拿到 caller 的 claims
         let claims = self
             .token_service
             .validate_access_token(access_token)
@@ -212,31 +224,34 @@ where
         let user_id: UserId = claims
             .sub
             .parse()
-            .map_err(|_| AppError::Unauthorized("invalid user_id".into()))?;
-        let environment_id: EnvironmentId = claims
+            .map_err(|_| AppError::Unauthorized("invalid user_id in token".into()))?;
+        let _environment_id: EnvironmentId = claims
             .env
             .parse()
-            .map_err(|_| AppError::Unauthorized("invalid env".into()))?;
+            .map_err(|_| AppError::Unauthorized("invalid env in token".into()))?;
 
-        // 1. 查目标 extid 是否已被绑定
+        // 2. 冲突检测 (race-condition safe, 真正的兜底是 PG uniq_users_env_extid)
+        //    即使这里 TOCTOU 漏掉, UPDATE 时也会被 SQL 触发器兜住并返回 23505
+        //    → 由 link_external_identity 映射成 AccountMergeConflict
         if let Some(existing) = self
             .user_repo
             .find_by_external_identity(
-                environment_id,
+                _environment_id,
                 &external.provider,
                 &external.external_uid,
             )
             .await?
         {
             if existing.id != user_id {
+                // 目标 extid 已被绑定到 *其它* user → 合并冲突
                 return Err(AppError::AccountMergeConflict);
             }
-            // 已是同一 user,直接续 token
+            // 已是同一 user (idempotent link) — 直接续 token
             let user = self
                 .user_repo
                 .find_by_id(user_id)
                 .await?
-                .ok_or(AppError::NotFound("user".into()))?;
+                .ok_or(AppError::NotFound(format!("user {}", user_id.0)))?;
             return self.issue_token_pair(user).await;
         }
 
@@ -245,7 +260,7 @@ where
         // 返更新后的 User, 调 issue_token_pair(user) 签发新 token pair
         let updated = self
             .user_repo
-            .update_external_identity(user_id, environment_id, external.clone())
+            .update_external_identity(user_id, _environment_id, external.clone())
             .await?;
         self.issue_token_pair(updated).await
     }
