@@ -99,6 +99,10 @@ prometheus = { version = "0.14", default-features = false }
 opentelemetry = "0.24"
 opentelemetry_sdk = { version = "0.24", features = ["rt-tokio"] }
 opentelemetry-otlp = { version = "0.17", features = ["grpc-tonic"] }
+opentelemetry-semantic-conventions = "0.16"
+# tracing ↔ OpenTelemetry bridge. 0.25 aligns with opentelemetry 0.24 (workspace).
+# 0.26+ bumps to opentelemetry 0.25; lock to 0.25 until the rest of the stack moves.
+tracing-opentelemetry = "0.25"
 
 # ---- gRPC ----
 tonic = "0.12"
