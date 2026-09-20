@@ -105,7 +105,7 @@ opentelemetry-semantic-conventions = "0.16"
 tracing-opentelemetry = "0.25"
 
 # ---- gRPC ----
-tonic = "0.12"
+tonic = "0.14"
 tonic-build = "0.12"
 prost = "0.13"
 prost-types = "0.13"
