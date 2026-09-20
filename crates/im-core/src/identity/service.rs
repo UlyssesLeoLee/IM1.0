@@ -34,8 +34,8 @@ pub struct ServerExchangeCommand {
 }
 
 pub struct IdentityService<U: UserRepository, D: DeviceSessionRepository> {
-    user_repo: U,
-    device_repo: D,
+    pub(crate) user_repo: U,
+    pub(crate) device_repo: D,
     token_service: std::sync::Arc<TokenService>,
     server_secrets: std::collections::HashMap<EnvironmentId, secrecy::SecretString>,
 }
@@ -240,12 +240,14 @@ where
             return self.issue_token_pair(user).await;
         }
 
-        // 2. 绑定(MVP:不实现自动 merge,直接更新 user 记录)
-        // 实现:UPDATE users SET external_identity = $1 WHERE id = $2
-        // 留待 SQL 实现,目前返回未实现
-        Err(AppError::Internal(anyhow::anyhow!(
-            "link_account UPDATE not yet implemented in MVP; see ImplementationSpec §7.4.1"
-        )))
+        // 2. 绑定(MVP:不实现自动 merge, 直接更新 user 记录)
+        // WBS C-6 实装: UPDATE users SET external_identity = $1 WHERE id = $2 AND environment_id = $3
+        // 返更新后的 User, 调 issue_token_pair(user) 签发新 token pair
+        let updated = self
+            .user_repo
+            .update_external_identity(user_id, environment_id, external.clone())
+            .await?;
+        self.issue_token_pair(updated).await
     }
 
     pub async fn logout(

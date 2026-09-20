@@ -162,6 +162,37 @@ impl UserRepository for PgUserRepository {
         .map_err(map_sqlx_error)?;
         row.map(UserRow::into_user).ok_or_else(|| AppError::NotFound(format!("user {}", id.0)))
     }
+
+    async fn update_external_identity(
+        &self,
+        id: UserId,
+        env: EnvironmentId,
+        external: ExternalIdentity,
+    ) -> Result<User, AppError> {
+        // 把 ExternalIdentity (provider + external_uid) 序列化为 JSONB.
+        // 序列化格式: `{"provider": "...", "external_uid": "..."}`
+        let ext_json = serde_json::to_value(&external).map_err(|e| {
+            AppError::Internal(anyhow::anyhow!(
+                "update_external_identity: serde_json::to_value failed: {e}"
+            ))
+        })?;
+        let row: Option<UserRow> = sqlx::query_as(
+            r#"
+            UPDATE users
+            SET external_identity = $1
+            WHERE id = $2 AND environment_id = $3
+            RETURNING id, environment_id, kind, external_identity, state, display_name, created_at
+            "#,
+        )
+        .bind(ext_json)
+        .bind(id.0)
+        .bind(env.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        row.map(UserRow::into_user)
+            .ok_or_else(|| AppError::NotFound(format!("user {} in env {}", id.0, env.0)))
+    }
 }
 
 // ----------------------------------------------------------------------------

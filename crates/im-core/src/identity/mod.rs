@@ -6,6 +6,8 @@ pub mod password;
 pub mod pg;
 pub mod repository;
 pub mod service;
+#[cfg(test)]
+mod tests;
 pub mod token;
 
 pub use password::{hash_password, verify_password, PasswordError};

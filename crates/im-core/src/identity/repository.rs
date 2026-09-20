@@ -73,6 +73,15 @@ pub trait UserRepository: Send + Sync {
         id: UserId,
         display_name: Option<&str>,
     ) -> Result<User, AppError>;
+    /// WBS C-6 link_account SQL 实装: 把 external_identity UPDATE 到 user 记录
+    /// (MVP: 仅 external_identity, V1 加 external_linked_at 时间戳需新 migration)
+    /// 返更新后的 User (供 service 调 issue_token_pair)
+    async fn update_external_identity(
+        &self,
+        id: UserId,
+        env: EnvironmentId,
+        external: ExternalIdentity,
+    ) -> Result<User, AppError>;
 }
 
 /// Device Session Repository trait (在 token.rs 中定义以避免循环)
