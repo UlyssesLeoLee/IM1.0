@@ -208,6 +208,8 @@ mod tests {
             external_identity: None,
             state: UserState::Active,
             display_name: Some("test".into()),
+            username: None,           // 2026-09-21 整合
+            password_hash: None,      // 2026-09-21 整合
             created_at: Utc::now(),
         }
     }

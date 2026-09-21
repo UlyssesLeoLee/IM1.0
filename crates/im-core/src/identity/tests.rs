@@ -73,6 +73,46 @@ impl UserRepository for InMemoryUserRepo {
             external_identity: external,
             state: UserState::Active,
             display_name,
+            username: None,           // 2026-09-21 整合: 默认 None
+            password_hash: None,      // 2026-09-21 整合: 默认 None
+            created_at: Utc::now(),
+        };
+        self.users.write().insert(user.id, user.clone());
+        Ok(user)
+    }
+
+    // ============================================================================
+    // 2026-09-21 整合: C-3 + C-4 username/password 路径 (in-memory 实现, 测试用)
+    // ============================================================================
+
+    async fn find_by_username(
+        &self,
+        env: EnvironmentId,
+        username: &str,
+    ) -> Result<Option<User>, AppError> {
+        let users = self.users.read();
+        Ok(users
+            .values()
+            .find(|u| u.environment_id == env && u.username.as_deref() == Some(username))
+            .cloned())
+    }
+
+    async fn create_with_password(
+        &self,
+        env: EnvironmentId,
+        username: &str,
+        password_hash: &str,
+        display_name: Option<String>,
+    ) -> Result<User, AppError> {
+        let user = User {
+            id: UserId(Uuid::new_v4()),
+            environment_id: env,
+            kind: UserKind::User,
+            external_identity: None,  // 密码路径不写 extid
+            state: UserState::Active,
+            display_name,
+            username: Some(username.to_string()),
+            password_hash: Some(password_hash.to_string()),
             created_at: Utc::now(),
         };
         self.users.write().insert(user.id, user.clone());

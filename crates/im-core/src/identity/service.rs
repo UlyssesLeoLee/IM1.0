@@ -20,7 +20,17 @@ use super::repository::{
     ExternalIdentity, User, UserKind, UserRepository, UserState,
 };
 use super::token::{AccessToken, DeviceSessionRepository, TokenPair, TokenService};
+use super::password::{hash_password, validate_password_strength, validate_username, verify_password};
 use crate::common::repository::*; // 留位,后续会用到
+
+/// Register 命令 (username/password 路径, 2026-09-21 整合 C-3)
+#[derive(Debug, Clone)]
+pub struct RegisterCommand {
+    pub environment_id: EnvironmentId,
+    pub username: String,
+    pub password: String,
+    pub display_name: Option<String>,
+}
 
 /// Server Exchange 命令(Server-to-Server)
 #[derive(Debug, Clone)]
@@ -121,6 +131,100 @@ where
             .user_repo
             .create(environment_id, UserKind::Guest, None, None)
             .await?;
+        self.issue_token_pair(user).await
+    }
+
+    // ============================================================================
+    // 2026-09-21 整合 (C-3 + C-4, 方案 C): username/password 路径
+    // ============================================================================
+
+    /// C-3 WBS (ULYS-144): username/password 注册
+    ///
+    /// 流程:
+    ///   1. 校验 username 格式 + 密码强度
+    ///   2. argon2id 哈希密码
+    ///   3. INSERT user (dup username → AppError::AccountAlreadyExists)
+    ///   4. 签发 TokenPair (同 issue_token_pair)
+    pub async fn register(
+        &self,
+        cmd: RegisterCommand,
+    ) -> Result<TokenPair, AppError> {
+        // 1. 校验 username
+        validate_username(&cmd.username).map_err(|e| {
+            AppError::Validation(format!("invalid username '{}': {}", cmd.username, e))
+        })?;
+        // 2. 校验密码强度
+        validate_password_strength(&cmd.password).map_err(|e| {
+            AppError::Validation(format!("weak password: {}", e))
+        })?;
+
+        // 3. argon2id 哈希
+        let password_hash = hash_password(&cmd.password)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("argon2 hash failed: {}", e)))?;
+
+        // 4. INSERT user
+        let user = self
+            .user_repo
+            .create_with_password(
+                cmd.environment_id,
+                &cmd.username,
+                &password_hash,
+                cmd.display_name.clone(),
+            )
+            .await?;
+
+        // 5. 签发 token pair
+        self.issue_token_pair(user).await
+    }
+
+    /// C-4 WBS (ULYS-145): username/password 认证
+    ///
+    /// 流程 (5 步):
+    ///   1. 同消息防 enumeration 查 user (find_by_username)
+    ///   2. state 校验 (active/banned/suspended/deleted 各专属错误码)
+    ///   3. password_hash 必须存在 (纯 extid 用户走 server_exchange_token)
+    ///   4. argon2id verify_password
+    ///   5. 签发新 TokenPair (新 device session, 符合 SRS IM-ID-002 多设备并发)
+    pub async fn authenticate(
+        &self,
+        environment_id: EnvironmentId,
+        username: &str,
+        password: &str,
+    ) -> Result<TokenPair, AppError> {
+        // 1. 查 user
+        let user = self
+            .user_repo
+            .find_by_username(environment_id, username)
+            .await?
+            .ok_or_else(|| AppError::Unauthorized("invalid username or password".into()))?;
+
+        // 2. state 校验
+        if user.state != UserState::Active {
+            return Err(match user.state {
+                UserState::Banned => AppError::AccountBanned,
+                UserState::Suspended => AppError::AccountSuspended,
+                UserState::Deleted => {
+                    AppError::Unauthorized("invalid username or password".into())
+                }
+                _ => AppError::Internal(anyhow::anyhow!("unexpected user state")),
+            });
+        }
+
+        // 3. password_hash 必须存在
+        let password_hash = user.password_hash.as_ref().ok_or_else(|| {
+            AppError::Unauthorized("invalid username or password".into())
+        })?;
+
+        // 4. argon2id verify (wrong password → Unauthorized, 与 unknown 同文本防 enumeration)
+        let valid = verify_password(password, password_hash)
+            .map_err(|_| AppError::Unauthorized("invalid username or password".into()))?;
+        if !valid {
+            return Err(AppError::Unauthorized(
+                "invalid username or password".into(),
+            ));
+        }
+
+        // 5. 签发 token pair (新 device session, 符合 SRS IM-ID-002)
         self.issue_token_pair(user).await
     }
 

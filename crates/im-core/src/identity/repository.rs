@@ -47,6 +47,11 @@ pub struct User {
     pub external_identity: Option<ExternalIdentity>,
     pub state: UserState,
     pub display_name: Option<String>,
+    /// 2026-09-21 C-3 + C-4 整合: username/password 登录凭证
+    /// NULL 表示该 user 走 extid/OAuth 路径 (无密码登录)
+    pub username: Option<String>,
+    /// argon2id PHC-format 哈希字符串;NULL 表示无密码登录路径
+    pub password_hash: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -88,6 +93,28 @@ pub trait UserRepository: Send + Sync {
         id: UserId,
         env: EnvironmentId,
         external: ExternalIdentity,
+    ) -> Result<User, AppError>;
+
+    // ============================================================================
+    // 2026-09-21 整合 (C-3 + C-4): username/password 路径
+    // ============================================================================
+
+    /// C-4 WBS (ULYS-145): 按 (env, username) 查 user — 用于 authenticate
+    /// 返回 None 表示用户不存在(由 caller 决定是否映射为 generic Unauthorized 防 enumeration)
+    async fn find_by_username(
+        &self,
+        env: EnvironmentId,
+        username: &str,
+    ) -> Result<Option<User>, AppError>;
+
+    /// C-3 WBS (ULYS-144): 创建带 username + password_hash 的 user
+    /// dup username 由 PG UNIQUE 约束拦截 → map_sqlx_error → AppError::AccountAlreadyExists
+    async fn create_with_password(
+        &self,
+        env: EnvironmentId,
+        username: &str,
+        password_hash: &str,
+        display_name: Option<String>,
     ) -> Result<User, AppError>;
 }
 
