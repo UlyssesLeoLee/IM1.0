@@ -38,6 +38,9 @@ anyhow = { workspace = true }
 # 2026-08-31: 加 reqwest 0.12 JSON feature(测试只读)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# ---- ACI 跨项目 emitter (per ULYS-191 §4.3.3 brief v0.1) ----
+aci-emitter = { workspace = true }
+
 [dev-dependencies]
 # testkit 自身 smoke 测试时 im-core 也要可引用(虽然 fixture 路径已经覆盖)
 im-core = { workspace = true }
