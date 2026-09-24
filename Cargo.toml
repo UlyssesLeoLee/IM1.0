@@ -76,7 +76,7 @@ strum = { version = "0.26", features = ["derive"] }
 
 # ---- 密码 / Token ----
 argon2 = "0.5"
-jsonwebtoken = "9"
+jsonwebtoken = "11"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
