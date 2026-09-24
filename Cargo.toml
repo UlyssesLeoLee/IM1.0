@@ -143,6 +143,10 @@ im-media = { path = "crates/im-media" }
 extension-runtime = { path = "crates/extension-runtime" }
 im-testkit = { path = "crates/im-testkit" }
 
+# ---- ACI 跨项目 emitter (per ULYS-191 §4.3.3 brief v0.1) ----
+# 守门 #11 缺标比错标: git dep 锁 rev=df28c56 (= ULYS-191.1 / ULYS-224 main HEAD)
+aci-emitter = { git = "https://github.com/UlyssesLeoLee/aci-emitter", rev = "df28c56" }
+
 # ---- 共享编译 profile ----
 [profile.release]
 lto = "thin"
