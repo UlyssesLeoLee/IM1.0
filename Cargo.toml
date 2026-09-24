@@ -106,7 +106,7 @@ tracing-opentelemetry = "0.25"
 
 # ---- gRPC ----
 tonic = "0.12"
-tonic-build = "0.12"
+tonic-build = "0.14"
 prost = "0.13"
 prost-types = "0.13"
 
