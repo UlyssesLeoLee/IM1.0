@@ -1,13 +1,13 @@
-//! Day 2 GATE 补签: 6 份 SQL migration 验证
+//! Day 2 GATE 补签: 7 份 SQL migration 验证 (0007 于 2026-09-21 C-3/C-4 整合新增)
 //!
 //! **无 docker daemon 环境**: 仅跑 Migrator 解析 + 校验 SQL 文件不崩。
 //! **完整版** (testcontainers::Postgres + sqlx::migrate!): 见
 //! `tests/migration_smoke_docker.rs`(feature-gated, 默认不编)。
 //!
 //! 当前测试覆盖:
-//! 1. `sqlx::migrate::Migrator::new` 解析 6 份 SQL 文件不抛错
+//! 1. `sqlx::migrate::Migrator::new` 解析 7 份 SQL 文件不抛错
 //! 2. 列出的迁移名与 `migrations/*.sql` 文件名 1:1 对应
-//! 3. 6 份 SQL 至少能 create 14 张表(SQL 内的 `CREATE TABLE` 计数 = 14)
+//! 3. 7 份 SQL 至少能 create 14 张表(SQL 内的 `CREATE TABLE` 计数 = 14; 0007 仅 ALTER users, 不新增表)
 //!
 //! 不覆盖: 真实 PG 执行(需 docker / 真 PG 实例)。
 
@@ -52,7 +52,7 @@ fn migration_files_present_and_nonempty() {
             count += 1;
         }
     }
-    assert_eq!(count, 6, "应有 6 份 SQL migration, 实际 {count}");
+    assert_eq!(count, 7, "应有 7 份 SQL migration, 实际 {count}");
 }
 
 #[test]
@@ -70,14 +70,14 @@ fn migrator_parses_all_six_files() {
     let names: Vec<String> = migrations.map(|m| m.version.to_string()).collect();
     assert_eq!(
         names.len(),
-        6,
-        "Migrator 应识别 6 份 migration, 实际 {} ({:?})",
+        7,
+        "Migrator 应识别 7 份 migration, 实际 {} ({:?})",
         names.len(),
         names
     );
     for v in &names {
         let n: u64 = v.parse().expect("version parse");
-        assert!((1..=6).contains(&n), "unexpected version {v}");
+        assert!((1..=7).contains(&n), "unexpected version {v}");
     }
 }
 
