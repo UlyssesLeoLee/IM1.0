@@ -1,12 +1,29 @@
 {
   "$schema": "https://ulysses-star.local/schemas/aci/v0.1.0-draft.json",
   "aci_version": "0.1.0-draft",
+  "aci_compat_version": "0.1.0-draft",
   "project": "im1.0",
   "description": "IM1.0 im-testkit ACI 契约 v0.1 — 提示词型断言 (LLM-可读), per ULYS-191 §4.3.3",
   "homepage": "https://github.com/UlyssesLeoLee/IM1.0/tree/main/crates/im-testkit",
-  "supported_layers": ["ut", "it", "st", "e2e"],
-  "severity_levels": ["critical", "high", "medium", "low", "info"],
-  "assertion_statuses": ["PASS", "FAIL", "WARN", "SKIP"],
+  "supported_layers": [
+    "ut",
+    "it",
+    "st",
+    "e2e"
+  ],
+  "severity_levels": [
+    "critical",
+    "high",
+    "medium",
+    "low",
+    "info"
+  ],
+  "assertion_statuses": [
+    "PASS",
+    "FAIL",
+    "WARN",
+    "SKIP"
+  ],
   "expect_value_types": [
     "response_within_ms",
     "response_status_2xx",
@@ -127,5 +144,79 @@
     "docs/architecture/2026-09-22-aci-mock-interface/00-design-analysis.md v0.2",
     "docs/briefs/ulys-191-star-mock-aci-stage1.md v0.1",
     "scripts/_lib_validate.py (风格参考)"
-  ]
+  ],
+  "plugins": {
+    "assertions": {
+      "plugin_id": "assertions",
+      "enabled": true,
+      "default_mode": "offline",
+      "modules": {
+        "assert_error_code": {
+          "module_id": "assert_error_code",
+          "enabled": true,
+          "mode": "offline"
+        },
+        "assert_ws_frame_shape": {
+          "module_id": "assert_ws_frame_shape",
+          "enabled": true,
+          "mode": "offline"
+        },
+        "assert_json_schema": {
+          "module_id": "assert_json_schema",
+          "enabled": true,
+          "mode": "offline"
+        }
+      }
+    },
+    "fixtures": {
+      "plugin_id": "fixtures",
+      "enabled": true,
+      "default_mode": "offline",
+      "modules": {
+        "tenant": {
+          "module_id": "tenant",
+          "enabled": true,
+          "mode": "offline"
+        },
+        "user": {
+          "module_id": "user",
+          "enabled": true,
+          "mode": "offline"
+        },
+        "device": {
+          "module_id": "device",
+          "enabled": true,
+          "mode": "offline"
+        },
+        "session": {
+          "module_id": "session",
+          "enabled": true,
+          "mode": "offline"
+        },
+        "message": {
+          "module_id": "message",
+          "enabled": true,
+          "mode": "offline"
+        }
+      }
+    },
+    "mock_grpc": {
+      "plugin_id": "mock_grpc",
+      "enabled": true,
+      "default_mode": "offline",
+      "modules": {}
+    },
+    "mock_rest": {
+      "plugin_id": "mock_rest",
+      "enabled": true,
+      "default_mode": "offline",
+      "modules": {}
+    },
+    "mock_ws_frames": {
+      "plugin_id": "mock_ws_frames",
+      "enabled": true,
+      "default_mode": "offline",
+      "modules": {}
+    }
+  }
 }
