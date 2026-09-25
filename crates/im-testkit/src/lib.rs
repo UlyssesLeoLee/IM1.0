@@ -29,6 +29,7 @@
 //! - 引用 im-proto 的 protobuf 类型 vs serde JSON 类型——当前 mock 主要用 serde JSON,未实测 protobuf wire format
 //! - miri / criterion 未做
 
+pub mod aci_emitter_helper;
 pub mod assertions;
 pub mod fixtures;
 pub mod mock_grpc;
