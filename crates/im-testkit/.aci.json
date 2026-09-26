@@ -204,19 +204,142 @@
       "plugin_id": "mock_grpc",
       "enabled": true,
       "default_mode": "offline",
-      "modules": {}
+      "modules": {
+        "send_message": {
+          "module_id": "send_message",
+          "enabled": true,
+          "mode": "offline",
+          "description": "RPC: send a text message to a conversation"
+        },
+        "list_messages": {
+          "module_id": "list_messages",
+          "enabled": true,
+          "mode": "offline",
+          "description": "RPC: list messages in a conversation"
+        },
+        "validate_access_token": {
+          "module_id": "validate_access_token",
+          "enabled": true,
+          "mode": "offline",
+          "description": "RPC: validate JWT access token (valid + invalid variant)"
+        },
+        "mark_read": {
+          "module_id": "mark_read",
+          "enabled": true,
+          "mode": "offline",
+          "description": "RPC: mark message(s) read"
+        }
+      }
     },
     "mock_rest": {
       "plugin_id": "mock_rest",
       "enabled": true,
       "default_mode": "offline",
-      "modules": {}
+      "modules": {
+        "login": {
+          "module_id": "login",
+          "enabled": true,
+          "mode": "offline",
+          "description": "POST /auth/login"
+        },
+        "guest_register": {
+          "module_id": "guest_register",
+          "enabled": true,
+          "mode": "offline",
+          "description": "POST /auth/guest-register"
+        },
+        "create_conversation": {
+          "module_id": "create_conversation",
+          "enabled": true,
+          "mode": "offline",
+          "description": "POST /conversations (success + blocked variant)"
+        },
+        "list_messages_rest": {
+          "module_id": "list_messages_rest",
+          "enabled": true,
+          "mode": "offline",
+          "description": "GET /conversations/{id}/messages"
+        },
+        "send_message_rest": {
+          "module_id": "send_message_rest",
+          "enabled": true,
+          "mode": "offline",
+          "description": "POST /conversations/{id}/messages (incl. idempotent replay variant)"
+        },
+        "presign_media": {
+          "module_id": "presign_media",
+          "enabled": true,
+          "mode": "offline",
+          "description": "POST /media/presign"
+        },
+        "error_responses": {
+          "module_id": "error_responses",
+          "enabled": true,
+          "mode": "offline",
+          "description": "Generic 4xx error mocks"
+        }
+      }
     },
     "mock_ws_frames": {
       "plugin_id": "mock_ws_frames",
       "enabled": true,
       "default_mode": "offline",
-      "modules": {}
+      "modules": {
+        "auth": {
+          "module_id": "auth",
+          "enabled": true,
+          "mode": "offline",
+          "description": "WS client frame: auth handshake"
+        },
+        "send_message": {
+          "module_id": "send_message",
+          "enabled": true,
+          "mode": "offline",
+          "description": "WS client frame: send_message"
+        },
+        "edit_message": {
+          "module_id": "edit_message",
+          "enabled": true,
+          "mode": "offline",
+          "description": "WS client frame: edit_message"
+        },
+        "recall_message": {
+          "module_id": "recall_message",
+          "enabled": true,
+          "mode": "offline",
+          "description": "WS client frame: recall_message"
+        },
+        "react": {
+          "module_id": "react",
+          "enabled": true,
+          "mode": "offline",
+          "description": "WS client frame: react (add/remove emoji)"
+        },
+        "mark_read": {
+          "module_id": "mark_read",
+          "enabled": true,
+          "mode": "offline",
+          "description": "WS client frame: mark_read"
+        },
+        "typing": {
+          "module_id": "typing",
+          "enabled": true,
+          "mode": "offline",
+          "description": "WS client frame: typing indicator"
+        },
+        "ping": {
+          "module_id": "ping",
+          "enabled": true,
+          "mode": "offline",
+          "description": "WS client frame: ping (with pong server response variant)"
+        },
+        "server_frames": {
+          "module_id": "server_frames",
+          "enabled": true,
+          "mode": "offline",
+          "description": "WS server frames: connected, ack (success/idempotent/error), message events, presence, typing broadcast, force_disconnect, validation_error (12 server-side frame factory functions aggregated into 1 module per G-MS-04 naming convention)"
+        }
+      }
     }
   }
 }
