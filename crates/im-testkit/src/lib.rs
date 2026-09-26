@@ -29,6 +29,27 @@
 //! - 引用 im-proto 的 protobuf 类型 vs serde JSON 类型——当前 mock 主要用 serde JSON,未实测 protobuf wire format
 //! - miri / criterion 未做
 
+//! ## module_switch 接入 (per ULYS-190 §4.4 brief v0.1)
+//!
+//! IM1.0 im-testkit 通过 `.aci.json` 的 `plugins.<plugin_id>.modules.<module_id>`
+//! 三层开关暴露 28 个 module_switch (assertions 3 + fixtures 5 + mock_grpc 4 +
+//! mock_rest 7 + mock_ws_frames 9)。读法:
+//!
+//! ```text
+//! 跨语言 dispatch:
+//!   python crates/im-testkit/scripts/_lib_mock_switch_im.py crates/im-testkit
+//! ```
+//!
+//! Rust native 版本跨 session (per G-MS-BRIEF-S44-01); 当前 Python helper 通过
+//! subprocess 暴露 (per AGENTS.md 守门 #9)。CI gate `mock-switch-validate.py
+//! validate-one im1` (Star ship) 验证 28 module 全部 enabled + cluster_ok=True.
+//!
+//! mock_switch_trace_format (per .mock-cluster.json) 输出例:
+//!   `cluster.enabled=True,mode=offline,plugins=[assertions(3m),fixtures(5m),mock_grpc(4m),mock_rest(7m),mock_ws_frames(9m)]=28/28 modules`
+//!
+//! 注意: trace 字段约 ~120 字, 超 G-MS-08 推荐 ~80 字, 跨 session 截断; 本
+//! stage 不做 (per brief §6 G-MS-BRIEF-S44-02)。
+
 pub mod aci_emitter_helper;
 pub mod assertions;
 pub mod fixtures;
