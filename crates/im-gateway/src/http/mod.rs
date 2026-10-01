@@ -28,10 +28,19 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     //   C-7 POST /auth/logout        → auth_handlers::logout (per 138 §8 缺口 #2 device_session_id JWT claim 未实装, 兜底 401)
     cfg.service(
         actix_web::web::scope("/auth")
-            .route("/token/exchange", actix_web::web::post().to(auth_handlers::token_exchange))
+            .route(
+                "/token/exchange",
+                actix_web::web::post().to(auth_handlers::token_exchange),
+            )
             .route("/guest", actix_web::web::post().to(auth_handlers::guest))
-            .route("/refresh", actix_web::web::post().to(auth_handlers::refresh))
-            .route("/link", actix_web::web::post().to(auth_handlers::link_account))
+            .route(
+                "/refresh",
+                actix_web::web::post().to(auth_handlers::refresh),
+            )
+            .route(
+                "/link",
+                actix_web::web::post().to(auth_handlers::link_account),
+            )
             .route("/logout", actix_web::web::post().to(auth_handlers::logout)),
     );
 
@@ -45,7 +54,10 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
         actix_web::web::scope("/conversations")
             .route("", actix_web::web::post().to(conversations::create))
             .route("", actix_web::web::get().to(conversations::list))
-            .route("/{id}", actix_web::web::get().to(crate::placeholder::conv_get))
+            .route(
+                "/{id}",
+                actix_web::web::get().to(crate::placeholder::conv_get),
+            )
             .route(
                 "/{id}/messages",
                 actix_web::web::post().to(messages::send_message),
@@ -54,14 +66,9 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 "/{id}/messages",
                 actix_web::web::get().to(messages::list_messages),
             )
-            .route(
-                "/{id}/members",
-                actix_web::web::get().to(members::list),
-            ),
+            .route("/{id}/members", actix_web::web::get().to(members::list)),
     );
 
     // WebSocket (C-11 driver) — MVP Day 4 实装
-    cfg.service(
-        actix_web::web::scope("/ws").configure(crate::ws::router::configure),
-    );
+    cfg.service(actix_web::web::scope("/ws").configure(crate::ws::router::configure));
 }

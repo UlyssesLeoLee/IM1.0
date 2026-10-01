@@ -28,7 +28,11 @@ pub struct FieldError {
 
 impl ErrorBody {
     /// 成功响应体(用于 IDEMPOTENCY_CONFLICT 特殊语义)
-    pub fn new(code: impl Into<String>, message: impl Into<String>, trace_id: impl Into<String>) -> Self {
+    pub fn new(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        trace_id: impl Into<String>,
+    ) -> Self {
         Self {
             code: code.into(),
             message: message.into(),

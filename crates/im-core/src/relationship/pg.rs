@@ -13,9 +13,7 @@ use uuid::Uuid;
 use im_common::ids::{EnvironmentId, UserId};
 use im_common::AppError;
 
-use super::repository::{
-    FriendRequest, FriendRequestState, FriendshipRepository,
-};
+use super::repository::{FriendRequest, FriendRequestState, FriendshipRepository};
 
 #[derive(Clone)]
 pub struct PgFriendshipRepository {
@@ -78,10 +76,14 @@ impl FriendshipRepository for PgFriendshipRepository {
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx: {}", e)))?
-        .ok_or_else(|| AppError::Internal(anyhow::anyhow!(
-            "ON CONFLICT triggered but row not found (env={}, sender={}, recipient={})",
-            env.0, sender.0, recipient.0
-        )))?;
+        .ok_or_else(|| {
+            AppError::Internal(anyhow::anyhow!(
+                "ON CONFLICT triggered but row not found (env={}, sender={}, recipient={})",
+                env.0,
+                sender.0,
+                recipient.0
+            ))
+        })?;
 
         // 已在 pending 视为幂等成功;非 pending 报错(per 2026-08-23 P2-1 限制)
         match existing.state.as_str() {
@@ -293,4 +295,3 @@ impl FriendRequestRow {
 }
 
 // 让编译通过:无
-

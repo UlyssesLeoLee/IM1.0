@@ -50,8 +50,7 @@ pub const USER_ID_SENDER: &str = "1a2e6679-7425-40de-944b-e07fc1f90ae7";
 pub const USER_ID_PEER: &str = "2b3e6679-7425-40de-944b-e07fc1f90ae7";
 
 /// JWT access_token 样例(per aux-13 §1.1.1)
-pub const ACCESS_TOKEN_SAMPLE: &str =
-    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...";
+pub const ACCESS_TOKEN_SAMPLE: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...";
 
 // =============================================================================
 // 客户端 → 服务端 帧

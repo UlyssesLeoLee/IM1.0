@@ -10,8 +10,8 @@ use serde_json::json;
 
 pub fn error_to_response(err: &AppError) -> HttpResponse {
     let code = err.code();
-    let status = StatusCode::from_u16(code.http_status())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status =
+        StatusCode::from_u16(code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
 
     // 链路追踪 ID(从 tracing span 中提取,MVP 暂时用随机)
     let trace_id = uuid::Uuid::new_v4().to_string();

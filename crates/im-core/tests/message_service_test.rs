@@ -11,18 +11,19 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use im_common::ids::{ConversationId, EnvironmentId, MessageId, UserId};
+use im_common::AppError;
 use im_core::conversation::pg::PgConversationRepository;
 use im_core::conversation::repository::{ConversationKind, ConversationRepository, MemberRole};
-use im_core::event::publisher::EventPublisher;
 use im_core::event::events::MessageCreatedEvent;
+use im_core::event::publisher::EventPublisher;
 use im_core::message::pg::{PgMessageRepository, PgSequenceAllocator};
 use im_core::message::repository::MessageRepository;
 use im_core::message::sequence::SequenceAllocator;
 use im_core::message::service::{MessageService, SendMessageCommand};
-use im_common::AppError;
 
 fn database_url() -> String {
-    env::var("DATABASE_URL").unwrap_or_else(|_| "postgres://leo19@172.28.176.169:5544/postgres".into())
+    env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://leo19@172.28.176.169:5544/postgres".into())
 }
 
 async fn pool() -> PgPool {
@@ -79,10 +80,20 @@ async fn make_env_with_dm() -> (EnvironmentId, UserId, UserId, ConversationId) {
         .create(EnvironmentId(env_id), ConversationKind::Dm, json!({}))
         .await
         .expect("create DM");
-    conv_repo.add_member(conv.id, UserId(alice), MemberRole::Member).await.unwrap();
-    conv_repo.add_member(conv.id, UserId(bob), MemberRole::Member).await.unwrap();
+    conv_repo
+        .add_member(conv.id, UserId(alice), MemberRole::Member)
+        .await
+        .unwrap();
+    conv_repo
+        .add_member(conv.id, UserId(bob), MemberRole::Member)
+        .await
+        .unwrap();
     // dm_pairs 行(user_a < user_b 规范化)
-    let (a, b) = if alice < bob { (alice, bob) } else { (bob, alice) };
+    let (a, b) = if alice < bob {
+        (alice, bob)
+    } else {
+        (bob, alice)
+    };
     sqlx::query(r#"INSERT INTO dm_pairs (environment_id, user_a, user_b, conversation_id) VALUES ($1, $2, $3, $4)"#)
         .bind(env_id).bind(a).bind(b).bind(conv.id.0)
         .execute(p_ref).await.expect("dm_pairs insert");
@@ -117,9 +128,15 @@ async fn make_service_async() -> (MessageService, Arc<MockEventPublisher>, PgPoo
     let p = pool().await;
     let msg_repo: Arc<dyn MessageRepository> = Arc::new(PgMessageRepository::new(p.clone()));
     let seq: Arc<dyn SequenceAllocator> = Arc::new(PgSequenceAllocator::new(p.clone()));
-    let conv_repo: Arc<dyn ConversationRepository> = Arc::new(PgConversationRepository::new(p.clone()));
+    let conv_repo: Arc<dyn ConversationRepository> =
+        Arc::new(PgConversationRepository::new(p.clone()));
     let events = Arc::new(MockEventPublisher::default());
-    let svc = MessageService::new(msg_repo, seq, events.clone() as Arc<dyn EventPublisher>, conv_repo);
+    let svc = MessageService::new(
+        msg_repo,
+        seq,
+        events.clone() as Arc<dyn EventPublisher>,
+        conv_repo,
+    );
     (svc, events, p)
 }
 
@@ -144,12 +161,18 @@ async fn c2_step1_idempotency_same_key_returns_same_msg() {
     let m1 = svc.send_message(cmd.clone()).await.expect("first send");
     let m2 = svc.send_message(cmd).await.expect("replay");
 
-    assert_eq!(m1.id, m2.id, "idempotent: same idem key returns same message id");
+    assert_eq!(
+        m1.id, m2.id,
+        "idempotent: same idem key returns same message id"
+    );
     assert_eq!(m1.sequence, m2.sequence, "idempotent: same sequence");
 
     // 事件只发 1 次(第 2 次是幂等回放,不重发)
     let count = events.count.load(Ordering::SeqCst);
-    assert_eq!(count, 1, "event should publish only once (idempotent replay skips publish)");
+    assert_eq!(
+        count, 1,
+        "event should publish only once (idempotent replay skips publish)"
+    );
 }
 
 #[tokio::test]
@@ -212,7 +235,11 @@ async fn c2_step2_non_member_cannot_send() {
         max_size_bytes: 65536,
     };
     let r = svc.send_message(cmd).await;
-    assert!(matches!(r, Err(AppError::Forbidden(_))), "expected Forbidden, got {:?}", r);
+    assert!(
+        matches!(r, Err(AppError::Forbidden(_))),
+        "expected Forbidden, got {:?}",
+        r
+    );
 }
 
 #[tokio::test]
@@ -233,8 +260,18 @@ async fn c2_step3_strict_monotonic_sequence() {
     let m2 = svc.send_message(mk()).await.unwrap();
     let m3 = svc.send_message(mk()).await.unwrap();
 
-    assert!(m2.sequence > m1.sequence, "seq must increase: {} < {}", m1.sequence, m2.sequence);
-    assert!(m3.sequence > m2.sequence, "seq must increase: {} < {}", m2.sequence, m3.sequence);
+    assert!(
+        m2.sequence > m1.sequence,
+        "seq must increase: {} < {}",
+        m1.sequence,
+        m2.sequence
+    );
+    assert!(
+        m3.sequence > m2.sequence,
+        "seq must increase: {} < {}",
+        m2.sequence,
+        m3.sequence
+    );
     // 3 条 message sequence 严格连续(1, 2, 3)
     assert_eq!(m3.sequence - m1.sequence, 2);
 }
@@ -255,7 +292,10 @@ async fn c2_step4_event_failure_does_not_block_ack() {
         max_size_bytes: 65536,
     };
     // 即使 event publish 失败,send_message 也应成功(不阻塞 ack)
-    let m = svc.send_message(cmd).await.expect("send should succeed even if event publish fails");
+    let m = svc
+        .send_message(cmd)
+        .await
+        .expect("send should succeed even if event publish fails");
     assert!(m.id != MessageId::nil());
     // 验证 1 次事件调用
     assert_eq!(events.count.load(Ordering::SeqCst), 1);
@@ -280,6 +320,9 @@ async fn c2_step5_returns_full_message() {
     assert_eq!(m.sender_id, Some(alice));
     assert_eq!(m.kind, "text");
     assert_eq!(m.state, im_core::message::repository::MessageState::Sent);
-    assert!(m.id != MessageId::new() || m.sequence >= 1, "id should be set");
+    assert!(
+        m.id != MessageId::new() || m.sequence >= 1,
+        "id should be set"
+    );
     assert!(m.created_at.timestamp() > 0, "created_at set");
 }

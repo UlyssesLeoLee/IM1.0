@@ -31,8 +31,8 @@ use super::content::{validate_fields, validate_serialized_size};
 use super::repository::{Message, MessageRepository, MessageState, NewMessage};
 use super::sequence::SequenceAllocator;
 use crate::conversation::repository::ConversationRepository;
-use crate::event::publisher::EventPublisher;
 use crate::event::events::MessageCreatedEvent;
+use crate::event::publisher::EventPublisher;
 
 #[derive(Debug, Clone)]
 pub struct SendMessageCommand {
@@ -95,12 +95,16 @@ impl MessageService {
         // 2b. content 大小
         let serialized = serde_json::to_string(&cmd.content).unwrap_or_default();
         if serialized.len() > cmd.max_size_bytes {
-            return Err(AppError::MessageTooLarge(serialized.len(), cmd.max_size_bytes));
+            return Err(AppError::MessageTooLarge(
+                serialized.len(),
+                cmd.max_size_bytes,
+            ));
         }
 
         // 2c. content schema(按 kind 反序列化为 MessageContent 严格校验)
-        let content: im_protocol::content::MessageContent = serde_json::from_value(cmd.content.clone())
-            .map_err(|e| AppError::Validation(format!("content schema: {}", e)))?;
+        let content: im_protocol::content::MessageContent =
+            serde_json::from_value(cmd.content.clone())
+                .map_err(|e| AppError::Validation(format!("content schema: {}", e)))?;
         validate_fields(&content)?;
         validate_serialized_size(&content, cmd.max_size_bytes)?;
 
@@ -147,10 +151,7 @@ impl MessageService {
                     // 直接查 friendships 表。简化:此处只检查 sender 是不是被 other block
                     // (block 反向 = is_blocked 检查)
                     // 完整 friend 互查留给 im-gateway 层(per SRS GAME-ID-005)
-                    if let Ok(true) = self
-                        .check_block(other_id, cmd.sender_id)
-                        .await
-                    {
+                    if let Ok(true) = self.check_block(other_id, cmd.sender_id).await {
                         return Err(AppError::UserBlocked);
                     }
                 }
@@ -198,11 +199,7 @@ impl MessageService {
             kind: msg.kind.clone(),
             ts: Utc::now(),
         };
-        if let Err(e) = self
-            .events
-            .publish("im.message.created", &event)
-            .await
-        {
+        if let Err(e) = self.events.publish("im.message.created", &event).await {
             tracing::error!(error = %e, message_id = %msg.id, "publish im.message.created failed, will be retried by outbox (V1+)");
         }
 
@@ -213,11 +210,7 @@ impl MessageService {
     /// 简化版 block 检查:查 friendships 表 "other block 了 sender"
     /// 这里走直 SQL,避免注入 RelationshipService 引起循环依赖
     /// 完整 friend 关系校验在 im-gateway 边界做(per ImplementationSpec §7.4.4)
-    async fn check_block(
-        &self,
-        other: UserId,
-        sender: UserId,
-    ) -> Result<bool, AppError> {
+    async fn check_block(&self, other: UserId, sender: UserId) -> Result<bool, AppError> {
         // 通过 conversation_repo 暴露 friendships 不优雅;此处复用 PgPool
         // (注:MessageService 本身没有 PgPool 字段,留 extension point 给 C-9 接入)
         // MVP:返回 false(=不阻止),完整实装在 C-9 + im-gateway 边界
@@ -251,8 +244,9 @@ impl MessageService {
         }
 
         // 4. content schema
-        let content: im_protocol::content::MessageContent = serde_json::from_value(new_content.clone())
-            .map_err(|e| AppError::Validation(format!("content schema: {}", e)))?;
+        let content: im_protocol::content::MessageContent =
+            serde_json::from_value(new_content.clone())
+                .map_err(|e| AppError::Validation(format!("content schema: {}", e)))?;
         validate_fields(&content)?;
         validate_serialized_size(&content, max_size_bytes)?;
 
@@ -265,7 +259,7 @@ impl MessageService {
     pub async fn list_messages(
         &self,
         conversation_id: ConversationId,
-        _user_id: UserId,    // 成员校验由 service 调用方完成
+        _user_id: UserId, // 成员校验由 service 调用方完成
         after_sequence: i64,
         limit: i32,
     ) -> Result<Vec<Message>, AppError> {

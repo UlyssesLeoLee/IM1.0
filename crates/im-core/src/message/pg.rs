@@ -157,7 +157,11 @@ impl MessageRepository for PgMessageRepository {
         Ok(row.map(MessageRow::into_message))
     }
 
-    async fn update_state(&self, message_id: MessageId, new_state: MessageState) -> Result<(), AppError> {
+    async fn update_state(
+        &self,
+        message_id: MessageId,
+        new_state: MessageState,
+    ) -> Result<(), AppError> {
         let state_str = message_state_to_str(new_state);
         let n = sqlx::query(
             r#"

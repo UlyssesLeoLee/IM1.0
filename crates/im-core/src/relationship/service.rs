@@ -68,7 +68,11 @@ impl RelationshipService {
         if req.state != FriendRequestState::Pending {
             return Err(AppError::InvalidStateTransition {
                 from: format!("{:?}", req.state),
-                to: if accept { "accepted".into() } else { "rejected".into() },
+                to: if accept {
+                    "accepted".into()
+                } else {
+                    "rejected".into()
+                },
             });
         }
 

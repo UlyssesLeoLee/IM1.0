@@ -107,11 +107,7 @@ fn http_err(e: AppError) -> actix_web::Error {
     use crate::error::error_to_response;
     let resp = error_to_response(&e);
     tracing::warn!(error = ?e, "list_members failed");
-    actix_web::error::InternalError::from_response(
-        e.code().as_str().to_string(),
-        resp,
-    )
-    .into()
+    actix_web::error::InternalError::from_response(e.code().as_str().to_string(), resp).into()
 }
 
 // ============================================================================

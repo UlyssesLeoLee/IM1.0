@@ -17,13 +17,9 @@ use im_common::AppError;
 use secrecy::Secret;
 use uuid::Uuid;
 
-use super::repository::{
-    ExternalIdentity, User, UserKind, UserRepository, UserState,
-};
+use super::repository::{ExternalIdentity, User, UserKind, UserRepository, UserState};
 use super::service::{IdentityService, ServerExchangeCommand};
-use super::token::{
-    DeviceSession, DeviceSessionRepository, SigningKey, TokenService,
-};
+use super::token::{DeviceSession, DeviceSessionRepository, SigningKey, TokenService};
 
 // 改用 parking_lot::RwLock (无毒 + async-friendly, 不需要 send)
 #[derive(Default, Clone)]
@@ -52,9 +48,9 @@ impl UserRepository for InMemoryUserRepo {
             .values()
             .find(|u| {
                 u.environment_id == env
-                    && u.external_identity.as_ref().is_some_and(|e| {
-                        e.provider == provider && e.external_uid == external_uid
-                    })
+                    && u.external_identity
+                        .as_ref()
+                        .is_some_and(|e| e.provider == provider && e.external_uid == external_uid)
             })
             .cloned())
     }
@@ -73,8 +69,8 @@ impl UserRepository for InMemoryUserRepo {
             external_identity: external,
             state: UserState::Active,
             display_name,
-            username: None,           // 2026-09-21 整合: 默认 None
-            password_hash: None,      // 2026-09-21 整合: 默认 None
+            username: None,      // 2026-09-21 整合: 默认 None
+            password_hash: None, // 2026-09-21 整合: 默认 None
             created_at: Utc::now(),
         };
         self.users.write().insert(user.id, user.clone());
@@ -108,7 +104,7 @@ impl UserRepository for InMemoryUserRepo {
             id: UserId(Uuid::new_v4()),
             environment_id: env,
             kind: UserKind::User,
-            external_identity: None,  // 密码路径不写 extid
+            external_identity: None, // 密码路径不写 extid
             state: UserState::Active,
             display_name,
             username: Some(username.to_string()),
@@ -186,10 +182,7 @@ impl DeviceSessionRepository for InMemoryDeviceRepo {
         Ok(())
     }
 
-    async fn find_by_id(
-        &self,
-        _id: DeviceSessionId,
-    ) -> Result<Option<DeviceSession>, AppError> {
+    async fn find_by_id(&self, _id: DeviceSessionId) -> Result<Option<DeviceSession>, AppError> {
         Ok(None)
     }
 }
@@ -198,8 +191,7 @@ fn make_token_service() -> Arc<TokenService> {
     let key = SigningKey {
         kid: "v1".into(),
         key: Secret::new(
-            "test-key-must-be-32-bytes-or-more-padding-padding-padding-padding"
-                .into(),
+            "test-key-must-be-32-bytes-or-more-padding-padding-padding-padding".into(),
         ),
     };
     let pepper = Secret::new("test-pepper-for-link-account-tests".into());
@@ -298,12 +290,7 @@ async fn c6_case2_link_account_same_user_fast_path() {
     assert_eq!(existing.id, user_id, "fast path: ext 绑到同一 user");
 
     // fast path 不调 update_external_identity, user.ext 保持原状
-    let after = svc
-        .user_repo
-        .find_by_id(user_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let after = svc.user_repo.find_by_id(user_id).await.unwrap().unwrap();
     assert_eq!(
         after.external_identity.as_ref().unwrap().external_uid,
         "existing-uid-003"
@@ -358,12 +345,7 @@ async fn c6_case3_link_account_ext_owned_by_other_user_returns_conflict() {
     );
 
     // 验证 user B 仍没 ext (conflict 不写入)
-    let user_b_after = svc
-        .user_repo
-        .find_by_id(user_b_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let user_b_after = svc.user_repo.find_by_id(user_b_id).await.unwrap().unwrap();
     assert!(
         user_b_after.external_identity.is_none(),
         "user B ext 仍为 None (conflict 不写入)"

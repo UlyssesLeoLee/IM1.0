@@ -49,8 +49,8 @@ pub enum MessageContent {
 impl MessageContent {
     /// 校验 content 大小(序列化字节数 ≤ max_bytes)
     pub fn validate_size(&self, max_bytes: usize) -> Result<(), ContentError> {
-        let serialized = serde_json::to_vec(self)
-            .map_err(|e| ContentError::Serialize(e.to_string()))?;
+        let serialized =
+            serde_json::to_vec(self).map_err(|e| ContentError::Serialize(e.to_string()))?;
         if serialized.len() > max_bytes {
             return Err(ContentError::TooLarge {
                 actual: serialized.len(),
@@ -149,14 +149,10 @@ mod tests {
 
     #[test]
     fn text_validation() {
-        let c = MessageContent::Text {
-            text: "hi".into(),
-        };
+        let c = MessageContent::Text { text: "hi".into() };
         assert!(c.validate().is_ok());
 
-        let c = MessageContent::Text {
-            text: "".into(),
-        };
+        let c = MessageContent::Text { text: "".into() };
         assert!(c.validate().is_err());
 
         let c = MessageContent::Text {

@@ -8,13 +8,12 @@
 //! - 帧 `type` vs aux-13 §1 一致
 
 use im_testkit::assertions::{
-    assert_error_body_code, assert_error_code, assert_error_code_str,
-    assert_json_schema, assert_message_content_schema, assert_ws_frame_shape,
-    MessageSchemaId,
+    assert_error_body_code, assert_error_code, assert_error_code_str, assert_json_schema,
+    assert_message_content_schema, assert_ws_frame_shape, MessageSchemaId,
 };
 use im_testkit::fixtures::{
-    stable_conversation_id, stable_user_id, ConversationFixture, MessageFixture,
-    SessionFixture, TenantFixture, UserFixture,
+    stable_conversation_id, stable_user_id, ConversationFixture, MessageFixture, SessionFixture,
+    TenantFixture, UserFixture,
 };
 use im_testkit::mock_grpc;
 use im_testkit::mock_rest;
@@ -56,7 +55,10 @@ fn test_tenant_builder_returns_valid_tenant() {
 fn assert_error_code_passes_on_match() {
     assert_error_code(ErrorCode::Unauthorized, ErrorCode::Unauthorized);
     assert_error_code(ErrorCode::RateLimited, ErrorCode::RateLimited);
-    assert_error_code(ErrorCode::ConversationNotFound, ErrorCode::ConversationNotFound);
+    assert_error_code(
+        ErrorCode::ConversationNotFound,
+        ErrorCode::ConversationNotFound,
+    );
 }
 
 #[test]

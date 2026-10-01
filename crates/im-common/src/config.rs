@@ -268,10 +268,7 @@ impl AppConfig {
 
     /// 取得所有 active 的 signing keys (供 TokenService 双密钥校验)
     pub fn active_signing_keys(&self) -> Vec<&SigningKeyConfig> {
-        self.jwt_signing_keys
-            .iter()
-            .filter(|k| k.active)
-            .collect()
+        self.jwt_signing_keys.iter().filter(|k| k.active).collect()
     }
 
     /// 暴露 refresh_pepper 的明文 (per TokenService 需求)
@@ -455,7 +452,10 @@ mod tests {
         let cfg_via_env = AppConfig::load_from_paths(None, None);
         // 必填 jwt_signing_keys 缺失 → Err (env 模式下不可绕开)
         // 改测: 在 env 模式故意缺 jwt_signing_keys, 验证 figment 正确报缺失
-        assert!(cfg_via_env.is_err(), "missing jwt_signing_keys should error");
+        assert!(
+            cfg_via_env.is_err(),
+            "missing jwt_signing_keys should error"
+        );
 
         // 然后验证基础环境变量解析路径 (用 serde_json 直接喂 TOML 字符串)
         let toml_str = r#"
@@ -468,8 +468,10 @@ mod tests {
             [event_publisher]
             kind = "stub"
         "#;
-        let cfg: AppConfig =
-            figment::Figment::new().merge(Toml::string(toml_str)).extract().unwrap();
+        let cfg: AppConfig = figment::Figment::new()
+            .merge(Toml::string(toml_str))
+            .extract()
+            .unwrap();
         assert_eq!(cfg.http_port, 9999);
         assert_eq!(cfg.postgres_url, "postgres://test:***@localhost/test");
         assert_eq!(cfg.refresh_pepper_plain(), "test-pepper");

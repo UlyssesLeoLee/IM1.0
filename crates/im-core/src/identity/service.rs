@@ -16,11 +16,11 @@ use uuid::Uuid;
 use im_common::ids::{EnvironmentId, UserId};
 use im_common::AppError;
 
-use super::repository::{
-    ExternalIdentity, User, UserKind, UserRepository, UserState,
+use super::password::{
+    hash_password, validate_password_strength, validate_username, verify_password,
 };
+use super::repository::{ExternalIdentity, User, UserKind, UserRepository, UserState};
 use super::token::{AccessToken, DeviceSessionRepository, TokenPair, TokenService};
-use super::password::{hash_password, validate_password_strength, validate_username, verify_password};
 use crate::common::repository::*; // 留位,后续会用到
 
 /// Register 命令 (username/password 路径, 2026-09-21 整合 C-3)
@@ -145,18 +145,14 @@ where
     ///   2. argon2id 哈希密码
     ///   3. INSERT user (dup username → AppError::AccountAlreadyExists)
     ///   4. 签发 TokenPair (同 issue_token_pair)
-    pub async fn register(
-        &self,
-        cmd: RegisterCommand,
-    ) -> Result<TokenPair, AppError> {
+    pub async fn register(&self, cmd: RegisterCommand) -> Result<TokenPair, AppError> {
         // 1. 校验 username
         validate_username(&cmd.username).map_err(|e| {
             AppError::Validation(format!("invalid username '{}': {}", cmd.username, e))
         })?;
         // 2. 校验密码强度
-        validate_password_strength(&cmd.password).map_err(|e| {
-            AppError::Validation(format!("weak password: {}", e))
-        })?;
+        validate_password_strength(&cmd.password)
+            .map_err(|e| AppError::Validation(format!("weak password: {}", e)))?;
 
         // 3. argon2id 哈希
         let password_hash = hash_password(&cmd.password)
@@ -203,17 +199,16 @@ where
             return Err(match user.state {
                 UserState::Banned => AppError::AccountBanned,
                 UserState::Suspended => AppError::AccountSuspended,
-                UserState::Deleted => {
-                    AppError::Unauthorized("invalid username or password".into())
-                }
+                UserState::Deleted => AppError::Unauthorized("invalid username or password".into()),
                 _ => AppError::Internal(anyhow::anyhow!("unexpected user state")),
             });
         }
 
         // 3. password_hash 必须存在
-        let password_hash = user.password_hash.as_ref().ok_or_else(|| {
-            AppError::Unauthorized("invalid username or password".into())
-        })?;
+        let password_hash = user
+            .password_hash
+            .as_ref()
+            .ok_or_else(|| AppError::Unauthorized("invalid username or password".into()))?;
 
         // 4. argon2id verify (wrong password → Unauthorized, 与 unknown 同文本防 enumeration)
         let valid = verify_password(password, password_hash)
@@ -339,11 +334,7 @@ where
         //    → 由 link_external_identity 映射成 AccountMergeConflict
         if let Some(existing) = self
             .user_repo
-            .find_by_external_identity(
-                _environment_id,
-                &external.provider,
-                &external.external_uid,
-            )
+            .find_by_external_identity(_environment_id, &external.provider, &external.external_uid)
             .await?
         {
             if existing.id != user_id {

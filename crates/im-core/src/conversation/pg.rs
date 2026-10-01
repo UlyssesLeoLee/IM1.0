@@ -216,7 +216,10 @@ impl ConversationRepository for PgConversationRepository {
         Ok(n.0 > 0)
     }
 
-    async fn list_members(&self, conv: ConversationId) -> Result<Vec<ConversationMember>, AppError> {
+    async fn list_members(
+        &self,
+        conv: ConversationId,
+    ) -> Result<Vec<ConversationMember>, AppError> {
         let rows: Vec<MemberRow> = sqlx::query_as(
             r#"
             SELECT conversation_id, user_id, role, joined_at, last_read_sequence

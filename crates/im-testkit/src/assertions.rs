@@ -9,7 +9,8 @@ use serde_json::Value;
 
 use im_common::ErrorCode;
 use im_protocol::{
-    content::MessageContent, error_body::ErrorBody,
+    content::MessageContent,
+    error_body::ErrorBody,
     ws_frames::{ClientFrame, ServerFrame},
 };
 
@@ -20,7 +21,8 @@ use im_protocol::{
 /// 断言 `actual == expected`,带可读失败信息
 pub fn assert_error_code(actual: ErrorCode, expected: ErrorCode) {
     assert_eq!(
-        actual, expected,
+        actual,
+        expected,
         "ErrorCode 不一致: actual={} ({}), expected={} ({})",
         actual.as_str(),
         actual.http_status(),
@@ -165,20 +167,11 @@ pub fn assert_json_schema(actual: &Value, schema_id: MessageSchemaId) {
             );
         }
         MessageSchemaId::System => {
-            assert!(
-                obj.contains_key("event"),
-                "[system] 缺少必填字段 `event`"
-            );
+            assert!(obj.contains_key("event"), "[system] 缺少必填字段 `event`");
         }
         MessageSchemaId::Custom => {
-            assert!(
-                obj.contains_key("schema"),
-                "[custom] 缺少必填字段 `schema`"
-            );
-            assert!(
-                obj.contains_key("data"),
-                "[custom] 缺少必填字段 `data`"
-            );
+            assert!(obj.contains_key("schema"), "[custom] 缺少必填字段 `schema`");
+            assert!(obj.contains_key("data"), "[custom] 缺少必填字段 `data`");
         }
     }
 }
@@ -202,7 +195,8 @@ pub fn assert_message_content_schema(content: &MessageContent, expected: Message
 /// 断言 ErrorBody 的 `code` 字段匹配期望错误码
 pub fn assert_error_body_code(body: &ErrorBody, expected: ErrorCode) {
     assert_eq!(
-        body.code, expected.as_str(),
+        body.code,
+        expected.as_str(),
         "ErrorBody.code 不一致: actual={}, expected={}",
         body.code,
         expected.as_str()
@@ -256,9 +250,7 @@ mod tests {
 
     #[test]
     fn assert_message_content_schema_text_passes() {
-        let c = MessageContent::Text {
-            text: "hi".into(),
-        };
+        let c = MessageContent::Text { text: "hi".into() };
         assert_message_content_schema(&c, MessageSchemaId::Text);
     }
 

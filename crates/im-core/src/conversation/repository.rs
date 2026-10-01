@@ -84,5 +84,6 @@ pub trait ConversationRepository: Send + Sync {
 
     async fn is_member(&self, conv: ConversationId, user: UserId) -> Result<bool, AppError>;
 
-    async fn list_members(&self, conv: ConversationId) -> Result<Vec<ConversationMember>, AppError>;
+    async fn list_members(&self, conv: ConversationId)
+        -> Result<Vec<ConversationMember>, AppError>;
 }

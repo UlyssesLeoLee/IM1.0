@@ -66,10 +66,7 @@ pub trait MessageRepository: Send + Sync {
         limit: i32,
     ) -> Result<Vec<Message>, AppError>;
 
-    async fn find_by_id(
-        &self,
-        message_id: MessageId,
-    ) -> Result<Option<Message>, AppError>;
+    async fn find_by_id(&self, message_id: MessageId) -> Result<Option<Message>, AppError>;
 
     async fn update_state(
         &self,

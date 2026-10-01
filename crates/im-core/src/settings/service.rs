@@ -98,7 +98,7 @@ fn default_recall_window() -> u32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetentionSettings {
-    pub dm: Option<u32>,      // None = 永久
+    pub dm: Option<u32>, // None = 永久
     pub group: Option<u32>,
     pub channel: Option<u32>,
 }
@@ -106,7 +106,7 @@ pub struct RetentionSettings {
 impl Default for RetentionSettings {
     fn default() -> Self {
         Self {
-            dm: None,           // 永久
+            dm: None, // 永久
             group: None,
             channel: Some(365), // 频道 1 年
         }
@@ -143,10 +143,7 @@ impl SettingsService {
 
     /// 获取 env 配置
     pub fn get(&self, env: EnvironmentId) -> EnvironmentSettings {
-        self.cache
-            .get(&env)
-            .cloned()
-            .unwrap_or_default()
+        self.cache.get(&env).cloned().unwrap_or_default()
     }
 
     /// 收到 Valkey pub/sub 失效广播后重载

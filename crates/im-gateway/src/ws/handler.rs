@@ -95,16 +95,15 @@ pub async fn ws_handler(
     stream: web::Payload,
     app: web::Data<AppState>,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let (response, mut session, mut msg_stream) = actix_ws::handle(&req, stream).map_err(
-        |e| -> actix_web::Error {
+    let (response, mut session, mut msg_stream) =
+        actix_ws::handle(&req, stream).map_err(|e| -> actix_web::Error {
             tracing::warn!(error = ?e, "ws upgrade failed");
             actix_web::error::InternalError::from_response(
                 String::from("ws_upgrade_failed"),
                 HttpResponse::BadRequest().finish(),
             )
             .into()
-        },
-    )?;
+        })?;
 
     // 创建 WsSession (per C-12 skeleton)
     let session_id = Uuid::new_v4();
@@ -129,7 +128,14 @@ pub async fn ws_handler(
     // 主 loop — 异步 spawn, 不阻塞 HTTP upgrade response 返回
     let app_for_loop = app_data.clone();
     actix_web::rt::spawn(async move {
-        if let Err(e) = run_ws_loop(&mut session, &mut msg_stream, &app_for_loop, &mut ws_session).await {
+        if let Err(e) = run_ws_loop(
+            &mut session,
+            &mut msg_stream,
+            &app_for_loop,
+            &mut ws_session,
+        )
+        .await
+        {
             tracing::warn!(error = ?e, session_id = %session_id, "ws loop ended");
         }
         // 关闭 session
@@ -165,7 +171,13 @@ async fn run_ws_loop(
                 let text_str: &str = match std::str::from_utf8(text.as_bytes()) {
                     Ok(s) => s,
                     Err(_) => {
-                        send_error(ws_session, im_common::ErrorCode::ValidationError, "invalid utf-8", None).await;
+                        send_error(
+                            ws_session,
+                            im_common::ErrorCode::ValidationError,
+                            "invalid utf-8",
+                            None,
+                        )
+                        .await;
                         continue;
                     }
                 };
@@ -176,7 +188,10 @@ async fn run_ws_loop(
                 // 2) 鉴权前只接受 Auth 帧
                 if state.state() == SessionState::Created {
                     match serde_json::from_str::<AuthFrame>(text_str) {
-                        Ok(AuthFrame::Auth { req_id, access_token }) => {
+                        Ok(AuthFrame::Auth {
+                            req_id,
+                            access_token,
+                        }) => {
                             match handle_auth(state, &access_token, &app.token_service).await {
                                 Ok((uid, env, dsid)) => {
                                     state.mark_authenticated(uid, env, dsid);
@@ -191,7 +206,9 @@ async fn run_ws_loop(
                                         "req_id": req_id,
                                     });
                                     if ws_session.text(ack.to_string()).await.is_err() {
-                                        return Err(AppError::Internal(anyhow::anyhow!("ws send failed")));
+                                        return Err(AppError::Internal(anyhow::anyhow!(
+                                            "ws send failed"
+                                        )));
                                     }
                                 }
                                 Err(e) => {
@@ -344,7 +361,10 @@ mod tests {
         let json = r#"{"type":"auth","req_id":"7c9e6679-7425-40de-944b-e07fc1f90ae7","access_token":"eyJ..."}"#;
         let f: AuthFrame = serde_json::from_str(json).unwrap();
         match f {
-            AuthFrame::Auth { req_id, access_token } => {
+            AuthFrame::Auth {
+                req_id,
+                access_token,
+            } => {
                 assert_eq!(
                     req_id.unwrap().to_string(),
                     "7c9e6679-7425-40de-944b-e07fc1f90ae7"
@@ -360,7 +380,10 @@ mod tests {
         let json = r#"{"type":"auth","access_token":"eyJ..."}"#;
         let f: AuthFrame = serde_json::from_str(json).unwrap();
         match f {
-            AuthFrame::Auth { req_id, access_token } => {
+            AuthFrame::Auth {
+                req_id,
+                access_token,
+            } => {
                 assert!(req_id.is_none());
                 assert_eq!(access_token, "eyJ...");
             }

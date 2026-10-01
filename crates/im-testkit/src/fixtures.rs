@@ -13,8 +13,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use im_common::ids::{
-    AuditLogId, ConversationId, DeviceSessionId, EnvironmentId, FriendRequestId, GameId,
-    MediaId, MessageId, TenantId, UserId,
+    AuditLogId, ConversationId, DeviceSessionId, EnvironmentId, FriendRequestId, GameId, MediaId,
+    MessageId, TenantId, UserId,
 };
 
 // =============================================================================
@@ -446,35 +446,51 @@ impl MessageFixture {
 
 /// 稳定 UUID 工厂(便于测试间对齐)
 pub fn stable_tenant_id() -> TenantId {
-    Uuid::parse_str("7c9e6679-7425-40de-944b-e07fc1f90ae7").unwrap().into()
+    Uuid::parse_str("7c9e6679-7425-40de-944b-e07fc1f90ae7")
+        .unwrap()
+        .into()
 }
 
 pub fn stable_game_id() -> GameId {
-    Uuid::parse_str("8a7e6679-7425-40de-944b-e07fc1f90ae7").unwrap().into()
+    Uuid::parse_str("8a7e6679-7425-40de-944b-e07fc1f90ae7")
+        .unwrap()
+        .into()
 }
 
 pub fn stable_environment_id() -> EnvironmentId {
-    Uuid::parse_str("7c9e6679-7425-40de-944b-e07fc1f90ae7").unwrap().into()
+    Uuid::parse_str("7c9e6679-7425-40de-944b-e07fc1f90ae7")
+        .unwrap()
+        .into()
 }
 
 pub fn stable_user_id() -> UserId {
-    Uuid::parse_str("1a2e6679-7425-40de-944b-e07fc1f90ae7").unwrap().into()
+    Uuid::parse_str("1a2e6679-7425-40de-944b-e07fc1f90ae7")
+        .unwrap()
+        .into()
 }
 
 pub fn stable_conversation_id() -> ConversationId {
-    Uuid::parse_str("7c9e6679-7425-40de-944b-e07fc1f90ae7").unwrap().into()
+    Uuid::parse_str("7c9e6679-7425-40de-944b-e07fc1f90ae7")
+        .unwrap()
+        .into()
 }
 
 pub fn stable_message_id() -> MessageId {
-    Uuid::parse_str("8a7e6679-7425-40de-944b-e07fc1f90ae7").unwrap().into()
+    Uuid::parse_str("8a7e6679-7425-40de-944b-e07fc1f90ae7")
+        .unwrap()
+        .into()
 }
 
 pub fn stable_audit_log_id() -> AuditLogId {
-    Uuid::parse_str("9c8e6679-7425-40de-944b-e07fc1f90ae7").unwrap().into()
+    Uuid::parse_str("9c8e6679-7425-40de-944b-e07fc1f90ae7")
+        .unwrap()
+        .into()
 }
 
 pub fn stable_friend_request_id() -> FriendRequestId {
-    Uuid::parse_str("ad8e6679-7425-40de-944b-e07fc1f90ae7").unwrap().into()
+    Uuid::parse_str("ad8e6679-7425-40de-944b-e07fc1f90ae7")
+        .unwrap()
+        .into()
 }
 
 #[cfg(test)]

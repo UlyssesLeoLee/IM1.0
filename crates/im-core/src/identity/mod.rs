@@ -15,4 +15,4 @@ pub use password::{
 };
 pub use repository::{DeviceSessionRepository, UserRepository};
 pub use service::IdentityService;
-pub use token::{TokenService, AccessToken, RefreshToken, TokenClaims, TokenPair};
+pub use token::{AccessToken, RefreshToken, TokenClaims, TokenPair, TokenService};

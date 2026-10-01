@@ -11,13 +11,14 @@ use serde_json::Value;
 use im_common::ids::{ConversationId, EnvironmentId, UserId};
 use im_common::AppError;
 
-use super::repository::{
-    Conversation, ConversationKind, ConversationRepository, MemberRole,
-};
+use super::repository::{Conversation, ConversationKind, ConversationRepository, MemberRole};
 
 /// Guest 限制(ImplementationSpec §3.1.2 / §11.1):
 /// `users.kind='guest'` 仅允许 kind=dm,且另一方非 banned
-pub fn check_guest_can_create(user_kind_is_guest: bool, kind: ConversationKind) -> Result<(), AppError> {
+pub fn check_guest_can_create(
+    user_kind_is_guest: bool,
+    kind: ConversationKind,
+) -> Result<(), AppError> {
     if user_kind_is_guest && !matches!(kind, ConversationKind::Dm) {
         return Err(AppError::Forbidden(
             "guest users can only create DM conversations".into(),
@@ -113,14 +114,12 @@ impl ConversationService {
         limit: i32,
     ) -> Result<Vec<Conversation>, AppError> {
         let limit = limit.clamp(1, 200);
-        self.repo.list_for_user(user, cursor, limit.clamp(1, 50)).await
+        self.repo
+            .list_for_user(user, cursor, limit.clamp(1, 50))
+            .await
     }
 
-    pub async fn is_member(
-        &self,
-        conv: ConversationId,
-        user: UserId,
-    ) -> Result<bool, AppError> {
+    pub async fn is_member(&self, conv: ConversationId, user: UserId) -> Result<bool, AppError> {
         self.repo.is_member(conv, user).await
     }
 
@@ -148,7 +147,11 @@ mod tests {
 
     #[test]
     fn user_can_create_any_kind() {
-        for kind in [ConversationKind::Dm, ConversationKind::Group, ConversationKind::Channel] {
+        for kind in [
+            ConversationKind::Dm,
+            ConversationKind::Group,
+            ConversationKind::Channel,
+        ] {
             assert!(check_guest_can_create(false, kind).is_ok());
         }
     }

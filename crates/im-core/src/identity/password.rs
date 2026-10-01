@@ -8,7 +8,9 @@
 //! - C-4 贡献: hash_password + verify_password + From<PasswordError> for AppError
 //! - 整合: MAX_USERNAME_LEN 3-32 → 3-64 (兼容企业 SSO)
 
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::password_hash::{
+    rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
+};
 use argon2::Argon2;
 
 use im_common::AppError;
@@ -159,12 +161,12 @@ mod tests {
 
     #[test]
     fn validate_username_min_max_len() {
-        assert!(validate_username("abc").is_ok());                  // 3 chars (min)
-        assert!(validate_username("a").is_err());                   // 1 char (too short)
-        assert!(validate_username("ab").is_err());                  // 2 chars (too short)
-        assert!(validate_username(&"a".repeat(64)).is_ok());        // 64 chars (max, 整合方案 C)
-        assert!(validate_username(&"a".repeat(65)).is_err());       // 65 chars (too long)
-        assert!(validate_username(&"a".repeat(32)).is_ok());        // 32 chars (历史 C-3 上限, 现在 OK)
+        assert!(validate_username("abc").is_ok()); // 3 chars (min)
+        assert!(validate_username("a").is_err()); // 1 char (too short)
+        assert!(validate_username("ab").is_err()); // 2 chars (too short)
+        assert!(validate_username(&"a".repeat(64)).is_ok()); // 64 chars (max, 整合方案 C)
+        assert!(validate_username(&"a".repeat(65)).is_err()); // 65 chars (too long)
+        assert!(validate_username(&"a".repeat(32)).is_ok()); // 32 chars (历史 C-3 上限, 现在 OK)
     }
 
     #[test]
@@ -178,12 +180,13 @@ mod tests {
 
     #[test]
     fn validate_password_strength_min_max() {
-        assert!(validate_password_strength("abc1").is_err());         // too short
-        assert!(validate_password_strength("abcdefg").is_err());      // no digit
-        assert!(validate_password_strength("1234567").is_err());      // no letter
+        assert!(validate_password_strength("abc1").is_err()); // too short
+        assert!(validate_password_strength("abcdefg").is_err()); // no digit
+        assert!(validate_password_strength("1234567").is_err()); // no letter
         assert!(validate_password_strength("abc12345").is_ok());
-        assert!(validate_password_strength(&format!("{}1", "a".repeat(127))).is_ok());   // 128 chars with digit
-        assert!(validate_password_strength(&"a".repeat(128)).is_err());                  // 128 chars no digit
-        assert!(validate_password_strength(&format!("{}1", "a".repeat(128))).is_err()); // 129 chars (too long)
+        assert!(validate_password_strength(&format!("{}1", "a".repeat(127))).is_ok()); // 128 chars with digit
+        assert!(validate_password_strength(&"a".repeat(128)).is_err()); // 128 chars no digit
+        assert!(validate_password_strength(&format!("{}1", "a".repeat(128))).is_err());
+        // 129 chars (too long)
     }
 }

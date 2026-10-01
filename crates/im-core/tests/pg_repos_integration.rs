@@ -19,8 +19,8 @@ use im_core::conversation::pg::PgConversationRepository;
 use im_core::conversation::repository::{ConversationKind, ConversationRepository, MemberRole};
 use im_core::identity::pg::{PgDeviceSessionRepository, PgUserRepository};
 use im_core::identity::repository::{ExternalIdentity, User, UserKind, UserRepository, UserState};
-use im_core::identity::token::DeviceSessionRepository;
 use im_core::identity::service::IdentityService;
+use im_core::identity::token::DeviceSessionRepository;
 use im_core::identity::token::TokenService;
 use im_core::message::pg::{PgMessageRepository, PgSequenceAllocator};
 use im_core::message::repository::{MessageRepository, MessageState, NewMessage};
@@ -160,9 +160,7 @@ async fn user_create_without_extid_for_user_kind_rejected() {
     let (env_id, _, _) = make_env().await;
     let repo = PgUserRepository::new(pool().await);
 
-    let r = repo
-        .create(env_id, UserKind::User, None, None)
-        .await;
+    let r = repo.create(env_id, UserKind::User, None, None).await;
     assert!(matches!(r, Err(im_common::AppError::Validation(_))));
 }
 
@@ -171,7 +169,15 @@ async fn user_update_state_banned() {
     let (env_id, _, _) = make_env().await;
     let repo = PgUserRepository::new(pool().await);
     let user = repo
-        .create(env_id, UserKind::User, Some(ExternalIdentity { provider: "x".into(), external_uid: "y".into() }), None)
+        .create(
+            env_id,
+            UserKind::User,
+            Some(ExternalIdentity {
+                provider: "x".into(),
+                external_uid: "y".into(),
+            }),
+            None,
+        )
         .await
         .unwrap();
     repo.update_state(user.id, UserState::Banned)
@@ -217,7 +223,10 @@ async fn device_session_create_find_revoke() {
         .find_by_refresh_token_hash(user_id, "hash-of-token-1")
         .await
         .expect("find failed");
-    assert!(after_revoke.is_none(), "session should be hidden after revoke");
+    assert!(
+        after_revoke.is_none(),
+        "session should be hidden after revoke"
+    );
 }
 
 // ============================================================================
@@ -229,8 +238,14 @@ async fn friendship_request_idempotent() {
     let (env_id, alice, bob) = make_env().await;
     let repo = PgFriendshipRepository::new(pool().await);
 
-    let r1 = repo.create_request(env_id, alice, bob).await.expect("1st failed");
-    let r2 = repo.create_request(env_id, alice, bob).await.expect("2nd (idempotent) failed");
+    let r1 = repo
+        .create_request(env_id, alice, bob)
+        .await
+        .expect("1st failed");
+    let r2 = repo
+        .create_request(env_id, alice, bob)
+        .await
+        .expect("2nd (idempotent) failed");
     assert_eq!(r1.id, r2.id, "idempotent: same row");
     assert_eq!(r1.state, FriendRequestState::Pending);
 }
@@ -248,14 +263,31 @@ async fn friendship_accept_creates_two_way() {
     let (env_id, alice, bob) = make_env().await;
     let repo = PgFriendshipRepository::new(pool().await);
 
-    let req = repo.create_request(env_id, alice, bob).await.expect("create failed");
-    repo.respond_request(req.id, true).await.expect("accept failed");
+    let req = repo
+        .create_request(env_id, alice, bob)
+        .await
+        .expect("create failed");
+    repo.respond_request(req.id, true)
+        .await
+        .expect("accept failed");
 
     // 双向 friendships 都建好
-    let alice_friends = repo.list_friends(alice, None, 100).await.expect("list failed");
-    let bob_friends = repo.list_friends(bob, None, 100).await.expect("list failed");
-    assert!(alice_friends.contains(&bob), "Alice should see Bob as friend");
-    assert!(bob_friends.contains(&alice), "Bob should see Alice as friend");
+    let alice_friends = repo
+        .list_friends(alice, None, 100)
+        .await
+        .expect("list failed");
+    let bob_friends = repo
+        .list_friends(bob, None, 100)
+        .await
+        .expect("list failed");
+    assert!(
+        alice_friends.contains(&bob),
+        "Alice should see Bob as friend"
+    );
+    assert!(
+        bob_friends.contains(&alice),
+        "Bob should see Alice as friend"
+    );
 }
 
 #[tokio::test]
@@ -268,11 +300,20 @@ async fn friendship_block_and_is_blocked() {
 
     // "is alice blocked by bob" = "does bob have alice in block list" = NO
     // (alice 主动 block bob,不是被 bob block)
-    let alice_blocked_by_bob = repo.is_blocked(alice, bob).await.expect("is_blocked failed");
-    assert!(!alice_blocked_by_bob, "alice is NOT blocked by bob (alice blocked bob)");
+    let alice_blocked_by_bob = repo
+        .is_blocked(alice, bob)
+        .await
+        .expect("is_blocked failed");
+    assert!(
+        !alice_blocked_by_bob,
+        "alice is NOT blocked by bob (alice blocked bob)"
+    );
 
     // "is bob blocked by alice" = "does alice have bob in block list" = YES
-    let bob_blocked_by_alice = repo.is_blocked(bob, alice).await.expect("is_blocked failed");
+    let bob_blocked_by_alice = repo
+        .is_blocked(bob, alice)
+        .await
+        .expect("is_blocked failed");
     assert!(bob_blocked_by_alice, "bob IS blocked by alice");
 }
 
@@ -286,9 +327,18 @@ async fn friendship_reject_marks_rejected() {
     let (env_id, alice, bob) = make_env().await;
     let repo = PgFriendshipRepository::new(pool().await);
 
-    let req = repo.create_request(env_id, alice, bob).await.expect("create failed");
-    repo.respond_request(req.id, false).await.expect("reject failed");
-    let after = repo.find_request(req.id).await.expect("find failed").expect("missing");
+    let req = repo
+        .create_request(env_id, alice, bob)
+        .await
+        .expect("create failed");
+    repo.respond_request(req.id, false)
+        .await
+        .expect("reject failed");
+    let after = repo
+        .find_request(req.id)
+        .await
+        .expect("find failed")
+        .expect("missing");
     assert_eq!(after.state, FriendRequestState::Rejected);
 }
 
@@ -308,9 +358,17 @@ async fn conversation_create_and_find_dm() {
     assert_eq!(conv.kind, ConversationKind::Dm);
 
     // 模拟 ConversationService::create_dm:add member + 建 dm_pairs
-    let (a, b) = if alice.0 < bob.0 { (alice, bob) } else { (bob, alice) };
-    repo.add_member(conv.id, a, MemberRole::Member).await.expect("add a failed");
-    repo.add_member(conv.id, b, MemberRole::Member).await.expect("add b failed");
+    let (a, b) = if alice.0 < bob.0 {
+        (alice, bob)
+    } else {
+        (bob, alice)
+    };
+    repo.add_member(conv.id, a, MemberRole::Member)
+        .await
+        .expect("add a failed");
+    repo.add_member(conv.id, b, MemberRole::Member)
+        .await
+        .expect("add b failed");
 
     // 插 dm_pairs 行
     sqlx::query(
@@ -324,9 +382,15 @@ async fn conversation_create_and_find_dm() {
     .await
     .expect("dm_pairs insert failed");
 
-    let found = repo.find_dm(env_id, alice, bob).await.expect("find_dm failed");
+    let found = repo
+        .find_dm(env_id, alice, bob)
+        .await
+        .expect("find_dm failed");
     assert!(found.is_some(), "DM should be findable");
-    let is_m = repo.is_member(conv.id, alice).await.expect("is_member failed");
+    let is_m = repo
+        .is_member(conv.id, alice)
+        .await
+        .expect("is_member failed");
     assert!(is_m);
 }
 
@@ -336,13 +400,24 @@ async fn conversation_list_for_user() {
     let repo = PgConversationRepository::new(pool().await);
 
     let conv = repo
-        .create(env_id, ConversationKind::Group, json!({"game.topic": "test"}))
+        .create(
+            env_id,
+            ConversationKind::Group,
+            json!({"game.topic": "test"}),
+        )
         .await
         .expect("create group failed");
-    repo.add_member(conv.id, alice, MemberRole::Owner).await.unwrap();
-    repo.add_member(conv.id, bob, MemberRole::Member).await.unwrap();
+    repo.add_member(conv.id, alice, MemberRole::Owner)
+        .await
+        .unwrap();
+    repo.add_member(conv.id, bob, MemberRole::Member)
+        .await
+        .unwrap();
 
-    let alice_list = repo.list_for_user(alice, None, 50).await.expect("list failed");
+    let alice_list = repo
+        .list_for_user(alice, None, 50)
+        .await
+        .expect("list failed");
     assert!(alice_list.iter().any(|c| c.id == conv.id));
 
     let members = repo.list_members(conv.id).await.expect("members failed");
@@ -365,7 +440,10 @@ async fn message_send_full_flow_5_steps() {
         .create(env_id, ConversationKind::Group, json!({}))
         .await
         .unwrap();
-    conv_repo.add_member(conv.id, alice, MemberRole::Owner).await.unwrap();
+    conv_repo
+        .add_member(conv.id, alice, MemberRole::Owner)
+        .await
+        .unwrap();
 
     // 2. 模拟 send_message 5 步
     let mut tx = msg_repo.begin_tx().await.expect("begin_tx failed");
@@ -439,7 +517,10 @@ async fn message_idempotency_null_sender_dedup() {
     let msg_repo = PgMessageRepository::new(pool().await);
     let seq = PgSequenceAllocator::new(pool().await);
 
-    let conv = conv_repo.create(env_id, ConversationKind::System, json!({})).await.unwrap();
+    let conv = conv_repo
+        .create(env_id, ConversationKind::System, json!({}))
+        .await
+        .unwrap();
 
     // 系统消息 sender=NULL,同 idempotency_key 不应重复
     let mut tx = msg_repo.begin_tx().await.unwrap();
@@ -469,7 +550,10 @@ async fn message_idempotency_null_sender_dedup() {
         .await
         .expect("find failed")
         .expect("missing");
-    assert_eq!(hit.id, m1.id, "NULL sender + idem key must dedup per UNIQUE NULLS NOT DISTINCT");
+    assert_eq!(
+        hit.id, m1.id,
+        "NULL sender + idem key must dedup per UNIQUE NULLS NOT DISTINCT"
+    );
 }
 
 // ============================================================================
@@ -485,7 +569,10 @@ async fn reaction_add_remove_idempotent() {
     let react_repo = PgReactionRepository::new(pool().await);
 
     // 建 conv + 1 条 message
-    let conv = conv_repo.create(env_id, ConversationKind::Group, json!({})).await.unwrap();
+    let conv = conv_repo
+        .create(env_id, ConversationKind::Group, json!({}))
+        .await
+        .unwrap();
     let mut tx = msg_repo.begin_tx().await.unwrap();
     let s = seq.next(&mut tx, conv.id).await.unwrap();
     let m = msg_repo
@@ -509,22 +596,37 @@ async fn reaction_add_remove_idempotent() {
 
     // 1. add 幂等
     let r1 = react_repo.add(m.id, bob, "👍").await.expect("add 1 failed");
-    let r2 = react_repo.add(m.id, bob, "👍").await.expect("add 2 (idempotent) failed");
+    let r2 = react_repo
+        .add(m.id, bob, "👍")
+        .await
+        .expect("add 2 (idempotent) failed");
     assert_eq!(r1.message_id, r2.message_id);
     assert_eq!(r1.user_id, r2.user_id);
 
     // 2. list 1 条
-    let list = react_repo.list_for_message(m.id).await.expect("list failed");
+    let list = react_repo
+        .list_for_message(m.id)
+        .await
+        .expect("list failed");
     assert_eq!(list.len(), 1);
 
     // 3. remove
-    let removed = react_repo.remove(m.id, bob, "👍").await.expect("remove failed");
+    let removed = react_repo
+        .remove(m.id, bob, "👍")
+        .await
+        .expect("remove failed");
     assert!(removed, "should remove existing");
-    let list_after = react_repo.list_for_message(m.id).await.expect("list failed");
+    let list_after = react_repo
+        .list_for_message(m.id)
+        .await
+        .expect("list failed");
     assert_eq!(list_after.len(), 0);
 
     // 4. remove 幂等(再删返回 false,不报错)
-    let removed_again = react_repo.remove(m.id, bob, "👍").await.expect("re-remove failed");
+    let removed_again = react_repo
+        .remove(m.id, bob, "👍")
+        .await
+        .expect("re-remove failed");
     assert!(!removed_again);
 }
 
@@ -622,7 +724,10 @@ async fn link_account_guest_upgrade_happy_path() {
         .expect("link_account failed");
 
     // 4. TokenPair.user_id 保持不变 (IM-ID-005: 保留历史消息)
-    assert_eq!(upgraded.user_id, guest.id, "user_id must persist (保留历史)");
+    assert_eq!(
+        upgraded.user_id, guest.id,
+        "user_id must persist (保留历史)"
+    );
 
     // 5. DB reload: kind='user' + external_identity 已绑定
     let reloaded = user_repo

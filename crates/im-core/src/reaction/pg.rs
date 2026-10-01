@@ -66,12 +66,16 @@ impl ReactionRepository for PgReactionRepository {
             })
         } else {
             // 已存在,回查
-            self.find_one(message_id, user_id, emoji).await?.ok_or_else(|| {
-                AppError::Internal(anyhow::anyhow!(
-                    "reaction insert conflict but row not found (msg={}, user={}, emoji={})",
-                    message_id.0, user_id.0, emoji
-                ))
-            })
+            self.find_one(message_id, user_id, emoji)
+                .await?
+                .ok_or_else(|| {
+                    AppError::Internal(anyhow::anyhow!(
+                        "reaction insert conflict but row not found (msg={}, user={}, emoji={})",
+                        message_id.0,
+                        user_id.0,
+                        emoji
+                    ))
+                })
         }
     }
 

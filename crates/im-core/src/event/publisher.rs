@@ -33,11 +33,7 @@ impl NatsEventPublisher {
 
 #[async_trait]
 impl EventPublisher for NatsEventPublisher {
-    async fn publish(
-        &self,
-        topic: &str,
-        _payload: &MessageCreatedEvent,
-    ) -> Result<(), AppError> {
+    async fn publish(&self, topic: &str, _payload: &MessageCreatedEvent) -> Result<(), AppError> {
         // 留待 MVP 编码阶段实装
         tracing::debug!(topic = topic, "NatsEventPublisher.publish (stub)");
         Ok(())

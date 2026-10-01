@@ -20,15 +20,23 @@ const MIGRATIONS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../migrati
 /// 14 张表名(ImSpec §1.1 / aux-02 §F.1-F.14)。Day 2 GATE 验证用。
 const EXPECTED_TABLES: &[&str] = &[
     // 0001: tenants / games / environments
-    "tenants", "games", "environments",
+    "tenants",
+    "games",
+    "environments",
     // 0002: users / device_sessions
-    "users", "device_sessions",
+    "users",
+    "device_sessions",
     // 0003: friend_requests / friendships
-    "friend_requests", "friendships",
+    "friend_requests",
+    "friendships",
     // 0004: conversations / conversation_sequences / dm_pairs / conversation_members
-    "conversations", "conversation_sequences", "dm_pairs", "conversation_members",
+    "conversations",
+    "conversation_sequences",
+    "dm_pairs",
+    "conversation_members",
     // 0005: messages / message_reactions
-    "messages", "message_reactions",
+    "messages",
+    "message_reactions",
     // 0006: audit_logs
     "audit_logs",
 ];
@@ -98,9 +106,7 @@ fn expected_14_tables_referenced_in_sql() {
         let create_count = all_sql
             .matches(&format!("CREATE TABLE IF NOT EXISTS {table}"))
             .count()
-            + all_sql
-                .matches(&format!("CREATE TABLE {table}"))
-                .count();
+            + all_sql.matches(&format!("CREATE TABLE {table}")).count();
         assert!(
             create_count >= 1,
             "表 `{table}` 应在 CREATE TABLE 出现 ≥1 次, 实际 {create_count}"

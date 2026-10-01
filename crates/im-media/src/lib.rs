@@ -24,10 +24,7 @@ pub trait MediaService: Send + Sync {
         size_hint: i64,
     ) -> Result<PresignResult, im_common::AppError>;
 
-    async fn presign_download(
-        &self,
-        media_id: Uuid,
-    ) -> Result<String, im_common::AppError>;
+    async fn presign_download(&self, media_id: Uuid) -> Result<String, im_common::AppError>;
 }
 
 pub fn placeholder() {}

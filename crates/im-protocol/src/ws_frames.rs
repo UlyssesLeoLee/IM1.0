@@ -13,16 +13,13 @@ use crate::content::MessageContent;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientFrame {
     /// 鉴权(WS 握手后第一帧)
-    Auth {
-        req_id: Uuid,
-        access_token: String,
-    },
+    Auth { req_id: Uuid, access_token: String },
     /// 发消息
     SendMessage {
         req_id: Uuid,
         conversation_id: Uuid,
         idempotency_key: Uuid,
-        kind: String,                  // text | image | file | sticker | system | custom
+        kind: String, // text | image | file | sticker | system | custom
         content: MessageContent,
         #[serde(default)]
         reply_to: Option<Uuid>,
@@ -34,10 +31,7 @@ pub enum ClientFrame {
         content: MessageContent,
     },
     /// 撤回消息
-    RecallMessage {
-        req_id: Uuid,
-        message_id: Uuid,
-    },
+    RecallMessage { req_id: Uuid, message_id: Uuid },
     /// 添加 reaction
     React {
         req_id: Uuid,
@@ -51,10 +45,7 @@ pub enum ClientFrame {
         sequence: i64,
     },
     /// 输入中指示
-    Typing {
-        req_id: Uuid,
-        conversation_id: Uuid,
-    },
+    Typing { req_id: Uuid, conversation_id: Uuid },
     /// 心跳
     Ping {
         #[serde(default)]
@@ -67,9 +58,7 @@ pub enum ClientFrame {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
     /// WS 握手成功
-    Connected {
-        session_id: Uuid,
-    },
+    Connected { session_id: Uuid },
     /// 请求响应(成功)
     Ack {
         req_id: Uuid,
@@ -97,7 +86,7 @@ pub enum ServerFrame {
     /// 在线状态变化
     PresenceUpdate {
         user_id: Uuid,
-        status: String,                  // online | offline | away | busy | invisible
+        status: String, // online | offline | away | busy | invisible
     },
     /// 输入中广播
     Typing {
@@ -105,12 +94,10 @@ pub enum ServerFrame {
         user_id: Uuid,
     },
     /// 心跳响应
-    Pong {
-        ts: i64,
-    },
+    Pong { ts: i64 },
     /// 强制下线
     ForceDisconnect {
-        reason: String,                  // token_revoked | account_banned | account_deleted | admin_kick
+        reason: String, // token_revoked | account_banned | account_deleted | admin_kick
     },
 }
 
@@ -197,9 +184,7 @@ mod tests {
             conversation_id: Uuid::new_v4(),
             idempotency_key: Uuid::new_v4(),
             kind: "text".into(),
-            content: MessageContent::Text {
-                text: "hi".into(),
-            },
+            content: MessageContent::Text { text: "hi".into() },
             reply_to: None,
         };
         let s = serde_json::to_string(&frame).unwrap();

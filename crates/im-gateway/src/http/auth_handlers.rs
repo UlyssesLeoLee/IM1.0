@@ -417,11 +417,7 @@ fn http_err(e: AppError) -> actix_web::Error {
     use crate::error::error_to_response;
     let resp = error_to_response(&e);
     tracing::warn!(error = ?e, "auth handler failed");
-    actix_web::error::InternalError::from_response(
-        e.code().as_str().to_string(),
-        resp,
-    )
-    .into()
+    actix_web::error::InternalError::from_response(e.code().as_str().to_string(), resp).into()
 }
 
 // ============================================================================
@@ -450,10 +446,7 @@ mod tests {
             Uuid::nil()
         );
         // session 部分不是 uuid → 返回 nil
-        assert_eq!(
-            extract_device_session_id("notuuid.rawuuid"),
-            Uuid::nil()
-        );
+        assert_eq!(extract_device_session_id("notuuid.rawuuid"), Uuid::nil());
         // 空字符串 → 返回 nil
         assert_eq!(extract_device_session_id(""), Uuid::nil());
     }
@@ -469,7 +462,10 @@ mod tests {
             "display_name": "Player1"
         }"#;
         let req: TokenExchangeRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.environment_id.to_string(), "7c9e6679-7425-40de-944b-e07fc1f90ae7");
+        assert_eq!(
+            req.environment_id.to_string(),
+            "7c9e6679-7425-40de-944b-e07fc1f90ae7"
+        );
         assert_eq!(req.external_provider, "steam");
         assert_eq!(req.external_uid, "76561198000000000");
         assert_eq!(req.display_name.as_deref(), Some("Player1"));

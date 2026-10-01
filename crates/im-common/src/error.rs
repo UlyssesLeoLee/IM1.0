@@ -18,29 +18,29 @@ use thiserror::Error;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, AsRefStr)]
 pub enum ErrorCode {
     // ---- 鉴权 / 通用 ----
-    Unauthorized,                // 401
-    Forbidden,                   // 403
-    NotFound,                    // 404
+    Unauthorized, // 401
+    Forbidden,    // 403
+    NotFound,     // 404
 
     // ---- 消息 / 业务 ----
-    IdempotencyConflict,         // 200 特殊语义(WS/REST 视为成功)
-    RateLimited,                 // 429
-    InvalidStateTransition,      // 409
-    RecallWindowExpired,         // 409
-    AccountBanned,               // 403
-    AccountSuspended,            // 403
-    AccountMergeConflict,        // 409
-    FriendRequestExists,         // 409
-    FriendRequestNotFound,       // 404
-    UserBlocked,                 // 403
-    ValidationError,             // 400
-    InternalError,               // 500
-    ServiceUnavailable,          // 503
-    ConversationNotFound,        // 404
-    MessageNotFound,             // 404
-    MessageTooLarge,             // 413
-    InvalidIdempotencyKey,       // 400
-    EnvironmentDisabled,         // 403
+    IdempotencyConflict,    // 200 特殊语义(WS/REST 视为成功)
+    RateLimited,            // 429
+    InvalidStateTransition, // 409
+    RecallWindowExpired,    // 409
+    AccountBanned,          // 403
+    AccountSuspended,       // 403
+    AccountMergeConflict,   // 409
+    FriendRequestExists,    // 409
+    FriendRequestNotFound,  // 404
+    UserBlocked,            // 403
+    ValidationError,        // 400
+    InternalError,          // 500
+    ServiceUnavailable,     // 503
+    ConversationNotFound,   // 404
+    MessageNotFound,        // 404
+    MessageTooLarge,        // 413
+    InvalidIdempotencyKey,  // 400
+    EnvironmentDisabled,    // 403
 }
 
 impl ErrorCode {
@@ -317,7 +317,10 @@ mod tests {
             ErrorCode::FriendRequestNotFound.as_str(),
             "FRIEND_REQUEST_NOT_FOUND"
         );
-        assert_eq!(ErrorCode::IdempotencyConflict.as_str(), "IDEMPOTENCY_CONFLICT");
+        assert_eq!(
+            ErrorCode::IdempotencyConflict.as_str(),
+            "IDEMPOTENCY_CONFLICT"
+        );
     }
 
     #[test]

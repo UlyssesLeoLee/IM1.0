@@ -43,9 +43,9 @@ use im_common::AppError;
 use im_core::message::repository::Message;
 use im_core::message::service::SendMessageCommand;
 
-use super::state::AuthedUser;
 use super::error_response::json_response;
 use super::state::AppState;
+use super::state::AuthedUser;
 
 // ============================================================================
 // C-9 DTO: POST /v1/conversations/{id}/messages
@@ -250,7 +250,8 @@ pub async fn list_messages(
         .map(|m| m.sequence)
         .unwrap_or(q.after_sequence);
 
-    let messages_resp: Vec<MessageResponse> = messages.into_iter().map(MessageResponse::from).collect();
+    let messages_resp: Vec<MessageResponse> =
+        messages.into_iter().map(MessageResponse::from).collect();
 
     tracing::info!(
         conversation_id = %conv_id.0,

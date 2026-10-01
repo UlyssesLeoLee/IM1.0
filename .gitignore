@@ -93,3 +93,7 @@ fwt.txt
 # ===== 测试日志 + 报告 [ULYS-138] =====
 tests/logs/
 tests/reports/
+
+# ===== Git worktree (本地并行开发目录,不入库) =====
+.worktrees/
+target-*/

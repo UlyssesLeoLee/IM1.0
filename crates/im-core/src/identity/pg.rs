@@ -160,7 +160,8 @@ impl UserRepository for PgUserRepository {
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx_error)?;
-        row.map(UserRow::into_user).ok_or_else(|| AppError::NotFound(format!("user {}", id.0)))
+        row.map(UserRow::into_user)
+            .ok_or_else(|| AppError::NotFound(format!("user {}", id.0)))
     }
 
     async fn update_external_identity(
@@ -182,7 +183,8 @@ impl UserRepository for PgUserRepository {
         .await
         .map_err(map_sqlx_error)?;
 
-        let row = existing.ok_or_else(|| AppError::NotFound(format!("user {} in env {}", id.0, env.0)))?;
+        let row = existing
+            .ok_or_else(|| AppError::NotFound(format!("user {} in env {}", id.0, env.0)))?;
         if row.kind != "guest" {
             return Err(AppError::Validation(
                 "user already linked; only guests can upgrade".into(),
@@ -305,7 +307,10 @@ impl UserRow {
         let external_identity = self.external_identity.and_then(|v| {
             let p = v.get("provider")?.as_str()?.to_string();
             let u = v.get("external_uid")?.as_str()?.to_string();
-            Some(ExternalIdentity { provider: p, external_uid: u })
+            Some(ExternalIdentity {
+                provider: p,
+                external_uid: u,
+            })
         });
         User {
             id: UserId(self.id),

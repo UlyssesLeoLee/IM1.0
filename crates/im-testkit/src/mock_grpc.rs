@@ -172,7 +172,9 @@ pub fn env_id() -> EnvironmentId {
 
 /// 把 `TENANT_ID_DEFAULT` 转 `TenantId`
 pub fn tenant_id() -> TenantId {
-    Uuid::parse_str(TENANT_ID_DEFAULT).expect("valid uuid").into()
+    Uuid::parse_str(TENANT_ID_DEFAULT)
+        .expect("valid uuid")
+        .into()
 }
 
 #[cfg(test)]

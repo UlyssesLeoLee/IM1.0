@@ -34,7 +34,7 @@ pub enum UserState {
 /// 外部身份(游戏服务器 Token Exchange 用)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExternalIdentity {
-    pub provider: String,         // steam | xbox | psn | epic | custom_jwt | ...
+    pub provider: String, // steam | xbox | psn | epic | custom_jwt | ...
     pub external_uid: String,
 }
 

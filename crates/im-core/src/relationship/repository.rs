@@ -48,11 +48,7 @@ pub trait FriendshipRepository: Send + Sync {
 
     async fn find_request(&self, id: Uuid) -> Result<Option<FriendRequest>, AppError>;
 
-    async fn respond_request(
-        &self,
-        id: Uuid,
-        accept: bool,
-    ) -> Result<(), AppError>;
+    async fn respond_request(&self, id: Uuid, accept: bool) -> Result<(), AppError>;
 
     async fn block(&self, user: UserId, target: UserId) -> Result<(), AppError>;
 

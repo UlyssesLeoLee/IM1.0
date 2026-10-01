@@ -43,7 +43,9 @@ impl FromRequest for AuthedUser {
             .and_then(|s| s.strip_prefix("Bearer ").map(|s| s.to_string()));
 
         // 2. 从 app data 拿 token service
-        let token_service = req.app_data::<actix_web::web::Data<AppState>>().map(|d| d.token_service.clone());
+        let token_service = req
+            .app_data::<actix_web::web::Data<AppState>>()
+            .map(|d| d.token_service.clone());
 
         Box::pin(async move {
             let token = match bearer {
@@ -81,14 +83,21 @@ impl FromRequest for AuthedUser {
             };
 
             // 4. 解析 claims → AuthedUser
-            let user_id: im_common::ids::UserId = claims
-                .sub
-                .parse()
-                .map_err(|_| json_response(im_common::ErrorCode::Unauthorized, None, Some("invalid sub")))?;
-            let environment_id: im_common::ids::EnvironmentId = claims
-                .env
-                .parse()
-                .map_err(|_| json_response(im_common::ErrorCode::Unauthorized, None, Some("invalid env")))?;
+            let user_id: im_common::ids::UserId = claims.sub.parse().map_err(|_| {
+                json_response(
+                    im_common::ErrorCode::Unauthorized,
+                    None,
+                    Some("invalid sub"),
+                )
+            })?;
+            let environment_id: im_common::ids::EnvironmentId =
+                claims.env.parse().map_err(|_| {
+                    json_response(
+                        im_common::ErrorCode::Unauthorized,
+                        None,
+                        Some("invalid env"),
+                    )
+                })?;
 
             Ok(AuthedUser {
                 user_id,

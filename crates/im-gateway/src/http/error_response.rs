@@ -34,8 +34,8 @@ pub fn json_response(
     conv_id: Option<ConversationId>,
     message: Option<&str>,
 ) -> actix_web::Error {
-    let status = StatusCode::from_u16(code.http_status())
-        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let status =
+        StatusCode::from_u16(code.http_status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     let body = serde_json::json!({
         "code": code.as_str(),
         "message": message.unwrap_or("error"),

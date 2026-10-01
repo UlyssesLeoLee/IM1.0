@@ -73,13 +73,13 @@ pub struct RefreshToken(pub String);
 /// JWT claims
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenClaims {
-    pub sub: String,         // user_id (UUID)
-    pub env: String,         // environment_id
-    pub tenant: String,      // tenant_id
-    pub exp: i64,            // unix seconds
-    pub iat: i64,            // issued at
-    pub kind: String,        // user | guest
-    pub kid: String,         // signing key id(用于轮换期识别)
+    pub sub: String,    // user_id (UUID)
+    pub env: String,    // environment_id
+    pub tenant: String, // tenant_id
+    pub exp: i64,       // unix seconds
+    pub iat: i64,       // issued at
+    pub kind: String,   // user | guest
+    pub kid: String,    // signing key id(用于轮换期识别)
 }
 
 /// Token 对
@@ -88,7 +88,7 @@ pub struct TokenPair {
     pub access_token: AccessToken,
     pub refresh_token: RefreshToken,
     pub user_id: UserId,
-    pub expires_in: i64,    // seconds
+    pub expires_in: i64, // seconds
 }
 
 /// Device Session 实体
@@ -102,14 +102,21 @@ pub struct DeviceSession {
 }
 
 pub struct TokenService {
-    signing_keys: Vec<SigningKey>,    // 至少 1 个;轮换期有 v1+v2
+    signing_keys: Vec<SigningKey>, // 至少 1 个;轮换期有 v1+v2
     access_ttl: ChronoDuration,
     _refresh_pepper: SecretString,
 }
 
 impl TokenService {
-    pub fn new(signing_keys: Vec<SigningKey>, access_ttl: ChronoDuration, refresh_pepper: SecretString) -> Self {
-        assert!(!signing_keys.is_empty(), "at least one signing key required");
+    pub fn new(
+        signing_keys: Vec<SigningKey>,
+        access_ttl: ChronoDuration,
+        refresh_pepper: SecretString,
+    ) -> Self {
+        assert!(
+            !signing_keys.is_empty(),
+            "at least one signing key required"
+        );
         Self {
             signing_keys,
             access_ttl,
@@ -151,8 +158,11 @@ impl TokenService {
     /// 校验 Access Token(双密钥:轮换期 v1+v2 同时可验)
     pub fn validate_access_token(&self, token: &str) -> Result<TokenClaims, TokenError> {
         // 1. 先用未签发 kid 解 header
-        let header = jsonwebtoken::decode_header(token).map_err(|e| TokenError::Jwt(e.to_string()))?;
-        let kid = header.kid.ok_or_else(|| TokenError::Jwt("missing kid".into()))?;
+        let header =
+            jsonwebtoken::decode_header(token).map_err(|e| TokenError::Jwt(e.to_string()))?;
+        let kid = header
+            .kid
+            .ok_or_else(|| TokenError::Jwt("missing kid".into()))?;
 
         // 2. 找匹配的 signing key
         let key = self
@@ -208,8 +218,8 @@ mod tests {
             external_identity: None,
             state: UserState::Active,
             display_name: Some("test".into()),
-            username: None,           // 2026-09-21 整合
-            password_hash: None,      // 2026-09-21 整合
+            username: None,      // 2026-09-21 整合
+            password_hash: None, // 2026-09-21 整合
             created_at: Utc::now(),
         }
     }
@@ -217,7 +227,9 @@ mod tests {
     fn key(kid: &str) -> SigningKey {
         SigningKey {
             kid: kid.into(),
-            key: SecretString::new("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into()),
+            key: SecretString::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+            ),
         }
     }
 
@@ -265,4 +277,3 @@ mod tests {
         ));
     }
 }
-

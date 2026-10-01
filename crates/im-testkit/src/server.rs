@@ -15,9 +15,7 @@
 
 use std::io;
 
-use actix_web::{
-    middleware::Logger, web, App, HttpRequest, HttpResponse, HttpServer, Responder,
-};
+use actix_web::{middleware::Logger, web, App, HttpRequest, HttpResponse, HttpServer, Responder};
 use serde_json::{json, Value};
 
 /// Mock IM Server handle
@@ -45,18 +43,12 @@ impl MockImServer {
                         .route("/auth/guest", web::post().to(auth_guest))
                         .route("/auth/token/exchange", web::post().to(auth_token_exchange))
                         .route("/auth/refresh", web::post().to(auth_refresh))
-                        .route(
-                            "/conversations",
-                            web::post().to(conversations_create),
-                        )
+                        .route("/conversations", web::post().to(conversations_create))
                         .route(
                             "/conversations/{id}/messages",
                             web::post().to(messages_send),
                         )
-                        .route(
-                            "/conversations/{id}/messages",
-                            web::get().to(messages_list),
-                        )
+                        .route("/conversations/{id}/messages", web::get().to(messages_list))
                         .route("/media/presign", web::post().to(media_presign)),
                 )
                 .route("/ws", web::get().to(ws_echo))
@@ -132,10 +124,7 @@ async fn conversations_create(_req: HttpRequest, _body: web::Json<Value>) -> imp
     }))
 }
 
-async fn messages_send(
-    _req: HttpRequest,
-    _body: web::Json<Value>,
-) -> impl Responder {
+async fn messages_send(_req: HttpRequest, _body: web::Json<Value>) -> impl Responder {
     HttpResponse::Ok().json(json!({
         "id": "8a7e6679-7425-40de-944b-e07fc1f90ae7",
         "conversation_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
@@ -212,7 +201,9 @@ async fn ws_echo(req: HttpRequest, stream: web::Payload) -> actix_web::Result<Ht
                     };
                     let ty = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
                     let reply = match ty {
-                        "ping" => json!({ "type": "pong", "ts": parsed.get("ts").cloned().unwrap_or(json!(0)) }),
+                        "ping" => {
+                            json!({ "type": "pong", "ts": parsed.get("ts").cloned().unwrap_or(json!(0)) })
+                        }
                         "auth" => json!({
                             "type": "ack",
                             "req_id": parsed.get("req_id").cloned().unwrap_or(json!(null)),
@@ -228,7 +219,9 @@ async fn ws_echo(req: HttpRequest, stream: web::Payload) -> actix_web::Result<Ht
                                 "sequence": 42
                             }
                         }),
-                        _ => json!({ "type": "ack", "ok": false, "error": { "code": "INTERNAL_ERROR" } }),
+                        _ => {
+                            json!({ "type": "ack", "ok": false, "error": { "code": "INTERNAL_ERROR" } })
+                        }
                     };
                     let _ = session.text(serde_json::to_string(&reply).unwrap()).await;
                 }

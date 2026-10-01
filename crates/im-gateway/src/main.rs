@@ -30,9 +30,7 @@ use actix_web::{web, App, HttpServer};
 use secrecy::{ExposeSecret, Secret};
 use sqlx::postgres::PgPoolOptions;
 
-use im_common::config::{
-    AppConfig, EventPublisherKind, SigningKeyConfig,
-};
+use im_common::config::{AppConfig, EventPublisherKind, SigningKeyConfig};
 use im_common::ids::EnvironmentId;
 use im_core::conversation::pg::PgConversationRepository;
 use im_core::conversation::service::ConversationService;
@@ -60,8 +58,12 @@ async fn main() -> std::io::Result<()> {
     // 1. 加载配置 (figment: default.toml < local.toml < env vars, per im-common::config)
     let cfg = AppConfig::load().unwrap_or_else(|e| {
         eprintln!("[im-gateway] config load failed: {e}");
-        eprintln!("[im-gateway] hint: set IM_POSTGRES_URL + IM_JWT_SIGNING_KEYS + IM_REFRESH_PEPPER");
-        eprintln!("[im-gateway]        or provide config/default.toml (see config/local.toml.example)");
+        eprintln!(
+            "[im-gateway] hint: set IM_POSTGRES_URL + IM_JWT_SIGNING_KEYS + IM_REFRESH_PEPPER"
+        );
+        eprintln!(
+            "[im-gateway]        or provide config/default.toml (see config/local.toml.example)"
+        );
         std::process::exit(78);
     });
 
@@ -116,8 +118,15 @@ async fn main() -> std::io::Result<()> {
             )
         }
         EventPublisherKind::Nats => {
-            let url = cfg.event_publisher.nats_url.as_deref().unwrap_or("nats://localhost:4222");
-            tracing::info!(nats_url = url, "EventPublisher = Nats (MVP-stub: no real connect)");
+            let url = cfg
+                .event_publisher
+                .nats_url
+                .as_deref()
+                .unwrap_or("nats://localhost:4222");
+            tracing::info!(
+                nats_url = url,
+                "EventPublisher = Nats (MVP-stub: no real connect)"
+            );
             Arc::new(
                 NatsEventPublisher::connect(url)
                     .await

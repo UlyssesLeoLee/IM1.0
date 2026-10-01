@@ -142,7 +142,10 @@ pub fn pick_environment(im_env: Option<&str>, env: Option<&str>) -> String {
 ///
 /// 给定 `IM_OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT` 的可选值,
 /// 返回最终生效的 endpoint。
-pub fn pick_otel_endpoint(im_endpoint: Option<&str>, otel_endpoint: Option<&str>) -> Option<String> {
+pub fn pick_otel_endpoint(
+    im_endpoint: Option<&str>,
+    otel_endpoint: Option<&str>,
+) -> Option<String> {
     im_endpoint
         .or(otel_endpoint)
         .map(|s| s.to_string())
@@ -173,10 +176,11 @@ impl Default for Config {
 pub fn init(config: Config) -> Result<(), TracingError> {
     // 1. EnvFilter — IM_LOG_LEVEL > RUST_LOG > 默认
     let filter_expr = read_env_filter();
-    let env_filter = EnvFilter::try_new(&filter_expr).map_err(|source| TracingError::EnvFilter {
-        expr: filter_expr.clone(),
-        source,
-    })?;
+    let env_filter =
+        EnvFilter::try_new(&filter_expr).map_err(|source| TracingError::EnvFilter {
+            expr: filter_expr.clone(),
+            source,
+        })?;
 
     // 2. JSON formatter (stdout 单行 NDJSON) — 兼容 Loki + kubectl logs | jq
     let fmt_layer = tracing_subscriber::fmt::layer()
@@ -207,11 +211,14 @@ pub fn init(config: Config) -> Result<(), TracingError> {
 
     if let Some(endpoint) = otel_endpoint.as_deref() {
         let otel_layer = build_otel_layer(&config, endpoint)?;
-        registry.with(otel_layer).try_init().map_err(|_| {
-            TracingError::AlreadyInitialized
-        })?;
+        registry
+            .with(otel_layer)
+            .try_init()
+            .map_err(|_| TracingError::AlreadyInitialized)?;
     } else {
-        registry.try_init().map_err(|_| TracingError::AlreadyInitialized)?;
+        registry
+            .try_init()
+            .map_err(|_| TracingError::AlreadyInitialized)?;
     }
 
     Ok(())
@@ -221,10 +228,7 @@ pub fn init(config: Config) -> Result<(), TracingError> {
 ///
 /// MVP 默认未启用(ImplementationSpec §9.3),V1+ 启用。
 /// `IM_OTEL_EXPORTER_OTLP_ENDPOINT` 形如 `http://otel-collector.im1-obs:4317`。
-fn build_otel_layer<S>(
-    config: &Config,
-    endpoint: &str,
-) -> Result<impl Layer<S>, TracingError>
+fn build_otel_layer<S>(config: &Config, endpoint: &str) -> Result<impl Layer<S>, TracingError>
 where
     S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
 {
@@ -297,7 +301,11 @@ impl<S> Layer<S> for StaticFieldsLayer
 where
     S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
 {
-    fn on_event(&self, _event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+    fn on_event(
+        &self,
+        _event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
         // 把全局静态字段 record 到当前 span — 这样 tracing-subscriber 的 JSON 层
         // 在序列化为 EventFormatter 时会包含它们(flatten_event 模式下写入根 JSON)。
         // 注意:record 在 event 触发时执行,后续序列化层才能拿到。
@@ -498,7 +506,7 @@ mod tests {
         // 主要断言不 panic,且对 AlreadyInitialized 优雅降级
         let result = try_init();
         match result {
-            Ok(()) => {}                          // 第一个 init 成功
+            Ok(()) => {}                                // 第一个 init 成功
             Err(TracingError::AlreadyInitialized) => {} // 已被其他测试 init
             Err(e) => panic!("unexpected error: {e:?}"),
         }

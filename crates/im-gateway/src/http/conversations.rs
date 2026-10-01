@@ -127,9 +127,7 @@ pub async fn create(
     }
 
     // 2. metadata 必须是 JSON object(per PgConversationRepository::create 的检查前置)
-    if !matches!(body.metadata, serde_json::Value::Object(_))
-        && !body.metadata.is_null()
-    {
+    if !matches!(body.metadata, serde_json::Value::Object(_)) && !body.metadata.is_null() {
         return Err(json_response(
             im_common::ErrorCode::ValidationError,
             None,
@@ -163,11 +161,8 @@ pub async fn create(
         }
         ConversationKind::Group => {
             // 2-500 成员(per ConversationService::create_group 限制)
-            let mut members: Vec<UserId> = body
-                .member_user_ids
-                .iter()
-                .map(|u| UserId(*u))
-                .collect();
+            let mut members: Vec<UserId> =
+                body.member_user_ids.iter().map(|u| UserId(*u)).collect();
             // creator 自动加入;若 client 已包含 creator,svc 去重
             if !members.contains(&auth.user_id) {
                 members.push(auth.user_id);
@@ -265,10 +260,7 @@ mod tests {
 
     #[test]
     fn kind_wire_dm_to_kind() {
-        assert_eq!(
-            ConversationKindWire::Dm.to_kind(),
-            ConversationKind::Dm
-        );
+        assert_eq!(ConversationKindWire::Dm.to_kind(), ConversationKind::Dm);
     }
 
     #[test]

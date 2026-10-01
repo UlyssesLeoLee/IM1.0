@@ -3,6 +3,18 @@
 version = 3
 
 [[package]]
+name = "aci-emitter"
+version = "0.1.0"
+source = "git+https://github.com/UlyssesLeoLee/aci-emitter?rev=df28c56#df28c5646780afa8b84fe8c0b1831c392b76c869"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
 name = "actix-codec"
 version = "0.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2012,6 +2024,7 @@ dependencies = [
 name = "im-testkit"
 version = "0.1.0"
 dependencies = [
+ "aci-emitter",
  "actix-web",
  "actix-ws",
  "anyhow",
