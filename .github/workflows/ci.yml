@@ -1,10 +1,12 @@
 name: CI
 
 on:
+  # 2026-10-02 修:dev 是车道合入的集成分支,原先只监听 main,
+  # 导致 dev 上所有真实改动从不跑 CI(静默系统性缺口)。
   pull_request:
-    branches: [main]
+    branches: [main, dev]
   push:
-    branches: [main]
+    branches: [main, dev]
 
 # 4 个 job: lint / test-unit / test-integration / sast
 # 全部用 PostgreSQL 18.6 服务(与 BasicDesign §5 一致,2026-08-26 锁 patch 18.6)
@@ -30,8 +32,10 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: aux-01 naming check
         run: |
-          # 占位:clippy 已含命名检查;后续加 sqlfluff / buf lint
-          echo "naming checks: clippy + manual review per aux-01 §J"
+          # 占位,恒通过:本步骤不做任何自动检查,只 echo,不能当门禁看。
+          # aux-01 §J 命名约定目前无工具强制;clippy 不含命名规范检查,
+          # 也未接入 sqlfluff / buf lint。后续 PR 补实现时再改这里。
+          echo "placeholder: no automated aux-01 §J naming check is enforced here"
 
   test-unit:
     name: Unit Tests
@@ -81,12 +85,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: install sqlx-cli
-        run: cargo install sqlx-cli --version '^0.8' --no-default-features --features rustls,postgres --locked
+        # 2026-10-02 修:版本对齐 workspace 依赖 sqlx = "0.9"(Cargo.lock 解析 0.9.0)。
+        # 原为 '^0.8',是 2026-08-26 sqlx 0.8.6 → 0.9.0 升级时漏改的残留。
+        run: cargo install sqlx-cli --version '^0.9' --no-default-features --features rustls,postgres --locked
       - name: run migrations
         run: sqlx migrate run --database-url $DATABASE_URL
       - name: cargo test (integration)
-        # 当前 MVP: 集成测试用例尚少,待后续 PR 补充
-        # 跑全部 test 即可,包括 unit 集成的 lib tests
+        # 2026-10-02 修正:集成用例已不"尚少"——crates/*/tests/ 共 6 个文件 66 个
+        # #[test]/#[tokio::test],其中 pg_repos_integration.rs 的 22 个跑真实 PG。
+        # 命令保持 cargo test --workspace:它会连 lib tests 一起跑(与 test-unit 重叠),
+        # 这是既有行为,不在本次修正范围内。
         run: cargo test --workspace --no-fail-fast
 
   sast:
@@ -104,9 +112,10 @@ jobs:
           cargo audit
       - name: check error codes consistency (aux-03)
         run: |
-          # 占位:检查所有错误码字符串都在 aux-03 §B 中
-          # 实现见 scripts/check_error_codes.sh(MVP 后续 PR 补充)
-          echo "error code check: manual review for MVP"
+          # 占位,恒通过:本步骤不校验错误码,只 echo,不能当门禁看。
+          # 2026-10-02 修正:原注释引用 scripts/check_error_codes.sh,但该文件不存在
+          # (scripts/ 下无此脚本),aux-03 §B 的一致性目前全靠人工 review。
+          echo "placeholder: no automated aux-03 §B error-code check is enforced here"
       - name: semgrep
         uses: returntocorp/semgrep-action@v1
         with:

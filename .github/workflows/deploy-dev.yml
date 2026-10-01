@@ -1,5 +1,11 @@
 name: Deploy Dev
 on:
+  # 2026-10-02 决策:有意不把 dev 加进来(与 ci.yml 不同)。
+  # 每次合入 dev 都自动部署 = 每次合并都对共享 K3s dev 集群跑一遍 apply + 迁移 Job;
+  # 且 concurrency.cancel-in-progress=false,突发合并的部署会排队而非取消,
+  # 重叠的迁移 Job 不可重入,有把共享 dev 环境搞脏的风险 —— 属于放大爆炸半径,不静默开启。
+  # dev 的部署走 workflow_dispatch(手动选 dev ref),入口见下方 inputs。
+  # 若要改为 dev 自动部署:先跑通一次 workflow_dispatch 手动部署再开,并复核迁移 Job 的幂等性。
   push:
     branches: [main]
   workflow_dispatch:
@@ -51,7 +57,10 @@ jobs:
           kubectl wait --for=condition=complete job/im-migrate -n im1-dev --timeout=2m
 
       - name: Smoke test
-        if: ${{ !inputs.skip_smoke && github.event_name == 'push' }}
+        # 2026-10-02 修:原条件带 github.event_name == 'push',导致手动 dispatch
+        # 永远跳过 smoke,与 skip_smoke 输入描述("manual deploy only")正好相反,
+        # 且让该输入形同虚设。改为只由 skip_smoke 控制:push 时 inputs 为空 → 照旧执行。
+        if: ${{ !inputs.skip_smoke }}
         run: |
           # 等待 im-gateway 就绪
           for i in {1..30}; do
