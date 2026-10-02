@@ -52,9 +52,16 @@ jobs:
 
       - name: Run migrations
         run: |
-          kubectl create job --from=cronjob/im-migrate-cronjob im-migrate-manual -n im1-dev 2>/dev/null || \
+          # 2026-10-02 修:原先主路径建的是 job/im-migrate-manual,下一行却固定
+          # 等 job/im-migrate,名字对不上 → 每次 dev 部署都在此 2 分钟超时失败。
+          # 保留 -manual 后缀(避免与 cronjob 生成的 im-migrate-<timestamp> 撞名),
+          # 改为按实际走的路径决定等待哪个 job 名。
+          JOB_NAME=im-migrate-manual
+          kubectl create job --from=cronjob/im-migrate-cronjob "$JOB_NAME" -n im1-dev 2>/dev/null || {
             kubectl apply -f deploy/k3s/dev/migrate-job.yaml -n im1-dev
-          kubectl wait --for=condition=complete job/im-migrate -n im1-dev --timeout=2m
+            JOB_NAME=im-migrate
+          }
+          kubectl wait --for=condition=complete "job/$JOB_NAME" -n im1-dev --timeout=2m
 
       - name: Smoke test
         # 2026-10-02 修:原条件带 github.event_name == 'push',导致手动 dispatch

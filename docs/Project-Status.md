@@ -18,6 +18,7 @@
 |---|---|---|---|
 | 1.0.0 | 2026-08-20 | (Mavis 辅助) | Day 1 Kickoff 决议 |
 | 1.1.0 | 2026-09-01 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 132-wbs.md 关联;决策待办 7 项 (§2.2) 仍空缺,卡 H-1 截止日 |
+| 1.2.0 | 2026-10-02 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 §1.1.2 CI 三闸门实测基线(fmt / clippy / test 全部 exit 0)+ CI 分支触发修复记录 + 本机 toolchain 缺陷记录;新增 `dangling-references.md` 关联 |
 
 ---
 
@@ -42,6 +43,61 @@
 - **遗留工程债**:
   - im-core 各 service / repository **未直接引用** aux-02 §F 字段定义(只有 `im-common/src/ids.rs:3` 1 处 + 6 个 migration 注释引用;ImSpec §12.3 要求"im-core 各 service / repository 至少 3 处引用 aux-02",未达成)。
   - 6 份 SQL migration 未在真 PG 实例上跑过(2026-08-26 沙箱 Docker Desktop 启了但 Windows↔WSL2 daemon bridge 未就绪,`docker ps` 2 分钟超时;`postgres:18.6` image 锁 tag 已 commit,K3s dev 部署 / 桌面端 daemon bridge 就绪后立即可验证)。
+
+### 1.1.2 CI 三闸门实测基线 (2026-10-02) [GATES-GREEN]
+
+本节记录 2026-10-02 在 `dev` 分支实测的三道 CI 闸门结果。此前 dev 长期处于
+**两道闸门红**的状态(fmt 46 文件违规、clippy 29 errors),无法通过 CI。
+
+**实测结果(dev @ `803bad9`,toolchain cargo/rustc 1.98.1)**:
+
+| 闸门 | 命令 | 修复前 | 修复后 |
+|---|---|---|---|
+| 格式 | `cargo fmt --all -- --check` | ❌ 46 文件违规 | ✅ **exit 0** |
+| 静态分析 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | ❌ exit 101,29 errors | ✅ **exit 0** |
+| 单元测试 | `cargo test --workspace --lib --no-fail-fast` | ✅ 128 passed / 0 failed | ✅ 128 passed / 0 failed |
+
+测试构成:im_common 41 / im_core 19 / im_protocol 7 / im_testkit 61;
+extension_runtime / im_media / im_presence / im_proto 的 lib tests 为 0。
+
+**本次修复内容**:
+
+- `0e926f3` —— `cargo fmt --all` 统一全仓 46 文件格式;`.gitignore` 补
+  `.worktrees/` 与 `target-*/`;`Cargo.lock` 补 `aci-emitter` git dep 条目
+  (CI clippy job 用 `--locked`,缺该条目会直接失败)。
+- `a26ae67` —— im-gateway 的 29 个 clippy error 清零。其中 12 处死代码
+  **标注保留而非删除**(逐项加 `#[allow(dead_code)]` + `守门 #1 缺口台账`
+  缺口编号 + 后续接线条件),理由见 §1.1.1 占位符保留约定;未改任何运行时逻辑。
+- `efe1768` —— CI 补 `dev` 分支触发 + `sqlx-cli` 版本对齐 `0.9`。
+  此前 `ci.yml` / `deploy-dev.yml` 只监听 `main`,而团队实际在 `dev` 上集成,
+  **dev 上的真实改动从不跑 CI**(静默系统性缺口)。
+
+**有意未修的项(需团队 lead 拍板)**:
+
+- `deploy-dev.yml` **未**把 `dev` 加入自动部署触发。每次合入 dev 都自动部署
+  = 每次合并都对共享 K3s dev 集群跑 apply + 迁移 Job,且
+  `concurrency.cancel-in-progress: false` 会让突发合并的部署排队而非取消,
+  重叠的迁移 Job 不可重入,存在把共享 dev 环境搞脏的风险。dev 部署保持走
+  `workflow_dispatch` 手动触发。
+- `deploy-dev.yml` 的 "Run migrations" 疑似 job 名与 `needs` 依赖不一致
+  (建 job `im-migrate-manual` 但等 `job/im-migrate`),**未确认,未修**。
+  在确认前不要开启 dev 自动部署。
+
+**本机 toolchain 缺陷(不影响 CI,属开发者体验问题)**:
+
+`~/.cargo/bin/` 下的 `cargo.exe` / `rustc.exe` shim 丢失(目录不存在),但
+`~/.rustup/toolchains/` 下 4 套 toolchain(1.89.0 / 1.95.0 / 1.98 /
+1.98.1)完整。因此本机 `cargo` 无法直接调用,需走 toolchain 绝对路径:
+
+```powershell
+$env:PATH = "C:\Users\leo19\.rustup\toolchains\1.98.1-x86_64-pc-windows-msvc\bin;$env:PATH"
+```
+
+CI 不受影响(`dtolnay/rust-toolchain@stable` 自行安装)。**未修改本机 PATH** ——
+恢复 shim 属宿主状态变更,待团队 lead 决定。
+
+**关联**:`dangling-references.md` —— 代码中 46 处 `守门 #N` 引用无定义文档
+(`AGENTS.md` 不存在),该文只做事实清单,不定义守则含义。
 
 ### 1.2 第一个产品线:IM Core (消息为主)
 
