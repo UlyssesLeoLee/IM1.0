@@ -7,5 +7,7 @@
 
 pub mod pg;
 pub mod repository;
+pub mod service;
 
 pub use repository::{Reaction, ReactionRepository};
+pub use service::ReactionService;

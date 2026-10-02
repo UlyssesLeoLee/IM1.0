@@ -604,9 +604,6 @@ async fn mark_read_does_not_affect_other_members_pointers() {
 }
 
 /// 读某成员的 `last_read_sequence`(测试读取口)
-///
-/// 走 `list_members` —— service 现有公开面里唯一能读到该列的路径, 故不额外
-/// 开一条只给测试用的查询, 免得测试能通过而线上读不到。
 async fn last_read_of(
     svc: &im_core::conversation::service::ConversationService,
     conv: im_common::ids::ConversationId,
@@ -617,6 +614,166 @@ async fn last_read_of(
         .find(|m| m.user_id == user)
         .map(|m| m.last_read_sequence)
         .expect("该成员应在 members 列表中")
+}
+
+// ============================================================================
+// `ReactionService` —— 权限边界是本 service 存在的全部理由
+// ============================================================================
+//
+// `ReactionRepository` 只做 PK 幂等插入, **不校验任何东西**。所以「谁能对
+// 哪些消息加表情」这条规则完全由 `ReactionService` 承担。若这层校验缺失,
+// 任何持有任意 `message_id` 的用户都能对**任何**会话里的任何消息加表情。
+//
+// 关键的一条: 非成员的越权尝试**不得留下任何行** —— 校验必须先于写入, 而不是
+// 写入后回滚。
+
+/// 成员 Alice + **非成员** Carol + 一条 Alice 发的消息
+async fn reaction_fixture() -> (
+    im_core::reaction::service::ReactionService,
+    sqlx::PgPool,
+    UserId,
+    UserId,
+    im_core::message::repository::Message,
+) {
+    let (env, alice, _bob) = make_env().await;
+    let p = pool().await;
+    let carol_id: Uuid = sqlx::query_scalar(
+        r#"INSERT INTO users (id, environment_id, kind, display_name)
+           VALUES (gen_random_uuid(), $1, 'user', 'Carol') RETURNING id"#,
+    )
+    .bind(env.0)
+    .fetch_one(&p)
+    .await
+    .expect("create Carol");
+    let carol = UserId(carol_id);
+
+    let conv_repo: Arc<dyn ConversationRepository> =
+        Arc::new(PgConversationRepository::new(p.clone()));
+    let conv = conv_repo
+        .create(env, ConversationKind::Dm, json!({}))
+        .await
+        .expect("create DM");
+    conv_repo
+        .add_member(conv.id, alice, MemberRole::Member)
+        .await
+        .unwrap();
+
+    // 直接插一条 sent 消息(不经过 MessageService —— 本文件只测 reaction 权限)
+    let msg_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO messages (conversation_id, sequence, sender_id, kind, content, \
+         idempotency_key) VALUES ($1, 1, $2, 'text', '{\"kind\":\"text\",\"text\":\"hi\"}', \
+         gen_random_uuid()::text) RETURNING id",
+    )
+    .bind(conv.id.0)
+    .bind(alice.0)
+    .fetch_one(&p)
+    .await
+    .expect("insert message");
+
+    let msg_repo: Arc<dyn MessageRepository> = Arc::new(PgMessageRepository::new(p.clone()));
+    let msg = MessageRepository::find_by_id(&*msg_repo, MessageId(msg_id))
+        .await
+        .expect("read back")
+        .expect("message row must exist");
+    assert_eq!(msg.sequence, 1);
+
+    let svc = im_core::reaction::service::ReactionService::new(
+        Arc::new(PgReactionRepository::new(p.clone())),
+        msg_repo,
+        conv_repo,
+    );
+    (svc, p, alice, carol, msg)
+}
+
+#[tokio::test]
+async fn reaction_by_member_is_stored() {
+    let (svc, _p, alice, _carol, msg) = reaction_fixture().await;
+    let (r, inserted) = svc
+        .add_reaction(msg.id, alice, "👍")
+        .await
+        .expect("member may react");
+    assert!(inserted, "首次添加应是新插入");
+    assert_eq!(r.emoji, "👍");
+    assert_eq!(r.user_id, alice);
+
+    let all = svc.list_reactions(msg.id, alice).await.expect("list");
+    assert_eq!(all.len(), 1);
+}
+
+#[tokio::test]
+async fn reaction_is_idempotent_and_reports_replay() {
+    // 幂等重放时 `inserted` 必须是 `false` —— 调用方据此决定要不要广播。
+    // 若它错报 `true`, 将来补上 `conversation_id` 后每次重试都会让所有在线端
+    // 看到同一个表情被重复动画一次。
+    let (svc, _p, alice, _carol, msg) = reaction_fixture().await;
+    svc.add_reaction(msg.id, alice, "👍").await.expect("first");
+    let (_, inserted) = svc.add_reaction(msg.id, alice, "👍").await.expect("replay");
+    assert!(!inserted, "重复 add 必须报 replay(false), 否则会被重复广播");
+    // 且库里仍只有一行
+    let all = svc.list_reactions(msg.id, alice).await.expect("list");
+    assert_eq!(all.len(), 1, "幂等 add 不应产生第二行");
+}
+
+#[tokio::test]
+async fn reaction_by_non_member_is_forbidden_and_writes_nothing() {
+    // **本组测试的核心安全断言**
+    let (svc, p, _alice, carol, msg) = reaction_fixture().await;
+    let r = svc.add_reaction(msg.id, carol, "👍").await;
+    assert!(
+        matches!(r, Err(im_common::AppError::Forbidden(_))),
+        "非成员加表情必须 Forbidden, 实际: {r:?}"
+    );
+
+    // 越权尝试**不得留下任何行** —— 校验必须先于写入
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*)::bigint FROM message_reactions WHERE message_id = $1")
+            .bind(msg.id.0)
+            .fetch_one(&p)
+            .await
+            .expect("count reactions");
+    assert_eq!(rows, 0, "越权 add 不得留下行(校验必须先于写, 而非写后回滚)");
+}
+
+#[tokio::test]
+async fn listing_reactions_by_non_member_is_forbidden() {
+    // 只读也要校验: 否则非成员能凭 message_id 枚举「谁对这条消息点了什么
+    // 表情」—— 那是会话内的用户行为信息, 属于泄漏。
+    let (svc, _p, alice, carol, msg) = reaction_fixture().await;
+    svc.add_reaction(msg.id, alice, "👍").await.expect("member");
+    let r = svc.list_reactions(msg.id, carol).await;
+    assert!(
+        matches!(r, Err(im_common::AppError::Forbidden(_))),
+        "非成员列 reaction 必须 Forbidden, 实际: {r:?}"
+    );
+}
+
+#[tokio::test]
+async fn reaction_on_missing_message_is_not_found() {
+    let (svc, _p, alice, _carol, _msg) = reaction_fixture().await;
+    let r = svc.add_reaction(MessageId::new(), alice, "👍").await;
+    assert!(
+        matches!(r, Err(im_common::AppError::MessageNotFound(_))),
+        "不存在的消息应 MessageNotFound, 实际: {r:?}"
+    );
+}
+
+#[tokio::test]
+async fn empty_or_oversized_emoji_is_rejected_without_touching_db() {
+    // 校验顺序: emoji 是便宜校验, 必须排在两次库查询之前
+    let (svc, _p, alice, _carol, msg) = reaction_fixture().await;
+    for bad in ["", "   "] {
+        let r = svc.add_reaction(msg.id, alice, bad).await;
+        assert!(
+            matches!(r, Err(im_common::AppError::Validation(_))),
+            "空 emoji 应 Validation, 实际: {r:?}"
+        );
+    }
+    let long = "x".repeat(65);
+    let r = svc.add_reaction(msg.id, alice, &long).await;
+    assert!(
+        matches!(r, Err(im_common::AppError::Validation(_))),
+        "超长 emoji 应 Validation, 实际: {r:?}"
+    );
 }
 
 // ============================================================================

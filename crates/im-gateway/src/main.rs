@@ -183,12 +183,30 @@ async fn main() -> std::io::Result<()> {
     let settings_service = Arc::new(im_core::settings::service::SettingsService::new(
         pg_pool.clone(),
     ));
+    let reaction_repo: Arc<dyn im_core::reaction::repository::ReactionRepository> = Arc::new(
+        im_core::reaction::pg::PgReactionRepository::new(pg_pool.clone()),
+    );
+    // message_repo 在第 4 步已被 move 进 MessageService, 这里需要一份给
+    // ReactionService 做「消息 → conversation_id」的反查。取一份新的 Arc 指向
+    // 同一个 pool, 代价可忽略, 且避免了把 MessageService 的构造顺序改成环状。
+    let message_repo_for_reaction: Arc<dyn im_core::message::repository::MessageRepository> =
+        Arc::new(PgMessageRepository::new(pg_pool.clone()));
+    let conversation_repo_for_reaction: Arc<
+        dyn im_core::conversation::repository::ConversationRepository,
+    > = Arc::new(PgConversationRepository::new(pg_pool.clone()));
+    let reaction_service = Arc::new(im_core::reaction::service::ReactionService::new(
+        reaction_repo,
+        message_repo_for_reaction,
+        conversation_repo_for_reaction,
+    ));
+
     let app_state = AppState::new(
         conversation_service,
         message_service,
         token_service,
         identity_service,
         settings_service,
+        reaction_service,
     );
 
     // 9b. WS 广播中枢 —— 进程内单例。

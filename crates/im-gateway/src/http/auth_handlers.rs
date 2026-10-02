@@ -763,7 +763,14 @@ mod tests {
             // 本文件这些用例走的是 auth 端点、不碰撤回, 所以具体值无关;
             // 但**必须传真 service** —— 传一个假 stub 会让「WS 撤回读不到
             // 真实窗口」这类问题在别的测试里重现时无从分辨。
-            std::sync::Arc::new(im_core::settings::service::SettingsService::new(p.clone())),
+            Arc::new(im_core::settings::service::SettingsService::new(p.clone())),
+            // 同理: 传真的 ReactionService(真 pool), 而非 stub —— reaction
+            // 的成员校验依赖真实的 conversation_members 行, 换 stub 就测不到了。
+            Arc::new(im_core::reaction::service::ReactionService::new(
+                Arc::new(im_core::reaction::pg::PgReactionRepository::new(p.clone())),
+                Arc::new(im_core::message::pg::PgMessageRepository::new(p.clone())),
+                Arc::new(PgConversationRepository::new(p.clone())),
+            )),
         ))
     }
 

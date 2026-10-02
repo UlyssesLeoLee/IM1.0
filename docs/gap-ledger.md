@@ -862,6 +862,70 @@ WHERE conversation_id = $2 AND user_id = $3 AND last_read_sequence < $1
 
 ---
 
+### 1.13 `react` + `typing` 实装, 6 类业务帧收官; 以及一处需要规范所有者决断的 wire 缺口 (2026-10-03)
+
+至此 aux-13 §1.1 的 6 类业务帧**全部落地**。但收官时暴露出一个模式, 值得
+单独记: **有三类帧的「持久化部分」能做、「广播部分」做不了, 原因完全相同**。
+
+#### `ReactionService`: 权限边界是它存在的全部理由
+
+`ReactionRepository` 只做 PK 幂等插入, **不校验任何东西**。所以「谁能对哪些
+消息加表情」这条规则**完全由 service 承担**。若这层缺失, 任何持有任意
+`message_id` 的用户都能对**任何**会话里的任何消息加表情。
+
+三条刻意的设计:
+
+- **校验必须先于写入, 不是写后回滚**。测试直接断言「越权 add 之后
+  `message_reactions` 里一行都不能多」—— 若实现先插入再报错回滚, 这条会红。
+- **只读列表也校验**。否则非成员能凭 `message_id` 枚举「谁对这条消息点了什么
+  表情」—— 那是**会话内的用户行为信息**, 属于泄漏。「能读」不等于「无风险」。
+- **emoji 校验排在两次库查询之前**。空/超长 emoji 不该为一个显然无效的输入
+  去查两次库。
+
+返回 `(Reaction, bool)` 的 `bool` = `inserted`(是否真插了行)。`add` 自身幂等
+但**不告诉调用方**是自己插的还是回查到的, 而广播需要这个区分 —— 漏掉它就是
+「重复 reaction 被广播多次」的 bug。代价是多一次 `list_for_message` 查询;
+reaction 是低频操作, 划算。
+
+#### `typing`: 不查库, 且这是刻意的
+
+typing 是全协议**最高频**的帧(打字时可能每秒一次), 而 `aux-13` §1.1.7 未给它
+定义任何 guard。**不加**成员校验, 理由: 每帧一次 DB 往返在热路径上不成比例,
+而**安全性并不依赖它** —— 广播中枢的 `Audience::Conversation` 过滤保证非成员的
+typing 帧投不出去。代价是非成员会拿到 `ok: true` 却看不到效果, 可接受:
+typing 是瞬时信号, 客户端没有任何可观测结果依赖它。
+
+> 判别式: **这个守卫是为了挡泄漏, 还是为了让客户端拿到准确反馈?**
+> 前者必须放在**投递前**; 后者可以省。
+
+#### wire 缺口: 三类帧「能存不能广播」
+
+| 帧 | 缺什么 | 后果 |
+|---|---|---|
+| `MessageEdited` (aux-13 §1.2.6) | 不带 `conversation_id` | 编辑无法实时同步 |
+| `ReactionAdded` (aux-13 §1.2.8) | 不带 `conversation_id` | reaction 无法实时同步; 且广播它还会顺带泄漏「谁对哪条消息点了什么表情」 |
+| (无已读回执变体) | `ServerFrame` 根本没有这个帧 | 已读无法实时回执给发送方 |
+
+前两个是**同一个根因**: 帧不带会话标识, 广播中枢无法判断接收方是不是成员,
+发给所有人即跨会话泄漏。第三个更彻底 —— 连变体都不存在。
+
+**三者都属协议变更**(`[PROTOCOL-FROZEN]`), 不由实现方拍板。实现侧的选择是:
+持久化部分照做(那是可确证的), 广播部分**不发明**。`Audience::Undeliverable`
+就是为这种情况准备的第三态(见 §1.10)。
+
+**这已连续三次撞到「wire 形状挡住了正确实现」**(`UNSUPPORTED_OPERATION`、
+`auth_ok`、以及这次的三个帧)。规律是: 规范给的是**样例 JSON** 而非**结构定义**
+—— 样例里没写的字段, 实现方就无权补。若规范改为给**字段表 + 可空性**,
+这类缺口会从根上消失。
+
+#### 测试
+
+7 个真 PG 用例: 成员可加且落库 / 重复 add 报 `replay` 且库里仍一行 /
+非成员加表情 `Forbidden` **且不留任何行** / 非成员列 reaction `Forbidden` /
+不存在的消息 `MessageNotFound` / 空 emoji 与超长 emoji `Validation`。
+
+---
+
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
@@ -873,7 +937,9 @@ WHERE conversation_id = $2 AND user_id = $3 AND last_read_sequence < $1
 | `crates/im-gateway/src/placeholder.rs` (整文件) | 10 个端点桩函数未被调用 | 该文件唯一职责就是存放未接线桩; 各端点随对应 WBS 项落地 |
 | ~~`im_protocol::ServerFrame::Ack` **缺 error 载荷**~~ | ~~规范 (aux-13 §1.2.4) 规定的失败形状表达不了, 实现因此另造顶层 `{"type":"error",...}` 帧~~ | ✅ **已修复** (2026-10-03): `Ack` 补 `error: Option<ErrorBody>`, im-gateway 改发规范形状并删除 `WsErrorFrame`, im-testkit 补齐强类型版。见 §1.7.3 |
 | ~~`im_protocol::ServerFrame` **缺 `message_new` 变体**~~ | ~~`ws_frames.rs` 模块文档称「aux-13 §1.2 服务端 11 类」, 实际枚举只有 9 个变体; aux-13 §1.2.5 定义的 `message_new`(新消息广播)**无对应变体** —— 即便 `send_message` 实装成功, 其他客户端也收不到广播~~ | ✅ **已修复** (2026-10-03): 补 `ServerFrame::MessageNew { message: WireMessage }`, 并实装 `ws::hub::WsHub` 广播中枢 + 成员过滤 + `handle_send_message` 接线。见 §1.10 |
-| `ServerFrame::MessageEdited` / `ReactionAdded` **不可广播** | aux-13 §1.2.6 / §1.2.8 的 wire 形状**不带 `conversation_id`**, 广播中枢无从判断接收方是否该会话成员 —— 发给所有人即跨会话泄漏。故判为 `Audience::Undeliverable` 一律不发 | **需规范所有者给这两个帧补 `conversation_id`**, 属协议变更(同 §1.6 的 `[PROTOCOL-FROZEN]` 约束), 不由实现方拍板。在此之前「编辑消息」无法实时同步到其它端 |
+| `ServerFrame::MessageEdited` / `ReactionAdded` **不可广播** | aux-13 §1.2.6 / §1.2.8 的 wire 形状**不带 `conversation_id`**, 广播中枢无从判断接收方是否该会话成员 —— 发给所有人即跨会话泄漏 | **需规范所有者给这两个帧补 `conversation_id`**, 属协议变更(同 §1.6 的 `[PROTOCOL-FROZEN]` 约束), 不由实现方拍板。在此之前「编辑消息」与「reaction」无法实时同步, 只能靠 REST 拉。见 §1.10 / §1.13 |
+| `ServerFrame` **无已读回执变体** | aux-04 §B.4 转换表 line 239 要求 mark_read 的 effect 是「UPDATE last_read_sequence **+ fanout**」, 但 `ServerFrame` 里根本没有 read receipt 帧 | 需规范所有者新增该下行帧(或明确取消 fanout 要求)。`ConversationService::mark_read` 已返回 `bool`(是否真的推进), 补帧后据此判断「值没变就别广播」, 无需改接口。见 §1.12 |
+| aux-13 只给**样例 JSON**, 不给**结构定义** | 连续三次撞到「样例里没写的字段, 实现方无权补」: `UNSUPPORTED_OPERATION`(§1.6) / `auth_ok`(§1.8.2) / 上面两个帧的 `conversation_id` | 建议规范改为给**字段表 + 可空性 + 取值域**, 而非单条样例。这是从根上消除此类缺口的唯一办法 |
 | `ws/hub.rs` 成员关系**鉴权时快照一次** | 会话期间被移出会话, 仍会收到该会话广播, 直到该连接重连 | 需基于事件的成员变更通知, 随 **G-1 presence** 落地 |
 | `ws/handler.rs` 鉴权成功回 **`{"type":"auth_ok"}`** | **`auth_ok` 不是 aux-13 §1.2 定义的任何帧类型**(§1.2.1 定义的是 `connected { session_id }`)。继 §1.6 的 `UNSUPPORTED_OPERATION` 之后**第二处凭空发明的 wire 帧** | **只记录不擅改**(见 §1.8.2): 改它变动客户端可见的 wire 形状, 且**无证据表明 `connected` 就是原意** —— 与 §1.7.3 的 `ack` 形状不同(那次有 testkit 证据, 方向无歧义)。需规范所有者确认该帧形状 |
 

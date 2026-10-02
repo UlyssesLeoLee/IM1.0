@@ -24,6 +24,7 @@ use im_core::identity::pg::{PgDeviceSessionRepository, PgUserRepository};
 use im_core::identity::service::IdentityService;
 use im_core::identity::token::TokenService;
 use im_core::message::service::MessageService;
+use im_core::reaction::service::ReactionService;
 use im_core::settings::service::SettingsService;
 
 /// im-gateway 共享 handler 状态(用 `web::Data<AppState>` 注入)
@@ -54,6 +55,13 @@ pub struct AppState {
     /// 「从 env settings 读」(合规), 实际却恒为写死值。现已改为真读
     /// `environments.settings` JSONB。
     pub settings_service: Arc<SettingsService>,
+
+    /// Reaction 服务 (C-9 `react` 帧 —— 6 类业务帧的第 5 类)
+    ///
+    /// 权限边界在 `ReactionService` 内部: 必须是**消息所属会话的成员**。
+    /// `ReactionRepository` 自身只做 PK 幂等插入, 不做任何校验, 所以它绝不能
+    /// 被直接暴露给 handler。
+    pub reaction_service: Arc<ReactionService>,
 }
 
 impl AppState {
@@ -64,6 +72,7 @@ impl AppState {
         token_service: Arc<TokenService>,
         identity_service: Arc<IdentityService<PgUserRepository, PgDeviceSessionRepository>>,
         settings_service: Arc<SettingsService>,
+        reaction_service: Arc<ReactionService>,
     ) -> Self {
         Self {
             conversation_service,
@@ -71,6 +80,7 @@ impl AppState {
             token_service,
             identity_service,
             settings_service,
+            reaction_service,
         }
     }
 }

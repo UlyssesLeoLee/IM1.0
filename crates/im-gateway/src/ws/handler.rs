@@ -27,7 +27,7 @@
 //! - ForceDisconnect hook stub (后续 G-1 presence 集成)
 //!
 //! ### 已知缺口 (per 守门 #1 缺标比错标)
-//! 1. **业务帧处理** —— **2026-10-03 已实装 4/6**:
+//! 1. **业务帧处理** —— **2026-10-03 已实装 6/6(全部)**:
 //!    - `SendMessage`: 走完整 `MessageService::send_message` 校验链
 //!      (幂等 / content schema / conversation member / 大小上限),
 //!      回 aux-13 §1.2.2 的 `ack`, 并经 `WsHub` 广播 `message_new`。
@@ -35,15 +35,17 @@
 //!      (仅原 sender / 撤回与删除态不可编辑 / 大小 / content schema)。
 //!    - `RecallMessage`: 走 `MessageService::recall_message`
 //!      (per aux-04 §B.4 转换表: 仅原 sender / `sent`·`delivered`·`read`
-//!      三态可撤 / 终态拒绝 / 时间窗 `≤` 判定), 并广播 `message_recalled`
-//!      —— 该帧带 `conversation_id`, 是**当前唯一可安全广播的变更类帧**。
+//!      三态可撤 / 终态拒绝 / 时间窗 `≤` 判定), 并广播 `message_recalled`。
 //!    - `MarkRead`: 走 `ConversationService::mark_read`
 //!      (仅会话成员 / 读指针单调不回退 / 未推进时**不写库**)。
-//!      **不广播** —— `ServerFrame` 没有已读回执变体, 见该 handler 注释。
+//!    - `React`: 走 `ReactionService::add_reaction`
+//!      (**必须是消息所属会话的成员**, 连只读列表也校验)。
+//!    - `Typing`: 不落库, 直接经 `WsHub` 广播 `typing`。
 //!
-//!    仍**未实装 2 类**: `React` / `Typing` ——
-//!    收到即回 `VALIDATION_ERROR`(带 req_id)。错误码语义不理想(帧格式合法,
-//!    缺的是服务端处理器), 但**不新造错误码**, 理由见下。
+//!    **注意**: 上述「实装」指**持久化 / 广播路径**通了。其中 `MarkRead`
+//!    与 `React` **没有广播** —— `ServerFrame` 里既没有已读回执变体, 也没有在
+//!    `ReactionAdded` 上带 `conversation_id`, 详见两个 handler 的注释与
+//!    `docs/gap-ledger.md` §1.12 / §1.13。
 
 //!
 //!    **2026-10-03 更正 —— 以下说明本条原注释为何不可照抄**:
@@ -510,25 +512,45 @@ async fn run_ws_loop(
                     //     `ClientFrame` 加变体会在此处编译报错, 而不会被 `Ok(_)`
                     //     静默吞掉。ping 漏洞(gap-ledger §1.2)就是这么藏的 ——
                     //     `ClientFrame::Ping` 解析成功, 却落进了 `Ok(_)`。
-                    Ok(ClientFrame::React { req_id, .. } | ClientFrame::Typing { req_id, .. }) => {
-                        // 2026-10-03 更正: 本注释原写「当前返 UNSUPPORTED_OPERATION」——
-                        // **该错误码不存在**。aux-03 §B(MVP 错误码唯一权威表)的 21 个
-                        // 已注册码里没有它, 也没有 501。实际返回的是
-                        // `VALIDATION_ERROR` (400)。
-                        //
-                        // 语义确实不合(业务帧格式合法, 缺的是服务端处理器), 但**不能
-                        // 自行改成 501**: aux-03 §B 规定新增错误码须同步更新该表与
-                        // DetailedDesign, 属协议变更, 而 ImplementationSpec 处于
-                        // `[PROTOCOL-FROZEN]`。是否新增「未实装」类错误码由规范所有者
-                        // 决定。见模块文档缺口 1 + docs/gap-ledger.md §1.6。
-                        send_error(
-                            ws_session,
-                            im_common::ErrorCode::ValidationError,
-                            "frame handler not implemented in MVP (per 138 §C-9)",
-                            Some(req_id),
-                        )
-                        .await;
-                    }
+                    // C-9 已实装: react (per aux-13 §1.1.5)
+                    Ok(frame @ ClientFrame::React { .. }) => match state.user_id() {
+                        Some(uid) => handle_react(ws_session, app, uid, frame).await,
+                        None => {
+                            send_error(
+                                ws_session,
+                                im_common::ErrorCode::Unauthorized,
+                                "not authenticated",
+                                None,
+                            )
+                            .await
+                        }
+                    },
+                    // C-9 已实装: typing (per aux-13 §1.1.7)
+                    //
+                    // 6 类业务帧至此全部实装完毕。此前这里是最后一个 or-pattern
+                    // 兜底分支, 收到即回「未实装」。**仍不用 `Ok(_)` 兜底** ——
+                    // 未来加变体必须在这里编译报错, 这正是 `ClientFrame::Ping`
+                    // 当年被静默吞掉的原因(gap-ledger §1.2)。
+                    Ok(frame @ ClientFrame::Typing { .. }) => match state.user_id() {
+                        Some(uid) => handle_typing(ws_session, hub, uid, frame).await,
+                        None => {
+                            send_error(
+                                ws_session,
+                                im_common::ErrorCode::Unauthorized,
+                                "not authenticated",
+                                None,
+                            )
+                            .await
+                        }
+                    },
+                    // 已无「未实装」分支: 6 类业务帧全部落地。
+                    //
+                    // 此前这一段(React | MarkRead | Typing)收到即回
+                    // `VALIDATION_ERROR` + 「frame handler not implemented」。
+                    // 那个错误码语义确实不理想(帧格式合法, 缺的是服务端处理器),
+                    // 但**不能**改成 501: aux-03 §B 规定新增错误码须同步更新该表
+                    // 与 DetailedDesign, 属协议变更, 而 ImplementationSpec 处于
+                    // `[PROTOCOL-FROZEN]`。见模块文档缺口 1 + gap-ledger §1.6。
                     Err(_) => {
                         send_error(
                             ws_session,
@@ -1020,6 +1042,109 @@ async fn handle_mark_read(
             .await;
         }
     }
+}
+
+/// C-9 业务帧: `react` (per aux-13 §1.1.5)
+///
+/// 权限边界在 `ReactionService` 内: 必须是**消息所属会话的成员**。
+/// `ReactionRepository` 只做 PK 幂等插入, 不校验任何东西 —— 绝不能直接暴露。
+///
+/// **不广播, 且这是 wire 形状的硬限制**: 对应的 `ServerFrame::ReactionAdded`
+/// (aux-13 §1.2.8) 只有 `message_id` + `user_id` + `emoji`, **不带
+/// `conversation_id`**。广播中枢因此无法判断接收方是不是该会话成员 ——
+/// 发给所有人就是跨会话泄漏(而且会顺带泄漏「谁对哪条消息点了什么表情」,
+/// 那是会话内的用户行为信息)。故 reaction **落库但不同步**, 其它端靠
+/// `GET /v1/conversations/{id}/messages` 或 `WireMessage.reactions` 拿到。
+/// 补 `conversation_id` 属协议变更, 不在本文件拍板范围。
+async fn handle_react(
+    ws_session: &mut actix_ws::Session,
+    app: &web::Data<AppState>,
+    user_id: UserId,
+    frame: ClientFrame,
+) {
+    let ClientFrame::React {
+        req_id,
+        message_id,
+        emoji,
+    } = frame
+    else {
+        unreachable!("调用方保证传入 React 变体");
+    };
+
+    match app
+        .reaction_service
+        .add_reaction(MessageId(message_id), user_id, &emoji)
+        .await
+    {
+        Ok((reaction, inserted)) => {
+            send_ack(
+                ws_session,
+                req_id,
+                Some(reaction.message_id.0),
+                None,
+                !inserted,
+            )
+            .await;
+            // 幂等重放(`inserted == false`)时**不广播**, 否则所有在线端会看到
+            // 同一个表情被重复动画一次。但此处因 §上文 的 wire 限制本就不广播;
+            // 该判断保留成注释是因为**将来补上 conversation_id 后**立刻要用 ——
+            // 届时漏掉它就是一个「重复 reaction 被广播多次」的 bug。
+            if !inserted {
+                tracing::trace!(
+                    message_id = %reaction.message_id.0,
+                    emoji = %reaction.emoji,
+                    "react idempotent replay, not re-broadcasting"
+                );
+            }
+        }
+        Err(e) => {
+            let (code, detail) = map_service_error(&e);
+            send_error(
+                ws_session,
+                code,
+                &format!("react failed: {detail}"),
+                Some(req_id),
+            )
+            .await;
+        }
+    }
+}
+
+/// C-9 业务帧: `typing` (per aux-13 §1.1.7)
+///
+/// 全协议中**最高频**的一类帧 —— 用户打字过程中可能每秒发一次。故本 handler
+/// 不做任何 DB 查询: `aux-13` 也未给 typing 定义 guard(§1.1.7 只有
+/// `req_id` + `conversation_id` 两个字段)。
+///
+/// **为什么不加成员校验**: 加了就是每个 typing 帧一次 DB 往返, 在最高频
+/// 路径上不成比例; 而**安全性并不依赖它** —— 广播中枢的 `Audience::Conversation`
+/// 过滤保证非成员的 typing 帧**投不出去**(收件人必须是该会话成员)。代价是
+/// 非成员会拿到一个 `ok: true` 却看不到任何效果, 这是可接受的: typing 是
+/// 瞬时信号, 客户端没有任何可观测的结果依赖它。
+///
+/// **ack 不带 data**: 同 `mark_read` 的理由 —— `AckData` 字段语义指向消息。
+async fn handle_typing(
+    ws_session: &mut actix_ws::Session,
+    hub: &super::hub::WsHub,
+    user_id: UserId,
+    frame: ClientFrame,
+) {
+    let ClientFrame::Typing {
+        req_id,
+        conversation_id,
+    } = frame
+    else {
+        unreachable!("调用方保证传入 Typing 变体");
+    };
+
+    send_ack(ws_session, req_id, None, None, false).await;
+    // `ServerFrame::Typing` 带 conversation_id → `Audience::Conversation` →
+    // 投递范围由收件侧的成员关系决定, 发送方**不必**是成员(见上)。
+    let delivered = hub.publish(ServerFrame::Typing {
+        conversation_id,
+        user_id: user_id.0,
+    });
+    tracing::trace!(conversation_id = %conversation_id, delivered, "typing");
 }
 
 /// 发成功 ack (per aux-13 §1.2.2)
