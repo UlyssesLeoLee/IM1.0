@@ -1001,6 +1001,55 @@ media / me 那 8 个端点**不在范围**: 它们的 service 层大多尚不存
 (群名、公告等)。非成员返 404(与 `GET /v1/conversations` 把非成员会话排除在
 列表外的语义一致, 且不泄漏「该 id 是否存在」)。
 
+### 1.15 上一条 commit 的 4 个端点**状态码是我选的, 却一个端到端测试都没有** (2026-10-03 已修)
+
+§1.14 把 4 个端点接上线时, 它们的**状态码全部无规范可依** —— `201`(新插入) vs
+`200`(幂等重放)、`404` vs `403`、`409` 全是我按 REST 惯例定的。既然是自定的,
+就不该只靠 service 层的真 PG 测试兜底: service 层根本走不到
+`init_service` → 路由匹配 → `Json` extractor → `json_response` 的状态码映射这条链。
+
+#### 覆盖了什么(12 个)
+
+| 组 | 用例 |
+|---|---|
+| 路由 + 状态码 | `patch_edit_returns_200_with_updated_content` / `reactions_returns_201_then_200_on_replay` / `recall_returns_200_with_state_recalled` / `recall_twice_is_invalid_state_transition` |
+| 权限 | `edit_by_member_who_is_not_the_sender_is_forbidden` / `reactions_by_non_member_is_forbidden` / `mark_read_by_non_member_is_forbidden` / `all_action_endpoints_require_authentication` |
+| 路径一致性 | `message_in_a_different_conversation_returns_404` |
+| 已读语义 | `mark_read_advances_and_reports_server_value` / `mark_read_rejects_negative_sequence_with_400` |
+| 读侧泄漏 | `conversation_get_hides_metadata_from_non_members` |
+
+#### 变异测试: 4 处注入, 4 处被捕获, 各由**唯一**一个测试抓住
+
+绿灯只证明「没报错」, 不证明「测到了东西」。故逐个摘掉已实现的门禁再跑:
+
+| 注入的缺陷 | 唯一失败的测试 |
+|---|---|
+| `ensure_message_in_conversation` 的归属比对短路 | `message_in_a_different_conversation_returns_404` |
+| `ReactionService::add_reaction` 的成员校验去掉 | `reactions_by_non_member_is_forbidden` |
+| `ConversationService::mark_read` 的成员校验去掉 | `mark_read_by_non_member_is_forbidden` |
+| `conversations::get` 的成员校验去掉 | `conversation_get_hides_metadata_from_non_members` |
+
+四处互不覆盖 —— 摘掉任意一个, 只有对应那条变红。这同时证明 e2e 真的连上了真
+PG(否则拿不到真实状态码), 而不是被 `let Some(p) = .. else { return }` 跳过。
+
+#### 但**这个跳过本身仍是一个假绿灯向量**, 记在这里不藏
+
+13 个 e2e 沿用 `auth_handlers` 的约定: 连不上 `DATABASE_URL` 就 `return` 而**不是**
+`fail`。好处是 CI 无 PG 时不阻塞, 代价是**一旦连接失败, 13 个用例全部静默通过**,
+且没有任何标记能区分「跑过了」与「没跑」。本地这 13 个是跑过的(上面四次变异
+就是证据), 但 CI 侧这一条**目前无法保证**, 需要 D-4 之后接 PG service container
+才能消掉。替代方案(连接失败即 fail)会让无 PG 的开发者本地全红, 未与使用者确认
+前不擅自改。
+
+#### 一个**故意没写**的用例
+
+原打算写 `edit_by_non_member_is_forbidden`。写完发现
+`MessageService::edit_message` **没有**独立的成员校验 —— 非成员同样被 sender
+条件挡住。写出来会是「同一个 403、同一个原因」的重复断言, 且测试名会让人误以为
+存在成员门禁。故删掉, 改在 sender 那条用例的注释里点明「这里只有 sender 一道
+门禁」。夹具相应拆出 Bob(成员但非 sender)与 Carol(非成员)两个人, 否则「非
+sender」这个用例实际测的仍是「非成员」。
+
 ---
 
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
@@ -1021,6 +1070,7 @@ media / me 那 8 个端点**不在范围**: 它们的 service 层大多尚不存
 | aux-13 只给**样例 JSON**, 不给**结构定义** | 连续三次撞到「样例里没写的字段, 实现方无权补」: `UNSUPPORTED_OPERATION`(§1.6) / `auth_ok`(§1.8.2) / 上面两个帧的 `conversation_id` | 建议规范改为给**字段表 + 可空性 + 取值域**, 而非单条样例。这是从根上消除此类缺口的唯一办法 |
 | `ws/hub.rs` 成员关系**鉴权时快照一次** | 会话期间被移出会话, 仍会收到该会话广播, 直到该连接重连 | 需基于事件的成员变更通知, 随 **G-1 presence** 落地 |
 | `ws/handler.rs` 鉴权成功回 **`{"type":"auth_ok"}`** | **`auth_ok` 不是 aux-13 §1.2 定义的任何帧类型**(§1.2.1 定义的是 `connected { session_id }`)。继 §1.6 的 `UNSUPPORTED_OPERATION` 之后**第二处凭空发明的 wire 帧** | **只记录不擅改**(见 §1.8.2): 改它变动客户端可见的 wire 形状, 且**无证据表明 `connected` 就是原意** —— 与 §1.7.3 的 `ack` 形状不同(那次有 testkit 证据, 方向无歧义)。需规范所有者确认该帧形状 |
+| im-gateway 13 个 e2e 用例**连不上 PG 就静默通过** | 沿用 `auth_handlers` 约定 `let Some(p) = .. else { return }`。CI 若无 `DATABASE_URL`, 全部「跑过」与「没跑」**无法区分** —— 假绿灯向量 | 需 D-4 后在 CI 挂 PG service container; 或改「连不上即 fail」(会让无 PG 的本地全红, 属取舍, 未擅自改)。见 §1.15 |
 
 ---
 

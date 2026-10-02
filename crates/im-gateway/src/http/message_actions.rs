@@ -366,6 +366,7 @@ fn app_error_with_conv(e: AppError, conv: ConversationId) -> actix_web::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn negative_sequence_is_rejected_before_touching_db() {
@@ -402,6 +403,659 @@ mod tests {
         assert!(
             j.get("requested_sequence").is_none(),
             "响应体不应回显请求值: {j}"
+        );
+    }
+
+    // ========================================================================
+    // HTTP 端到端 (真实 init_service + Bearer + 真 PG)
+    // ========================================================================
+    //
+    // **为什么这些不可省**: service 层的真 PG 行为已被前两个 commit 覆盖, 但
+    // 「路由注册是否正确 / 状态码是否如声明 / 路径与消息归属的一致性检查是否
+    // 真的生效」这条链只有端到端才走得到。actix 的路由匹配、extractor 解析、
+    // `json_response` 的状态码映射, 任一处写错, service 层测试全绿。
+    //
+    // 找不到 DATABASE_URL 时**跳过**而不是失败 —— 与 auth_handlers 的 e2e 一致。
+
+    async fn e2e_pool() -> Option<sqlx::PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .connect(&url)
+            .await
+            .ok()
+    }
+
+    /// 一个 env 里的三个用户 + 两个会话 + 一条 Alice 发的消息:
+    ///
+    /// - `alice` — **发送者 + 成员**, 正常路径
+    /// - `bob`   — **成员但不是发送者** (用来测「非 sender 编辑」)
+    /// - `carol` — **非成员** (用来测「越权」)
+    ///
+    /// bob 单独存在是因为「不是发送者」和「不是成员」是**两种不同的拒绝理由**:
+    /// 合并成一个用户的话, 成员检查会先命中, 发送者检查那条分支根本没跑到,
+    /// 而测试名字仍然写着「非 sender」。
+    struct RestFixture {
+        state: web::Data<AppState>,
+        alice_token: String,
+        bob_token: String,
+        carol_token: String,
+        conv: im_common::ids::ConversationId,
+        other_conv: im_common::ids::ConversationId,
+        msg: MessageId,
+    }
+
+    async fn rest_fixture(p: &sqlx::PgPool) -> RestFixture {
+        use im_core::conversation::repository::{
+            ConversationKind, ConversationRepository, MemberRole,
+        };
+        use im_core::identity::repository::{User, UserKind, UserState};
+        use im_core::message::repository::MessageRepository;
+        use std::sync::Arc;
+
+        let env_id: Uuid = sqlx::query_scalar(
+            r#"
+            WITH t AS (INSERT INTO tenants (id, name) VALUES (gen_random_uuid(), 'rest-' || gen_random_uuid()::text) RETURNING id),
+                 g AS (INSERT INTO games (id, tenant_id, name) SELECT gen_random_uuid(), t.id, 'rest-game-' || gen_random_uuid()::text FROM t RETURNING id)
+            INSERT INTO environments (id, game_id, name) SELECT gen_random_uuid(), g.id, 'test' FROM g RETURNING id
+            "#,
+        )
+        .fetch_one(p)
+        .await
+        .expect("make env");
+        let env = im_common::ids::EnvironmentId(env_id);
+
+        async fn mk_user(p: &sqlx::PgPool, env_id: Uuid, name: &str) -> im_common::ids::UserId {
+            let id: Uuid = sqlx::query_scalar(
+                r#"INSERT INTO users (id, environment_id, kind, display_name)
+                   VALUES (gen_random_uuid(), $1, 'user', $2) RETURNING id"#,
+            )
+            .bind(env_id)
+            .bind(name)
+            .fetch_one(p)
+            .await
+            .expect("create user");
+            im_common::ids::UserId(id)
+        }
+        let alice = mk_user(p, env_id, "RestAlice").await;
+        let bob = mk_user(p, env_id, "RestBob").await;
+        let carol = mk_user(p, env_id, "RestCarol").await;
+
+        let conv_repo: Arc<dyn ConversationRepository> = Arc::new(
+            im_core::conversation::pg::PgConversationRepository::new(p.clone()),
+        );
+        let conv = conv_repo
+            .create(env, ConversationKind::Dm, json!({}))
+            .await
+            .expect("create conv");
+        conv_repo
+            .add_member(conv.id, alice, MemberRole::Member)
+            .await
+            .unwrap();
+        // Bob 在群里但没发过消息 —— 与 Carol(非成员)分开, 用于隔离「非 sender」这条分支
+        conv_repo
+            .add_member(conv.id, bob, MemberRole::Member)
+            .await
+            .unwrap();
+        // 另一个会话: Alice 也在里面, 但不含那条消息 —— 用于测「路径与消息归属」
+        let other_conv = conv_repo
+            .create(env, ConversationKind::Dm, json!({}))
+            .await
+            .expect("create other conv");
+        conv_repo
+            .add_member(other_conv.id, alice, MemberRole::Member)
+            .await
+            .unwrap();
+
+        let msg_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO messages (conversation_id, sequence, sender_id, kind, content, idempotency_key) \
+             VALUES ($1, 1, $2, 'text', '{\"kind\":\"text\",\"text\":\"hi\"}', gen_random_uuid()::text) RETURNING id",
+        )
+        .bind(conv.id.0)
+        .bind(alice.0)
+        .fetch_one(p)
+        .await
+        .expect("insert message");
+        let msg = MessageId(msg_id);
+
+        // 与 auth_handlers 测试同构: 真实 pool 的 5 个 service
+        let conversation_repo: Arc<dyn ConversationRepository> = Arc::new(
+            im_core::conversation::pg::PgConversationRepository::new(p.clone()),
+        );
+        let message_repo: Arc<dyn MessageRepository> =
+            Arc::new(im_core::message::pg::PgMessageRepository::new(p.clone()));
+        let sequencer: Arc<dyn im_core::message::sequence::SequenceAllocator> =
+            Arc::new(im_core::message::pg::PgSequenceAllocator::new(p.clone()));
+        let events: Arc<dyn im_core::event::publisher::EventPublisher> = Arc::new(
+            im_core::event::publisher::NatsEventPublisher::connect("nats://stub:4222")
+                .await
+                .expect("stub publisher"),
+        );
+
+        let token_service = Arc::new(im_core::identity::token::TokenService::new(
+            vec![im_core::identity::token::SigningKey {
+                kid: "v1".into(),
+                key: secrecy::SecretString::new(
+                    "test-key-must-be-32-bytes-or-more-padding-padding".into(),
+                ),
+            }],
+            chrono::Duration::seconds(900),
+            secrecy::SecretString::new("test-pepper".into()),
+        ));
+
+        let mk_token = |uid: im_common::ids::UserId| {
+            let u = User {
+                id: uid,
+                environment_id: env,
+                kind: UserKind::User,
+                external_identity: None,
+                state: UserState::Active,
+                display_name: Some("e2e".into()),
+                username: None,
+                password_hash: None,
+                created_at: chrono::Utc::now(),
+            };
+            token_service.issue_access_token(&u).expect("签 token").0
+        };
+        let alice_token = mk_token(alice);
+        let bob_token = mk_token(bob);
+        let carol_token = mk_token(carol);
+
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert(env, secrecy::SecretString::new("rest-test-secret".into()));
+
+        let state = web::Data::new(AppState::new(
+            Arc::new(im_core::conversation::service::ConversationService::new(
+                conversation_repo.clone(),
+            )),
+            Arc::new(im_core::message::service::MessageService::new(
+                message_repo,
+                sequencer,
+                events,
+                conversation_repo.clone(),
+            )),
+            token_service.clone(),
+            Arc::new(im_core::identity::service::IdentityService::new(
+                im_core::identity::pg::PgUserRepository::new(p.clone()),
+                im_core::identity::pg::PgDeviceSessionRepository::new(p.clone()),
+                token_service,
+                secrets,
+            )),
+            Arc::new(im_core::settings::service::SettingsService::new(p.clone())),
+            Arc::new(im_core::reaction::service::ReactionService::new(
+                Arc::new(im_core::reaction::pg::PgReactionRepository::new(p.clone())),
+                Arc::new(im_core::message::pg::PgMessageRepository::new(p.clone())),
+                conversation_repo,
+            )),
+        ));
+
+        RestFixture {
+            state,
+            alice_token,
+            bob_token,
+            carol_token,
+            conv: conv.id,
+            other_conv: other_conv.id,
+            msg,
+        }
+    }
+
+    #[actix_web::test]
+    async fn patch_edit_returns_200_with_updated_content() {
+        let Some(p) = e2e_pool().await else { return };
+        let f = rest_fixture(&p).await;
+        let app =
+            actix_web::test::init_service(actix_web::App::new().app_data(f.state.clone()).route(
+                "/v1/conversations/{id}/messages/{msg_id}",
+                web::patch().to(edit_message),
+            ))
+            .await;
+
+        let req = actix_web::test::TestRequest::patch()
+            .uri(&format!(
+                "/v1/conversations/{}/messages/{}",
+                f.conv.0, f.msg.0
+            ))
+            .insert_header(("Authorization", format!("Bearer {}", f.alice_token)))
+            .set_json(serde_json::json!({"content": {"kind":"text","text":"edited"}}))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body: serde_json::Value = actix_web::test::read_body_json(resp).await;
+        assert_eq!(body["content"]["text"], "edited", "应返回编辑后的内容");
+        assert_eq!(
+            body["state"], "sent",
+            "编辑不改变状态; 这条同时验证 state 字段不是兜底假值"
+        );
+    }
+
+    #[actix_web::test]
+    async fn edit_by_member_who_is_not_the_sender_is_forbidden() {
+        // Bob **是成员**但不是 sender → 走到「不是发送者」那条拒绝分支。
+        //
+        // 注意这条**只**锁住 sender 门禁。`MessageService::edit_message` 里
+        // **没有**独立的成员校验 —— 非成员也会被同一个 sender 条件挡住
+        // (能发消息的前提是当时在会话里)。所以「非成员编辑」并不是一条
+        // 单独可观测的路径, 为它再写一个用例会得到同一个 403、同一个原因,
+        // 属于重复断言, 不写。
+        //
+        // 若将来真加了成员校验(例如允许已退会者继续编辑自己的历史消息,
+        // 或反之收紧), 应新增独立用例并在这里点明两条门禁的分工。
+        let Some(p) = e2e_pool().await else { return };
+        let f = rest_fixture(&p).await;
+        let app =
+            actix_web::test::init_service(actix_web::App::new().app_data(f.state.clone()).route(
+                "/v1/conversations/{id}/messages/{msg_id}",
+                web::patch().to(edit_message),
+            ))
+            .await;
+
+        let req = actix_web::test::TestRequest::patch()
+            .uri(&format!(
+                "/v1/conversations/{}/messages/{}",
+                f.conv.0, f.msg.0
+            ))
+            .insert_header(("Authorization", format!("Bearer {}", f.bob_token)))
+            .set_json(serde_json::json!({"content": {"kind":"text","text":"hijack"}}))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(
+            resp.status(),
+            actix_web::http::StatusCode::FORBIDDEN,
+            "非 sender(但是成员)编辑必须 403"
+        );
+
+        // 内容必须原样保留 —— 403 不能是「先写了再回滚」
+        let stored: String =
+            sqlx::query_scalar("SELECT content->>'text' FROM messages WHERE id = $1")
+                .bind(f.msg.0)
+                .fetch_one(&p)
+                .await
+                .expect("查 messages");
+        assert_eq!(stored, "hi", "被拒的编辑不应改动内容");
+    }
+
+    #[actix_web::test]
+    async fn message_in_a_different_conversation_returns_404() {
+        // **路径与消息归属一致性**: 消息在 conv, 但 URL 写 other_conv。
+        // 不对齐的话客户端会拿到「在 other_conv 编辑成功」的响应。
+        let Some(p) = e2e_pool().await else { return };
+        let f = rest_fixture(&p).await;
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(f.state.clone())
+                .route(
+                    "/v1/conversations/{id}/messages/{msg_id}",
+                    web::patch().to(edit_message),
+                )
+                .route(
+                    "/v1/conversations/{id}/messages/{msg_id}/recall",
+                    web::post().to(recall_message),
+                ),
+        )
+        .await;
+
+        for (label, uri) in [
+            (
+                "edit",
+                format!("/v1/conversations/{}/messages/{}", f.other_conv.0, f.msg.0),
+            ),
+            (
+                "recall",
+                format!(
+                    "/v1/conversations/{}/messages/{}/recall",
+                    f.other_conv.0, f.msg.0
+                ),
+            ),
+        ] {
+            let req = if label == "edit" {
+                actix_web::test::TestRequest::patch()
+                    .uri(&uri)
+                    .insert_header(("Authorization", format!("Bearer {}", f.alice_token)))
+                    .set_json(serde_json::json!({"content": {"kind":"text","text":"x"}}))
+                    .to_request()
+            } else {
+                actix_web::test::TestRequest::post()
+                    .uri(&uri)
+                    .insert_header(("Authorization", format!("Bearer {}", f.alice_token)))
+                    .to_request()
+            };
+            let resp = actix_web::test::call_service(&app, req).await;
+            assert_eq!(
+                resp.status(),
+                actix_web::http::StatusCode::NOT_FOUND,
+                "{label}: 消息不属于该会话时必须 404(而非 403 —— 后者会确认该 id 存在)"
+            );
+        }
+
+        let stored: String =
+            sqlx::query_scalar("SELECT content->>'text' FROM messages WHERE id = $1")
+                .bind(f.msg.0)
+                .fetch_one(&p)
+                .await
+                .expect("查 messages");
+        assert_eq!(stored, "hi", "404 路径不得改动内容");
+    }
+
+    #[actix_web::test]
+    async fn recall_returns_200_with_state_recalled() {
+        let Some(p) = e2e_pool().await else { return };
+        let f = rest_fixture(&p).await;
+        let app =
+            actix_web::test::init_service(actix_web::App::new().app_data(f.state.clone()).route(
+                "/v1/conversations/{id}/messages/{msg_id}/recall",
+                web::post().to(recall_message),
+            ))
+            .await;
+
+        let req = actix_web::test::TestRequest::post()
+            .uri(&format!(
+                "/v1/conversations/{}/messages/{}/recall",
+                f.conv.0, f.msg.0
+            ))
+            .insert_header(("Authorization", format!("Bearer {}", f.alice_token)))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let body: serde_json::Value = actix_web::test::read_body_json(resp).await;
+        assert_eq!(
+            body["state"], "recalled",
+            "撤回后响应里的 state 必须是 recalled —— 若这里显示 sent, \
+             说明 state 字段仍在走那个「序列化失败就兜底 sent」的旧写法"
+        );
+
+        let stored: String = sqlx::query_scalar("SELECT state FROM messages WHERE id = $1")
+            .bind(f.msg.0)
+            .fetch_one(&p)
+            .await
+            .expect("查 messages");
+        assert_eq!(stored, "recalled", "库里必须真落成 recalled");
+    }
+
+    #[actix_web::test]
+    async fn recall_twice_is_invalid_state_transition() {
+        let Some(p) = e2e_pool().await else { return };
+        let f = rest_fixture(&p).await;
+        let app =
+            actix_web::test::init_service(actix_web::App::new().app_data(f.state.clone()).route(
+                "/v1/conversations/{id}/messages/{msg_id}/recall",
+                web::post().to(recall_message),
+            ))
+            .await;
+        let uri = format!("/v1/conversations/{}/messages/{}/recall", f.conv.0, f.msg.0);
+        for expected in [
+            actix_web::http::StatusCode::OK,
+            // 终态再撤 → INVALID_STATE_TRANSITION = 409
+            actix_web::http::StatusCode::CONFLICT,
+        ] {
+            let req = actix_web::test::TestRequest::post()
+                .uri(&uri)
+                .insert_header(("Authorization", format!("Bearer {}", f.alice_token)))
+                .to_request();
+            let resp = actix_web::test::call_service(&app, req).await;
+            assert_eq!(resp.status(), expected);
+        }
+    }
+
+    #[actix_web::test]
+    async fn reactions_returns_201_then_200_on_replay() {
+        // 201 = 新插入, 200 = 幂等重放。两者都是**成功**, 差别只反映实际结果。
+        let Some(p) = e2e_pool().await else { return };
+        let f = rest_fixture(&p).await;
+        let app =
+            actix_web::test::init_service(actix_web::App::new().app_data(f.state.clone()).route(
+                "/v1/conversations/{id}/messages/{msg_id}/reactions",
+                web::post().to(add_reaction),
+            ))
+            .await;
+        let uri = format!(
+            "/v1/conversations/{}/messages/{}/reactions",
+            f.conv.0, f.msg.0
+        );
+
+        for (expected_status, expected_created) in [
+            (actix_web::http::StatusCode::CREATED, true),
+            (actix_web::http::StatusCode::OK, false),
+        ] {
+            let req = actix_web::test::TestRequest::post()
+                .uri(&uri)
+                .insert_header(("Authorization", format!("Bearer {}", f.alice_token)))
+                .set_json(serde_json::json!({"emoji": "👍"}))
+                .to_request();
+            let resp = actix_web::test::call_service(&app, req).await;
+            assert_eq!(resp.status(), expected_status);
+            let body: serde_json::Value = actix_web::test::read_body_json(resp).await;
+            assert_eq!(body["created"], expected_created, "body: {body}");
+        }
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM message_reactions WHERE message_id = $1",
+        )
+        .bind(f.msg.0)
+        .fetch_one(&p)
+        .await
+        .expect("count reactions");
+        assert_eq!(rows, 1, "幂等重放不得产生第二行");
+    }
+
+    #[actix_web::test]
+    async fn reactions_by_non_member_is_forbidden() {
+        let Some(p) = e2e_pool().await else { return };
+        let f = rest_fixture(&p).await;
+        let app =
+            actix_web::test::init_service(actix_web::App::new().app_data(f.state.clone()).route(
+                "/v1/conversations/{id}/messages/{msg_id}/reactions",
+                web::post().to(add_reaction),
+            ))
+            .await;
+        let req = actix_web::test::TestRequest::post()
+            .uri(&format!(
+                "/v1/conversations/{}/messages/{}/reactions",
+                f.conv.0, f.msg.0
+            ))
+            .insert_header(("Authorization", format!("Bearer {}", f.carol_token)))
+            .set_json(serde_json::json!({"emoji": "👍"}))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::FORBIDDEN);
+
+        let rows: i64 = sqlx::query_scalar(
+            "SELECT count(*)::bigint FROM message_reactions WHERE message_id = $1",
+        )
+        .bind(f.msg.0)
+        .fetch_one(&p)
+        .await
+        .expect("count reactions");
+        assert_eq!(rows, 0, "越权 add 不得留下行");
+    }
+
+    #[actix_web::test]
+    async fn mark_read_advances_and_reports_server_value() {
+        let Some(p) = e2e_pool().await else { return };
+        let f = rest_fixture(&p).await;
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(f.state.clone())
+                .route("/v1/conversations/{id}/read", web::post().to(mark_read)),
+        )
+        .await;
+        let uri = format!("/v1/conversations/{}/read", f.conv.0);
+
+        // (a) 首次上报 5 → 推进
+        let req = actix_web::test::TestRequest::post()
+            .uri(&uri)
+            .insert_header(("Authorization", format!("Bearer {}", f.alice_token)))
+            .set_json(serde_json::json!({"sequence": 5}))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        let body: serde_json::Value = actix_web::test::read_body_json(resp).await;
+        assert_eq!(body["last_read_sequence"], 5);
+        assert_eq!(body["advanced"], true);
+
+        // (b) 上报**更小**的 2 → 成功但无效果, 且回**服务端**值 5 而非请求值
+        let req = actix_web::test::TestRequest::post()
+            .uri(&uri)
+            .insert_header(("Authorization", format!("Bearer {}", f.alice_token)))
+            .set_json(serde_json::json!({"sequence": 2}))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(
+            resp.status(),
+            actix_web::http::StatusCode::OK,
+            "请求更小的 sequence 是幂等成功, 不是错误"
+        );
+        let body: serde_json::Value = actix_web::test::read_body_json(resp).await;
+        assert_eq!(body["advanced"], false);
+        assert_eq!(
+            body["last_read_sequence"], 5,
+            "必须回服务端当前值; 回显请求值(2)会让客户端以为读指针退了"
+        );
+    }
+
+    #[actix_web::test]
+    async fn mark_read_rejects_negative_sequence_with_400() {
+        let Some(p) = e2e_pool().await else { return };
+        let f = rest_fixture(&p).await;
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(f.state.clone())
+                .route("/v1/conversations/{id}/read", web::post().to(mark_read)),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::post()
+            .uri(&format!("/v1/conversations/{}/read", f.conv.0))
+            .insert_header(("Authorization", format!("Bearer {}", f.alice_token)))
+            .set_json(serde_json::json!({"sequence": -1}))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(
+            resp.status(),
+            actix_web::http::StatusCode::BAD_REQUEST,
+            "负 sequence 应 400; 撞 DB 的 CHECK 会变成 500"
+        );
+    }
+
+    #[actix_web::test]
+    async fn mark_read_by_non_member_is_forbidden() {
+        let Some(p) = e2e_pool().await else { return };
+        let f = rest_fixture(&p).await;
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(f.state.clone())
+                .route("/v1/conversations/{id}/read", web::post().to(mark_read)),
+        )
+        .await;
+        let req = actix_web::test::TestRequest::post()
+            .uri(&format!("/v1/conversations/{}/read", f.conv.0))
+            .insert_header(("Authorization", format!("Bearer {}", f.carol_token)))
+            .set_json(serde_json::json!({"sequence": 999}))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::FORBIDDEN);
+    }
+
+    #[actix_web::test]
+    async fn all_action_endpoints_require_authentication() {
+        // 无 Bearer → 401。这条对 4 个端点都成立, 故逐个点一遍 ——
+        // 漏挂 extractor 的端点在单个测试里看不出来。
+        let Some(p) = e2e_pool().await else { return };
+        let f = rest_fixture(&p).await;
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(f.state.clone())
+                .route(
+                    "/v1/conversations/{id}/messages/{msg_id}",
+                    web::patch().to(edit_message),
+                )
+                .route(
+                    "/v1/conversations/{id}/messages/{msg_id}/recall",
+                    web::post().to(recall_message),
+                )
+                .route(
+                    "/v1/conversations/{id}/messages/{msg_id}/reactions",
+                    web::post().to(add_reaction),
+                )
+                .route("/v1/conversations/{id}/read", web::post().to(mark_read)),
+        )
+        .await;
+
+        let paths = [
+            (
+                format!("/v1/conversations/{}/messages/{}", f.conv.0, f.msg.0),
+                true,
+            ),
+            (
+                format!("/v1/conversations/{}/messages/{}/recall", f.conv.0, f.msg.0),
+                false,
+            ),
+            (
+                format!(
+                    "/v1/conversations/{}/messages/{}/reactions",
+                    f.conv.0, f.msg.0
+                ),
+                false,
+            ),
+            (format!("/v1/conversations/{}/read", f.conv.0), false),
+        ];
+        for (uri, is_patch) in paths {
+            let mut b = if is_patch {
+                actix_web::test::TestRequest::patch()
+            } else {
+                actix_web::test::TestRequest::post()
+            };
+            b = b.uri(&uri);
+            if is_patch {
+                b = b.set_json(serde_json::json!({"content": {"kind":"text","text":"x"}}));
+            } else if uri.ends_with("/reactions") {
+                b = b.set_json(serde_json::json!({"emoji": "👍"}));
+            } else if uri.ends_with("/read") {
+                b = b.set_json(serde_json::json!({"sequence": 1}));
+            }
+            let resp = actix_web::test::call_service(&app, b.to_request()).await;
+            assert_eq!(
+                resp.status(),
+                actix_web::http::StatusCode::UNAUTHORIZED,
+                "{uri} 无 Bearer 必须 401"
+            );
+        }
+    }
+
+    #[actix_web::test]
+    async fn conversation_get_hides_metadata_from_non_members() {
+        let Some(p) = e2e_pool().await else { return };
+        let f = rest_fixture(&p).await;
+        let app =
+            actix_web::test::init_service(actix_web::App::new().app_data(f.state.clone()).route(
+                "/v1/conversations/{id}",
+                web::get().to(super::super::conversations::get),
+            ))
+            .await;
+        let uri = format!("/v1/conversations/{}", f.conv.0);
+
+        // 成员 → 200
+        let req = actix_web::test::TestRequest::get()
+            .uri(&uri)
+            .insert_header(("Authorization", format!("Bearer {}", f.alice_token)))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        let body: serde_json::Value = actix_web::test::read_body_json(resp).await;
+        assert_eq!(body["id"], f.conv.0.to_string());
+
+        // 非成员 → 404(不确认该 id 是否存在)
+        let req = actix_web::test::TestRequest::get()
+            .uri(&uri)
+            .insert_header(("Authorization", format!("Bearer {}", f.carol_token)))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(
+            resp.status(),
+            actix_web::http::StatusCode::NOT_FOUND,
+            "非成员读会话详情必须 404"
         );
     }
 }
