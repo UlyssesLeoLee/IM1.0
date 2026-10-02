@@ -924,9 +924,88 @@ typing 是瞬时信号, 客户端没有任何可观测结果依赖它。
 非成员加表情 `Forbidden` **且不留任何行** / 非成员列 reaction `Forbidden` /
 不存在的消息 `MessageNotFound` / 空 emoji 与超长 emoji `Validation`。
 
+### 1.14 4 个消息动作端点此前**只有 WS 帧, REST 侧完全没有** (2026-10-03 已修)
+
+`edit` / `recall` / `react` / `mark_read` 这四项能力在 2026-10-03 之前**只有
+WebSocket 帧**能触达, REST 侧一个端点都没有。这对「商业产品标准」是硬伤:
+服务端 SDK、后台任务、非 WS 客户端(Web / 桌面离线补传)全都够不着 —— 而这
+四项能力**已经**在 service 层实装完毕。
+
+也就是说, 缺的不是「能力」而是「**出口**」: 一个能用的函数, 没有任何非 WS
+路径能调用它。
+
+#### 顺带发现: DetailedDesign **自相矛盾**
+
+`DetailedDesign.md` 的端点→需求映射表逐条写着:
+
+```
+| §5 PATCH  /v1/conversations/{id}/messages/{msg_id}          | 编辑消息   | ... | §7 |
+| §5 POST   /v1/conversations/{id}/messages/{msg_id}/recall   | 撤回       | ... | §7 |
+| §5 POST   /v1/conversations/{id}/messages/{msg_id}/reactions| reaction   | ... | §7 |
+| §5 POST   /v1/conversations/{id}/read                       | 已读回执   | ... | §7 |
+```
+
+—— 明确标注这四个端点属于「**§5**」。但 DetailedDesign §5 的标题是
+「REST API **完整**清单(MVP)」, 其表格里**根本没有**这四个端点。
+
+更广地说, 两份规范对「端点全集」的认知**不同**:
+
+| 规范 | 有 | 无 |
+|---|---|---|
+| `BasicDesign §7` | recall / reactions / read / PATCH edit | friends / media / me |
+| `DetailedDesign §5` | friends(4) / media(2) / me(2) | recall / reactions / read / PATCH edit |
+
+**本 commit 只做两份规范「都指向或其一明确列出」的消息类 4 个** —— 它们的
+意图无歧义(映射表点名 + BasicDesign §7 列出 + service 已就绪)。friends /
+media / me 那 8 个端点**不在范围**: 它们的 service 层大多尚不存在
+(relationship 有仓储但无 service; `/me` 需要一个尚未定义的用户资料读写面),
+硬做只能凭空发明 wire 形状 —— 那正是本项目记了三次的错误形态(§1.6 /
+§1.8.2 / §1.13)。
+
+#### 两条路径共用同一条校验链
+
+四个 handler 全部只做「解析 → 调 service → 映射状态码」, **不重写任何业务
+规则**。仅原 sender / 终态拒绝 / 时间窗 / 成员校验 / 单调不回退全在 service
+里。若 REST 另写一遍, 两条路径迟早漂移, 而漂移的那一侧就是越权漏洞。
+
+#### 三处刻意的设计
+
+- **路径里的 conversation_id 必须与消息实际归属一致**。service 的编辑/撤回
+  只校验「是否原 sender」, **不**校验路径里的会话; 不在 handler 层对齐的话,
+  客户端会拿到「在会话 A 编辑成功」的响应而资源其实在 B —— URL 说谎, 且让
+  按 conversation 做的审计与限流全部错位。不一致返 **404** 而非 403: 后者会
+  顺带确认「该 id 对应的消息存在于别处」。
+- **响应码不自造**: 无规范规定, 故失败一律走 `json_response(code, ..)`,
+  状态码由 `ErrorCode::http_status()` 这个**单一真源**决定(与既有 messages
+  handler 完全一致)。成功侧用 REST 惯例且与实际结果对应:
+  `PATCH` 200 / `recall` 200 / `reactions` **201**(新插入)或 **200**(幂等
+  重放)/ `read` 200。
+- **`/read` 回服务端当前读指针, 不回显请求值**。请求一个更小的 sequence 是
+  **成功但无效果**(aux-08 幂等约定); 回显请求值会让客户端以为读指针退了。
+
+#### 顺带修掉的两个小缺陷
+
+| 位置 | 缺陷 |
+|---|---|
+| `messages.rs` `MessageResponse::from` | `state` 字段用 `serde_json::to_value(..).ok().and_then(as_str).unwrap_or_else(\|\| "sent")` —— 序列化一旦失败, 一条**已撤回**消息会以 `"state":"sent"` 返回, 客户端于是认为它仍可编辑。改用 `MessageState::as_str()`(单一真源, **无失败分支**) |
+| `conversations::get` 内部错误 | 散写的 `.map_err(\|e\| { ... })` 漏了 `tracing::error!`, 500 会变成完全不可诊断的 500(连服务端日志里都没有原因)。抽 `internal_error()` 统一出口 |
+
+#### `GET /v1/conversations/{id}` 从 placeholder 摘下来
+
+此前该路由指向 `placeholder::conv_get`(恒 501), 注释写「out-of-scope」——
+但 `ConversationService::get` 早已实装, 所以这不是「做不了」而是「没人接线」。
+一个**能做的端点**挂着 501, 会让 SDK 按 501 决定降级策略, 比直接 404 更糟。
+
+**成员校验必须在这一层做**: `get()` 只按 id 查, 不管调用方是不是成员; 不校验
+的话, 任何持有 access token 的用户都能凭 id 枚举任意会话的 `metadata`
+(群名、公告等)。非成员返 404(与 `GET /v1/conversations` 把非成员会话排除在
+列表外的语义一致, 且不泄漏「该 id 是否存在」)。
+
 ---
 
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
+
+| 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
 |---|---|---|

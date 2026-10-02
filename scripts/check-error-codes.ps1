@@ -90,7 +90,20 @@ $badUsages = @{}
 foreach ($f in $rustFiles) {
     if ($f.FullName -eq $errorFile) { continue }
     $text = Get-Content $f.FullName -Raw
-    foreach ($m in [regex]::Matches($text, 'ErrorCode::([A-Za-z_]\w*)')) {
+    # `(?!\w)(?!\s*\()` 两个前瞻缺一不可:
+    # - `(?!\w)` 钉住标识符长度。否则 `\w*` 会回溯: 面对 `ErrorCode::http_status()`
+    #   它会交出 `http_statu` 再让 `(?!\s*\()` 看到后面的 `s` 而「成功」——
+    #   结果就是把一个**函数名截断**后报出来, 比原本的误报更费解。
+    # - `(?!\s*\()` 才是本条检查不误报的关键: `ErrorCode::X` 若紧跟 `(` 就是
+    #   **关联函数调用**(`ErrorCode::http_status()` / `ErrorCode::from_str(..)`),
+    #   不是枚举变体引用 —— 变体不可调用, 所以「看起来像变体调用的东西」一定不是
+    #   变体误用, 排除它**不会削弱本检查**(想藏一个不存在的变体引用, 编译器先报错)。
+    #
+    # 2026-10-03 加入: `http::message_actions` 用 `ErrorCode::http_status()`
+    # 取状态码时被误报, 因为初版正则 `ErrorCode::([A-Za-z_]\w*)` 不区分两者。
+    # 同一份语义在 `error_response.rs` 写的是 `code.http_status()`(实例调用),
+    # 所以它一直没触发 —— 误报与否取决于写法而非代码语义, 这是典型的假警报信号。
+    foreach ($m in [regex]::Matches($text, 'ErrorCode::([A-Za-z_]\w*)(?!\w)(?!\s*\()')) {
         $ident = $m.Groups[1].Value
         if (-not $variants.ContainsKey($ident)) {
             $rel = $f.FullName.Substring($repoRoot.Length + 1)

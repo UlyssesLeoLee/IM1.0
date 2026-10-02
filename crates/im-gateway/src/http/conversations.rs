@@ -198,6 +198,70 @@ pub async fn create(
     Ok(HttpResponse::Created().json(resp))
 }
 
+/// GET /v1/conversations/{id}
+///
+/// 2026-10-03 实装。此前该路由指向 `placeholder::conv_get`(恒返 501), 且注释
+/// 写着「out-of-scope」—— 但 `ConversationService::get` 早已实装, 所以这不是
+/// 「做不了」, 是「没人接线」。一个**能做的端点**挂着 501, 会让 SDK 按 501 去
+/// 决定降级策略, 比直接 404 更糟。
+///
+/// **成员校验必须在这里做**: `get()` 只按 id 查, 不管调用方是不是成员。
+/// 不校验的话, 任何持有 access token 的用户都能凭 id 枚举任意会话的
+/// `metadata`(群名、公告等)。
+///
+/// 404 vs 403: 非成员返 403 **会顺带确认该 id 存在**; 而「这个 id 是否存在」
+/// 本身在多租户 IM 里就是信息。`GET /v1/conversations` 已把「非成员的会话」
+/// 排除在列表外, 所以此处返 404 与列表语义一致。
+pub async fn get(
+    app: web::Data<AppState>,
+    auth: AuthedUser,
+    path: web::Path<ConversationId>,
+) -> Result<HttpResponse, actix_web::Error> {
+    let conv = path.into_inner();
+
+    if !app
+        .conversation_service
+        .is_member(conv, auth.user_id)
+        .await
+        .map_err(|e| internal_error(conv, e))?
+    {
+        return Err(json_response(
+            im_common::ErrorCode::NotFound,
+            Some(conv),
+            Some("conversation not found"),
+        ));
+    }
+
+    let c = app
+        .conversation_service
+        .get(conv)
+        .await
+        .map_err(|e| internal_error(conv, e))?
+        .ok_or_else(|| {
+            json_response(
+                im_common::ErrorCode::NotFound,
+                Some(conv),
+                Some("conversation not found"),
+            )
+        })?;
+
+    Ok(HttpResponse::Ok().json(ConversationResponse::from(c)))
+}
+
+/// 内部错误统一出口: **客户端只看到通用文案, 真实原因写服务端日志**
+///
+/// 单独抽一个函数而不是每处 `.map_err(|e| { ... })`: 分散写的时候很容易
+/// 忘了 `tracing::error!`, 那样 500 就变成完全不可诊断的 500 —— 错误原因
+/// 连服务端日志里都没有。这正是本函数存在的唯一理由。
+fn internal_error(conv: ConversationId, e: im_common::AppError) -> actix_web::Error {
+    tracing::error!(error = %e, %conv, "conversation REST call failed");
+    json_response(
+        im_common::ErrorCode::InternalError,
+        Some(conv),
+        Some("internal error"),
+    )
+}
+
 /// GET /v1/conversations?cursor=&limit=
 ///
 /// 当前用户参与的会话列表(per ImplementationSpec §3.1.3)

@@ -421,6 +421,19 @@ impl MessageService {
         self.events.publish(topic, &payload).await
     }
 
+    /// 按 id 查消息 (2026-10-03 新增)
+    ///
+    /// 存在的理由: REST 的消息动作端点(`edit` / `recall` / `reactions`)必须先
+    /// 确认「这条消息确实属于 path 里给的会话」, 否则 URL 会说谎(客户端以为在
+    /// 会话 A 编辑, 资源其实在 B), 且按 conversation 做的审计与限流全部错位。
+    ///
+    /// **不提供 `repo()` 逃生口**: 那样等于把仓储层暴露给 gateway, 业务规则会
+    /// 开始散落到 handler 层 —— 那正是本轮反复在堵的「两条路径漂移」。
+    /// 需要哪条查询就在这里显式加一个方法。
+    pub async fn get(&self, message_id: MessageId) -> Result<Option<Message>, AppError> {
+        self.repo.find_by_id(message_id).await
+    }
+
     /// 按幂等键预查既有消息 (2026-10-03 新增, 供 WS ack 判定 `idempotent_replay`)
     ///
     /// `send_message` 内部遇到重放会返回既有 message, 但**不告诉调用方这是重放**。

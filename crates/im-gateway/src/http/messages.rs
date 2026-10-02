@@ -84,19 +84,33 @@ pub struct MessageResponse {
 }
 
 impl From<Message> for MessageResponse {
+    /// 委托给引用版 —— **两份字段映射必然漂移**
     fn from(m: Message) -> Self {
+        Self::from(&m)
+    }
+}
+
+/// 引用版是**唯一**的字段映射来源
+///
+/// 单独给出 `&Message` 入口是因为消息动作端点(`edit` / `recall`)拿到的是
+/// 借用来的 service 结果, 不该为了转 DTO 而 clone 整条消息。
+impl From<&Message> for MessageResponse {
+    fn from(m: &Message) -> Self {
         Self {
             id: m.id.0,
             conversation_id: m.conversation_id.0,
             sequence: m.sequence,
             sender_id: m.sender_id.map(|u| u.0),
-            kind: m.kind,
-            content: m.content,
+            kind: m.kind.clone(),
+            content: m.content.clone(),
             reply_to: m.reply_to.map(|m| m.0),
-            state: serde_json::to_value(m.state)
-                .ok()
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_else(|| "sent".to_string()),
+            // 直接用 `MessageState::as_str()` —— 单一真源, 且**无失败分支**。
+            // 此前这里是 `serde_json::to_value(m.state).ok().and_then(as_str)
+            // .unwrap_or_else(|| "sent".to_string())`: 一旦序列化失败, 一条
+            // **已撤回**的消息会以 `"state":"sent"` 返回 —— 客户端于是认为它仍
+            // 可编辑。这正是本项目反复在堵的「返回看似合理的假值」形态。
+            // 状态转换的正确性不应取决于「一个 serde 调用成功与否」。
+            state: m.state.as_str().to_string(),
             created_at: m.created_at,
             edited_at: m.edited_at,
         }
