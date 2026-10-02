@@ -31,13 +31,17 @@
 | **#E** | `src/ws/heartbeat.rs:77` `remaining()` / `config()` | 供 driver 在 tick 循环设 wakeup 间隔 / 读超时配置做日志上报; 当前 driver 走固定 30s tick | C-11 driver 接线 |
 | **#F** | `src/ws/heartbeat.rs:101/110/118/125` `PingFrame` / `PongFrame` / `PingPongType` / `into_pong` | C-12 预留的 wire 镜像 | C-11 driver 决定走本 struct 还是 `im_protocol::ws_frames::ClientFrame`, 二选一 |
 | **#G** | `src/ws/session.rs:95/102` `user_id()` / `environment_id()` | 鉴权后身份读取接口; 另有「同 user_id 多租户路由」 | C-11 driver 做 ForceDisconnect / 广播分发时按 user_id 定位 |
-| **#H** | `src/ws/session.rs:104` `tick_heartbeat()` | 心跳 tick 返回 true 表示应主动 close | 30s background task 调用点待 C-11 driver 实装 |
+| **#H** | `src/ws/session.rs:104` `tick_heartbeat()` | 心跳 tick 返回 true 表示应主动 close | ✅ **已结清** (2026-10-03, `d89b88d`): 调用点搬进 `run_ws_loop` 的 `select!`, 超时真正关闭连接 |
 | **#I** | `src/ws/session.rs:129/139` `WsInbound` / `handle_ping()` | C-11 driver 统一入站分派入口 | C-11 driver 实装后接线 |
 
-> #D/#E/#F/#G/#H/#I **全部阻塞在 C-11 (WsSession + actix-ws driver 实装)**。
-> 换句话说这 6 个缺口是同一个上游任务的下游, 接线 C-11 可一次性清掉。
+> #D/#E/#F/**#G**/#H/**#I** 中, **#H 已于 2026-10-03 结清**; 余下 #D/#E/#F/#G/#I
+> 仍全部阻塞在 C-11 (WsSession + actix-ws driver 实装)。换句话说这 5 个剩余缺口
+> 是同一个上游任务的下游, 接线 C-11 可一次性清掉。
 
-### 1.1 #H 的严重性升级: 60s 无帧超时当前**根本不生效** (2026-10-03 复核)
+### 1.1 #H 的严重性升级: 60s 无帧超时**根本不生效** (2026-10-03 复核 → 同日已修)
+
+> **✅ 已于 2026-10-03 修复(`d89b88d`)**。本节保留原始发现过程, 作为
+> 「文档声称的行为没实现」的实例。以下是**修复前**的代码。
 
 复核 `src/ws/handler.rs:113-147` 时发现, #H 不是一个"方法没被调用"的无害缺口,
 而是**行为与文档不符的功能漏洞**:
@@ -70,12 +74,24 @@ async fn run_ws_loop(ws_session: &mut actix_ws::Session, msg_stream: &mut actix_
 60s 无帧超时关闭」—— **文档描述的行为没有实现**。半开连接会一直堆积直到
 TCP 层超时, 属资源泄漏。
 
-**修法方向**(需 C-11 driver 重构, 且**端到端验证依赖 Docker/F-1**):
-让超时信号能到达持有 `Session` 的主循环, 例如后台任务通过
-`tokio::sync::oneshot` / `mpsc` 把超时事件发给主循环, 由主循环在
-`tokio::select!` 中 `msg_stream.next()` 与超时分支之间二选一后 close;
-或把 `interval` 直接搬进 `run_ws_loop`, 用 `select!` 同时等消息与 tick。
-**在此之前不应声称"无帧超时已实现"**。
+**修法**(已实施, `d89b88d`): 采用上面两个方向中的第二个 —— 把 `interval` 直接搬进
+`run_ws_loop`, 用 `tokio::select!` 同时等 `msg_stream.next()` 与 tick; 判超时即
+`force_close()` + return, 由 `ws_handler` 统一走 close handshake。原先那个后台
+task 已删除。`select!` 用 `biased` 让帧优先 —— 客户端持续发帧时 tick 分支不命中是
+正确的(每帧都重置 idle), 只有停发帧时才会落到 tick 分支。
+
+**新增 2 个回归测试**(`im-gateway --bins` 51 passed / 0 failed)锁住该判定。
+
+**仍未覆盖的边界(如实记录)**: 测试验证的是「tick 驱动下超时判定正确」, **不是**
+「连接真的被关闭」。后者需要真实 WS 端到端, 而本仓库当前没有任何 WS 客户端依赖
+(无 `awc` / `tokio-tungstenite`), 且 CI 用 `--locked` 不宜临时加依赖。若要把这条
+端到端补上, 前置条件是: 引入 WS 客户端 dev-dependency + 起 actix test server +
+构造可用的 `AppState`(需 PG)。
+
+**教训(第四次同形)**: 这条 bug 的成因与我三轮前「用 `tokio::time::pause()` 测
+`std::time::Instant` 计时」的失败是同一类 —— **我控制的量与被测对象读的不是同一
+个**。写验证前先问「我推进的时钟 / 解析的范围 / 判断的环境, 是不是生产代码实际
+用的那一套」。
 
 ---
 
