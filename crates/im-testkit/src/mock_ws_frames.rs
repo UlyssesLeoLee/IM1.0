@@ -189,6 +189,9 @@ pub fn ack_success_frame(req_id: Uuid) -> ServerFrame {
             sequence: Some(42),
             idempotent_replay: false,
         }),
+        // 2026-10-03: `ServerFrame::Ack` 新增 `error` 载荷(per aux-13 §1.2.4,
+        // 见 docs/gap-ledger.md §1.7.3)。成功时恒为 None。
+        error: None,
     }
 }
 
@@ -231,6 +234,22 @@ pub fn ack_error_json() -> Value {
             "trace_id": "tr_01HXY...",
         },
     })
+}
+
+/// §1.2.4 `ack` 真错误 —— 强类型版
+///
+/// 2026-10-03 新增。此前本文件只有 `ack_error_json()`(JSON Value)版, 而
+/// `ServerFrame::Ack` 挂不了 error 载荷, 强类型路径无从表达 —— 这也是
+/// im-gateway 当时另造顶层 `{"type":"error",...}` 帧的直接原因(见
+/// docs/gap-ledger.md §1.7.3)。现 `Ack` 有了 `error` 字段, 补齐强类型版,
+/// 本文件不再需要「JSON Value 兜底强类型」的平行结构。
+pub fn ack_error_frame(req_id: Uuid, code: &str, message: &str) -> ServerFrame {
+    ServerFrame::Ack {
+        req_id,
+        ok: false,
+        data: None,
+        error: Some(ErrorBody::new(code, message, "tr_01HXY")),
+    }
 }
 
 /// §1.2.5 `message_new` —— 强类型版

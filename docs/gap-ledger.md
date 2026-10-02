@@ -355,6 +355,115 @@ UTF-8 BOM、通过 `scripts/lint-ps1-encoding.ps1`。
 该启发式不可用。已从脚本中移除, 并在脚本头部与本文档同时注明**保留人工
 review**, 不假装已覆盖。
 
+### 1.7 WS 清扫: 凭空造的 device_session_id + 业务帧丢失 req_id (2026-10-03)
+
+顺着 §1.6 继续清 `ws/handler.rs`, 又发现三个问题。
+
+#### 1.7.1 `handle_auth` 凭空生成 device_session_id (安全)
+
+```rust
+// 注释: 「当前用 nil placeholder」
+let device_session_id = DeviceSessionId::new();   // 实际: 随机 UUID
+```
+
+`device_sessions` 表里**没有**这一行。该值经 `mark_authenticated` 存进
+`WsSession.device_session_id`, 于是每个 WS 会话都持有一个**永远匹配不上任何
+真实会话**的 id —— 将来任何「按 device session 强制下线」的逻辑都会指向一个
+不存在的对象, **而且不会报错**。
+
+**注释比代码更危险**: 写的是「nil placeholder」, 而代码生成的是随机 UUID。
+`Uuid::nil()` 一眼看出是假的; 随机 UUID 看着完全正常。**一个占位实现如果
+返回了「看起来真的」的值, 就会把未实装伪装成已实装。**
+
+修法: 读 `dsid` claim(§1.5 刚加的)。缺失时**拒绝**而非编造 —— WS 是长连接,
+一个无法被吊销的鉴权通道正是 §1.5 关掉的那个缺口。缺 dsid 的 token 是该字段
+加入前签发的, 有效期 ≤15min, 重新登录即可。
+
+#### 1.7.2 业务帧失败响应丢失 req_id (协议)
+
+6 类业务帧(`SendMessage` / `EditMessage` / `RecallMessage` / `React` /
+`MarkRead` / `Typing`)走的是 `Ok(_) => send_error(..., None)` —— **不传
+req_id**。aux-13 §1.2.4 规定 error 帧带 `req_id`, 客户端据此把失败响应关联
+回自己的请求; 不传的话, 同一连接上并发多个请求时**客户端无法知道是哪一个
+失败了**。
+
+**顺带把 `Ok(_)` 换成显式 or-pattern**(6 个变体全列出), 两个收益:
+
+1. 能取到 `req_id` 并回传
+2. match 变**穷尽** —— 未来给 `ClientFrame` 加变体会在此**编译报错**,
+   而不会被静默吞掉。ping 漏洞(§1.2)就是这么藏的: `ClientFrame::Ping`
+   解析完全成功, 却落进了 `Ok(_)`。
+
+#### 1.7.3 `ServerFrame::Ack` 表达不了「失败」(协议) —— 已修
+
+aux-13 §1.2.4 规定失败响应形状为
+
+```json
+{"type":"ack","req_id":"...","ok":false,"error":{"code":"...","message":"...","trace_id":"..."}}
+```
+
+但 `im_protocol::ServerFrame::Ack` 原本只有 `{ req_id, ok, data }` —— **有
+`ok: bool` 却没有 error 载荷**, 根本表达不了这个形状。这正是当初另造一个
+顶层 `{"type":"error", ...}` 帧类型(`WsErrorFrame`)的原因: 实现偏离了自己的
+规范形状。
+
+**一度判成「需规范所有者拍板, 不擅改」—— 那个判断下重了, 已被后续证据推翻。**
+
+推翻它的证据在 `im-testkit/src/mock_ws_frames.rs`: 该文件**已经在发规范形状**
+(`ack_error_json()` 返回 `{"type":"ack", req_id, ok:false, error:{code,message,trace_id}}`),
+而它的文件头明写「**强依赖 im-protocol, 避免另建平行结构**」。也就是说:
+
+1. 规范要求这个形状
+2. 项目自己的 testkit 已经在按这个形状造数据
+3. **只有** `im-protocol` 的类型表达不了 —— 它是三者中唯一偏离的
+
+这不是「要不要改协议」, 而是**实现去对齐自己的规范和自己的 testkit**,
+方向无歧义。`ImplementationSpec` 的 `[PROTOCOL-FROZEN]` 在这里不构成阻碍:
+冻结的是协议内容, 而这次改动是让实现回到被冻结的内容。
+
+修法:
+
+1. `ServerFrame::Ack` 新增 `error: Option<ErrorBody>`
+   (`#[serde(default, skip_serializing_if = "Option::is_none")]` —— 旧成功
+   ack 仍可解析)
+2. im-gateway `send_error` 改发 `ServerFrame::Ack { ok:false, error:Some(..) }`,
+   **删除** `WsErrorFrame` struct。客户端不必再同时处理 `error` 与 `ack(ok=false)`
+   两种错误帧
+3. im-testkit 补齐缺失的强类型 `ack_error_frame()`, 消除「JSON Value 兜底
+   强类型」的平行结构
+4. 构造逻辑抽成纯函数 `error_ack_frame()`, **线上与测试共用同一条路径** ——
+   否则测试会验证一个线上并不产生的形状, 那正是本轮反复在堵的那类错
+
+`req_id = None`(非法 JSON / binary 帧 / continuation 帧等协议级错误,
+解析不出请求)统一用 `Uuid::nil()` 占位, 表示「无可关联的请求」。
+
+**编译器替我们抓到 3 处构造点**(im-testkit 1、im-protocol 测试 1、以及
+编译期即暴露的 `ServerFrame::Ack` 初始化), 逐处补齐 —— 字段变更的真实影响
+范围由编译器给出, 不靠估计。
+
+
+#### 新增测试 (3 个)
+
+| 测试 | 锁住的事实 |
+|---|---|
+| `ws_auth_returns_the_dsid_carried_by_the_token` | 返回的必须是 **token 里那个** dsid, 不是某个合法 UUID |
+| `ws_auth_rejects_token_without_dsid` | 缺 dsid **拒绝**放行, 不编造 |
+| `business_frame_error_frame_carries_req_id` | error 帧回传 req_id |
+
+**变异测试(两轮, 均确认有判别力)**:
+
+1. `unwrap_or_else(DeviceSessionId::new)`(仅 dsid 缺失时才造)→
+   只有 `ws_auth_rejects_token_without_dsid` 变红
+2. `let device_session_id = DeviceSessionId::new();`(原 bug 形态, 总是造)→
+   **两个都变红**, 失败信息直接打出两个不同 UUID
+   (`left: DeviceSessionId(f8038613-…)` vs `right: DeviceSessionId(037559d9-…)`),
+   证明它比的是**真实值**而不是「有没有 id」
+
+**共性**: 1.7.1 与 §1.2(ping 漏洞)是同一处藏东西的形态 ——
+**`Ok(_)` 兜底与「返回看似合理的假值」都是把未实装伪装成已实装的手段**,
+且两者都不会让任何现有测试失败。
+
+
 
 
 
@@ -369,6 +478,8 @@ review**, 不假装已覆盖。
 | ~~`crates/im-core/src/identity/service.rs` `server_secrets`~~ | ~~S2S token exchange 要按 environment 取 secret, 接线未完成~~ | ✅ **已接线** (2026-10-03): 被 `IdentityService::verify_server_signature` 真正使用, 见 §1.3 |
 | `crates/im-gateway/src/http/auth_handlers.rs` `token_exchange` **nonce 防重放** | 协议有 `X-IM-Nonce`, 但服务端**未校验也未记录** —— 同一合法请求可在 ±300s 窗口内重放 | 需跨实例共享存储 → **WBS D-4 (Valkey)** 落地后接 |
 | `crates/im-gateway/src/placeholder.rs` (整文件) | 10 个端点桩函数未被调用 | 该文件唯一职责就是存放未接线桩; 各端点随对应 WBS 项落地 |
+| ~~`im_protocol::ServerFrame::Ack` **缺 error 载荷**~~ | ~~规范 (aux-13 §1.2.4) 规定的失败形状表达不了, 实现因此另造顶层 `{"type":"error",...}` 帧~~ | ✅ **已修复** (2026-10-03): `Ack` 补 `error: Option<ErrorBody>`, im-gateway 改发规范形状并删除 `WsErrorFrame`, im-testkit 补齐强类型版。见 §1.7.3 |
+| `im_protocol::ServerFrame` **缺 `message_new` 变体** | `ws_frames.rs` 模块文档称「aux-13 §1.2 服务端 11 类」, 实际枚举只有 9 个变体; aux-13 §1.2.5 定义的 `message_new`(新消息广播)**无对应变体** | 随 C-9 业务帧实装一并补; 需确认 wire 形状(`WireMessage` 已存在但未挂在 `ServerFrame` 上) |
 
 ---
 

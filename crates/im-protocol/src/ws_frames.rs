@@ -65,6 +65,17 @@ pub enum ServerFrame {
         ok: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         data: Option<AckData>,
+        /// 失败时的错误载荷(per aux-13 §1.2.4)
+        ///
+        /// 2026-10-03 新增。此前本变体只有 `ok: bool` 却**挂不了错误内容** ——
+        /// `ok=false` 表达不出 aux-13 §1.2.4 规定的形状, 导致 im-gateway 只好
+        /// 另造一个顶层 `{"type":"error",...}` 帧(`WsErrorFrame`), 与规范不一致。
+        /// 证据见 docs/gap-ledger.md §1.7.3。
+        ///
+        /// 语义: `ok=true` 时为 `None`; `ok=false` 时应为 `Some`。
+        /// 本字段不强制该不变量(serde 无法表达), 由构造方保证。
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<crate::error_body::ErrorBody>,
     },
     /// 消息被编辑
     MessageEdited {
@@ -172,6 +183,9 @@ mod tests {
                 sequence: Some(42),
                 idempotent_replay: true,
             }),
+            // aux-03 §B: IDEMPOTENCY_CONFLICT 在 WS 路径以**成功**形式返回
+            // (ok=true + idempotent_replay=true), 故 error 恒为 None。
+            error: None,
         };
         let s = serde_json::to_string(&frame).unwrap();
         assert!(s.contains("\"idempotent_replay\":true"));
@@ -190,5 +204,66 @@ mod tests {
         let s = serde_json::to_string(&frame).unwrap();
         assert!(s.contains("\"type\":\"send_message\""));
         assert!(s.contains("\"text\":\"hi\""));
+    }
+
+    // -------- ack 失败形状 (2026-10-03, 见 gap-ledger §1.7.3) --------
+
+    #[test]
+    fn server_frame_ack_failure_carries_error_payload() {
+        // aux-13 §1.2.4 规定的失败形状:
+        //   {"type":"ack","req_id":...,"ok":false,"error":{code,message,trace_id}}
+        //
+        // 此前 `ServerFrame::Ack` 只有 `ok: bool`, 表达不了这个形状 —— 这正是
+        // im-gateway 另造顶层 `{"type":"error",...}` 帧的原因。
+        let req_id = Uuid::new_v4();
+        let frame = ServerFrame::Ack {
+            req_id,
+            ok: false,
+            data: None,
+            error: Some(crate::error_body::ErrorBody::new(
+                "RATE_LIMITED",
+                "auth.rate_limit.send_message",
+                "tr_01HXY",
+            )),
+        };
+        let s = serde_json::to_string(&frame).unwrap();
+        assert!(s.contains("\"type\":\"ack\""), "失败响应仍是 ack 帧: {s}");
+        assert!(s.contains("\"ok\":false"));
+        assert!(s.contains(&format!("\"req_id\":\"{req_id}\"")));
+        assert!(s.contains("\"code\":\"RATE_LIMITED\""));
+        assert!(s.contains("\"message\":\"auth.rate_limit.send_message\""));
+        assert!(s.contains("\"trace_id\":\"tr_01HXY\""));
+    }
+
+    #[test]
+    fn server_frame_ack_success_omits_error_field() {
+        // 成功帧不该带 error 字段(与 data / error 互斥)
+        let s = serde_json::to_string(&ServerFrame::Ack {
+            req_id: Uuid::new_v4(),
+            ok: true,
+            data: Some(AckData {
+                message_id: Some(Uuid::new_v4()),
+                sequence: Some(1),
+                idempotent_replay: false,
+            }),
+            error: None,
+        })
+        .unwrap();
+        assert!(s.contains("\"ok\":true"));
+        assert!(!s.contains("\"error\""), "成功帧不应含 error: {s}");
+    }
+
+    #[test]
+    fn legacy_ack_without_error_field_still_deserializes() {
+        // `#[serde(default)]` 保证本字段加入前签发的成功 ack 仍能解析
+        let json = r#"{"type":"ack","req_id":"22222222-2222-4222-8222-222222222222","ok":true,"data":{"message_id":"22222222-2222-4222-8222-222222222222","sequence":42}}"#;
+        let f: ServerFrame = serde_json::from_str(json).expect("旧 ack 帧应仍可解析");
+        match f {
+            ServerFrame::Ack { ok, error, .. } => {
+                assert!(ok);
+                assert!(error.is_none());
+            }
+            _ => panic!("应解析为 Ack"),
+        }
     }
 }

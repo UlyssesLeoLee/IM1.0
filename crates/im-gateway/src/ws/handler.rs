@@ -94,25 +94,29 @@ enum AuthFrame {
     },
 }
 
-/// WS 错误响应帧 (per aux-13 §4 错误码格式)
-#[derive(Debug, Clone, serde::Serialize)]
-struct WsErrorFrame {
-    #[serde(rename = "type")]
-    ty: &'static str,
-    code: String,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    req_id: Option<Uuid>,
-}
-
-impl WsErrorFrame {
-    fn from_app_error(code: im_common::ErrorCode, message: &str, req_id: Option<Uuid>) -> Self {
-        Self {
-            ty: "error",
-            code: code.as_str().to_string(),
-            message: message.to_string(),
-            req_id,
-        }
+/// 构造 aux-13 §1.2.4 形状的失败响应帧
+///
+/// **纯函数, 无 IO** —— `send_error`(线上) 与测试断言**共用这一条路径**。
+/// 此前本文件有一个 `WsErrorFrame` struct 专供 `send_error` 使用, 另有一个
+/// 测试直接断言它; 若保留两份构造逻辑, 测试就会验证一个线上并不产生的形状 ——
+/// 那正是本轮反复在堵的那类错(验证对象与被测对象不同源)。现只保留这一个。
+///
+/// 2026-10-03: 此前发的是**另造**的顶层 `{"type":"error", code, message, req_id}`
+/// 帧, 与规范形状不一致。根因是 `ServerFrame::Ack` 只有 `ok: bool` 却挂不了
+/// 错误载荷。现已给 `ServerFrame::Ack` 补 `error` 字段(见 gap-ledger §1.7.3)。
+///
+/// `req_id = None`(非法 JSON / binary 帧 / continuation 帧等协议级错误, 解析不出
+/// 请求)统一用 `Uuid::nil()` 占位, 表示「无可关联的请求」。
+fn error_ack_frame(code: im_common::ErrorCode, message: &str, req_id: Option<Uuid>) -> ServerFrame {
+    ServerFrame::Ack {
+        req_id: req_id.unwrap_or_else(Uuid::nil),
+        ok: false,
+        data: None,
+        error: Some(im_protocol::error_body::ErrorBody::new(
+            code.as_str(),
+            message,
+            "",
+        )),
     }
 }
 
@@ -340,10 +344,25 @@ async fn run_ws_loop(
                             }
                         }
                     }
-                    Ok(_) => {
-                        // 业务帧 (SendMessage / Edit / Recall / React / MarkRead / Typing):
-                        // 留 C-9 + 后续 lane。
-                        //
+                    // 6 类业务帧**逐一列出**, 不用 `Ok(_)` 兜底。两个理由:
+                    //
+                    // (1) req_id 必须回传。aux-13 §1.2.4 规定 error 帧带 req_id,
+                    //     客户端据此把失败响应关联回自己的请求。此前这里传 `None`,
+                    //     客户端拿到一个「无主」的错误帧 —— 同一连接上并发多个
+                    //     请求时无法知道是哪一个失败了。
+                    //
+                    // (2) 显式 or-pattern 让本 match 变**穷尽**: 未来给
+                    //     `ClientFrame` 加变体会在此处编译报错, 而不会被 `Ok(_)`
+                    //     静默吞掉。ping 漏洞(gap-ledger §1.2)就是这么藏的 ——
+                    //     `ClientFrame::Ping` 解析成功, 却落进了 `Ok(_)`。
+                    Ok(
+                        ClientFrame::SendMessage { req_id, .. }
+                        | ClientFrame::EditMessage { req_id, .. }
+                        | ClientFrame::RecallMessage { req_id, .. }
+                        | ClientFrame::React { req_id, .. }
+                        | ClientFrame::MarkRead { req_id, .. }
+                        | ClientFrame::Typing { req_id, .. },
+                    ) => {
                         // 2026-10-03 更正: 本注释原写「当前返 UNSUPPORTED_OPERATION」——
                         // **该错误码不存在**。aux-03 §B(MVP 错误码唯一权威表)的 21 个
                         // 已注册码里没有它, 也没有 501。实际返回的是
@@ -358,7 +377,7 @@ async fn run_ws_loop(
                             ws_session,
                             im_common::ErrorCode::ValidationError,
                             "business frame handler not implemented in MVP (per 138 §C-9)",
-                            None,
+                            Some(req_id),
                         )
                         .await;
                     }
@@ -432,22 +451,42 @@ async fn handle_auth(
         .parse()
         .map_err(|_| AppError::Unauthorized("invalid env in claims".into()))?;
 
-    // 已知缺口: TokenClaims 暂不携带 device_session_id (per 138 §8 缺口 #2)
-    // 当前用 nil placeholder; V1 实装 dsid JWT claim
-    let device_session_id = DeviceSessionId::new();
+    // 2026-10-03 修复(此前是个**看起来像真的**假值):
+    // 此前这里写 `let device_session_id = DeviceSessionId::new();` —— 凭空生成
+    // 一个随机 UUID, 而 `device_sessions` 表里**没有对应行**。该值随后经
+    // `mark_authenticated` 存进 `WsSession.device_session_id`, 于是 WS 会话
+    // 持有一个永远匹配不上任何真实会话的 id: 将来任何「按 device session 强制
+    // 下线」的逻辑都会指向一个不存在的对象, 且**不会报错**。
+    //
+    // 注释写的是「当前用 nil placeholder」, 但代码生成的是随机 UUID —— 注释
+    // 反而**掩盖了**危险: `Uuid::nil()` 一眼看出是假的, 随机 UUID 看着正常。
+    //
+    // 现读 `dsid` claim(见 gap-ledger §1.5, C-7 logout 实装时加入 TokenClaims)。
+    // 缺失时**拒绝**而非编造: WS 是长连接, 一个无法被吊销的鉴权通道正是
+    // §1.5 关掉的那个安全缺口。缺 dsid 的 token 是 dsid 字段加入前签发的,
+    // 有效期 ≤15min, 让客户端重新登录即可。
+    let device_session_id: DeviceSessionId = claims
+        .dsid
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| {
+            AppError::Unauthorized(
+                "access token carries no device session (dsid); re-authenticate".into(),
+            )
+        })?;
 
     Ok((user_id, environment_id, device_session_id))
 }
 
-/// 通过 WS 发错误帧 (per aux-13 §4 错误码格式)
+/// 通过 WS 发错误帧 (per aux-13 §1.2.4)
 async fn send_error(
     session: &mut actix_ws::Session,
     code: im_common::ErrorCode,
     message: &str,
     req_id: Option<Uuid>,
 ) {
-    let frame = WsErrorFrame::from_app_error(code, message, req_id);
-    let body = serde_json::to_string(&frame).unwrap_or_else(|_| "{}".to_string());
+    let body = serde_json::to_string(&error_ack_frame(code, message, req_id))
+        .unwrap_or_else(|_| "{}".into());
     if let Err(e) = session.text(body).await {
         tracing::warn!(error = ?e, "ws send error failed");
     }
@@ -515,29 +554,46 @@ mod tests {
 
     #[test]
     fn ws_error_frame_serialization() {
-        let frame = WsErrorFrame {
-            ty: "error",
-            code: "UNAUTHORIZED".into(),
-            message: "auth failed: invalid token".into(),
-            req_id: Some(Uuid::new_v4()),
-        };
-        let s = serde_json::to_string(&frame).unwrap();
-        assert!(s.contains("\"type\":\"error\""));
-        assert!(s.contains("\"code\":\"UNAUTHORIZED\""));
+        // 走 `error_ack_frame` —— 与 `send_error` 线上路径同一个构造函数,
+        // 断言的是真实 wire 形状(aux-13 §1.2.4)。
+        let req_id = Uuid::new_v4();
+        let s = serde_json::to_string(&error_ack_frame(
+            im_common::ErrorCode::Unauthorized,
+            "auth failed: invalid token",
+            Some(req_id),
+        ))
+        .unwrap();
+        assert!(
+            s.contains("\"type\":\"ack\""),
+            "必须是 ack 帧, 非另造的 error 帧: {s}"
+        );
+        assert!(s.contains("\"ok\":false"), "失败响应 ok 必须为 false: {s}");
+        assert!(
+            s.contains("\"code\":\"UNAUTHORIZED\""),
+            "code 应嵌在 error 里: {s}"
+        );
         assert!(s.contains("\"message\":\"auth failed: invalid token\""));
-        assert!(s.contains("\"req_id\":"));
+        assert!(
+            s.contains(&format!("\"req_id\":\"{req_id}\"")),
+            "必须回传 req_id: {s}"
+        );
     }
 
     #[test]
-    fn ws_error_frame_without_req_id_omits_field() {
-        let frame = WsErrorFrame {
-            ty: "error",
-            code: "VALIDATION_ERROR".into(),
-            message: "bad".into(),
-            req_id: None,
-        };
-        let s = serde_json::to_string(&frame).unwrap();
-        assert!(!s.contains("req_id"), "缺 req_id 时不序列化: {s}");
+    fn ws_error_frame_without_req_id_uses_nil_sentinel() {
+        // 协议级错误(非法 JSON / binary 帧等)解析不出 req_id, 统一用
+        // `Uuid::nil()` 表示「无可关联的请求」—— 而不是省略字段。
+        let s = serde_json::to_string(&error_ack_frame(
+            im_common::ErrorCode::ValidationError,
+            "bad",
+            None,
+        ))
+        .unwrap();
+        assert!(s.contains("\"req_id\""), "req_id 字段恒在: {s}");
+        assert!(
+            s.contains("00000000-0000-0000-0000-000000000000"),
+            "无 req_id 时应为 nil UUID: {s}"
+        );
     }
 
     #[test]
@@ -705,5 +761,160 @@ mod tests {
             serde_json::from_str(r#"{"type":"ping","ts":1}"#).expect("ping 可解析");
         let is_ping = matches!(parsed, ClientFrame::Ping { .. });
         assert!(is_ping, "ping 必须匹配到 Ping 变体, 而非被业务帧分支吞掉");
+    }
+
+    // ========================================================================
+    // WS Auth 帧的 device_session_id (2026-10-03 修复"凭空造 id")
+    // ========================================================================
+
+    fn ts() -> Arc<TokenService> {
+        Arc::new(im_core::identity::token::TokenService::new(
+            vec![im_core::identity::token::SigningKey {
+                kid: "v1".into(),
+                key: secrecy::SecretString::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".into(),
+                ),
+            }],
+            chrono::Duration::seconds(900),
+            secrecy::SecretString::new("pepper".into()),
+        ))
+    }
+
+    fn ws_user() -> im_core::identity::repository::User {
+        im_core::identity::repository::User {
+            id: UserId::new(),
+            environment_id: EnvironmentId::new(),
+            kind: im_core::identity::repository::UserKind::User,
+            external_identity: None,
+            state: im_core::identity::repository::UserState::Active,
+            display_name: Some("ws".into()),
+            username: None,
+            password_hash: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_auth_returns_the_dsid_carried_by_the_token() {
+        // 关键: 返回的必须是 **token 里那个** dsid。此前实现返回
+        // `DeviceSessionId::new()` —— 随机 UUID, 库里没有对应行, 且不报错。
+        let svc = ts();
+        let user = ws_user();
+        let real_dsid = DeviceSessionId::new();
+        let token = svc
+            .issue_access_token_for_session(&user, Some(real_dsid))
+            .unwrap();
+
+        let (_uid, _env, got) = handle_auth(
+            &scaled_session(Duration::from_secs(30), Duration::from_secs(60)),
+            &token.0,
+            &svc,
+        )
+        .await
+        .expect("带 dsid 的 token 应通过 WS 鉴权");
+
+        assert_eq!(
+            got, real_dsid,
+            "handle_auth 必须返回 token 携带的 dsid, 不能凭空造一个"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_auth_rejects_token_without_dsid() {
+        // 缺 dsid 时**拒绝**, 不编造 —— WS 是长连接, 无法吊销的鉴权通道
+        // 正是 gap-ledger §1.5 关掉的那个安全缺口。
+        let svc = ts();
+        let token = svc.issue_access_token(&ws_user()).unwrap();
+
+        let r = handle_auth(
+            &scaled_session(Duration::from_secs(30), Duration::from_secs(60)),
+            &token.0,
+            &svc,
+        )
+        .await;
+        assert!(
+            r.is_err(),
+            "无 dsid 的 token 不该被放行, 更不该拿到一个编造的 session id"
+        );
+    }
+
+    #[test]
+    fn business_frame_error_frame_carries_req_id() {
+        // aux-13 §1.2.4: 失败响应带 req_id, 客户端据此关联回自己的请求。
+        // 此前业务帧分支传 `None`, 客户端拿到「无主」错误帧。
+        let req_id = Uuid::new_v4();
+        let s = serde_json::to_string(&error_ack_frame(
+            im_common::ErrorCode::ValidationError,
+            "business frame handler not implemented in MVP (per 138 §C-9)",
+            Some(req_id),
+        ))
+        .unwrap();
+        assert!(
+            s.contains(&format!("\"req_id\":\"{req_id}\"")),
+            "错误帧必须回传 req_id, 实际: {s}"
+        );
+    }
+
+    #[test]
+    fn every_client_frame_variant_is_routed_to_an_explicit_arm() {
+        // 锁住「没有 `Ok(_)` 兜底」这一事实: 8 个客户端帧变体必须各有归属,
+        // 而不是全部落进 catch-all。ping 漏洞(gap-ledger §1.2)就是这么藏的 ——
+        // `ClientFrame::Ping` 解析完全成功却落进 `Ok(_)`, 客户端永远收不到 pong。
+        let samples: Vec<(&str, serde_json::Value)> = vec![
+            (
+                // 注意: 首帧走 handler 自己的 `AuthFrame`(req_id 可选), 后续帧走
+                // `ClientFrame::Auth`(req_id 必填) —— 两个类型形状不同, 样例按
+                // 后者给全。
+                "auth",
+                serde_json::json!({"type":"auth","req_id":"11111111-1111-4111-8111-111111111111","access_token":"t"}),
+            ),
+            (
+                "send_message",
+                serde_json::json!({"type":"send_message","req_id":"22222222-2222-4222-8222-222222222222","conversation_id":"22222222-2222-4222-8222-222222222222","idempotency_key":"22222222-2222-4222-8222-222222222222","kind":"text","content":{"kind":"text","text":"hi"}}),
+            ),
+            (
+                "edit_message",
+                serde_json::json!({"type":"edit_message","req_id":"22222222-2222-4222-8222-222222222222","message_id":"22222222-2222-4222-8222-222222222222","content":{"kind":"text","text":"hi"}}),
+            ),
+            (
+                "recall_message",
+                serde_json::json!({"type":"recall_message","req_id":"22222222-2222-4222-8222-222222222222","message_id":"22222222-2222-4222-8222-222222222222"}),
+            ),
+            (
+                "react",
+                serde_json::json!({"type":"react","req_id":"22222222-2222-4222-8222-222222222222","message_id":"22222222-2222-4222-8222-222222222222","emoji":"👍"}),
+            ),
+            (
+                "mark_read",
+                serde_json::json!({"type":"mark_read","req_id":"22222222-2222-4222-8222-222222222222","conversation_id":"22222222-2222-4222-8222-222222222222","sequence":1}),
+            ),
+            (
+                "typing",
+                serde_json::json!({"type":"typing","req_id":"22222222-2222-4222-8222-222222222222","conversation_id":"22222222-2222-4222-8222-222222222222"}),
+            ),
+            ("ping", serde_json::json!({"type":"ping","ts":1})),
+        ];
+        assert_eq!(samples.len(), 8, "ClientFrame 应有 8 个变体");
+
+        for (name, v) in samples {
+            let parsed: ClientFrame =
+                serde_json::from_value(v).unwrap_or_else(|e| panic!("{name} 应可解析: {e}"));
+            // 关键: Ping / Auth 走各自专属分支, 其余 6 个业务帧走显式 or-pattern
+            // (都绑定 req_id), 即不存在「不知道落到哪」的变体。
+            let classified = match parsed {
+                ClientFrame::Auth { .. } => "auth",
+                ClientFrame::Ping { .. } => "ping",
+                ClientFrame::SendMessage { .. }
+                | ClientFrame::EditMessage { .. }
+                | ClientFrame::RecallMessage { .. }
+                | ClientFrame::React { .. }
+                | ClientFrame::MarkRead { .. }
+                | ClientFrame::Typing { .. } => "business",
+            };
+            assert!(
+                matches!(classified, "auth" | "ping" | "business"),
+                "{name} 未被任何显式分支覆盖"
+            );
+        }
     }
 }
