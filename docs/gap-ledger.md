@@ -181,6 +181,49 @@ B 环境**; `crypto.rs`: 恒定时间比较与普通 `==` 行为一致。
 读到注释就相信了它」。它和 §1.1/§1.2 的两个 WS 缺陷是同一族 —— **注释/文档里的
 断言必须由代码验证, 不能由注释自证**。三处都是「文档声称有, 代码里没有」。
 
+### 1.4 §1.3 的验证盲区: 只测 service 层证明不了 handler 调了验签 (2026-10-03)
+
+§1.3 修完后补的 9 个测试**全部落在 service 层**(`IdentityService::verify_server_signature`)。
+但原漏洞的形态是「**handler 压根没调用**它」—— service 层测得再全, 也证明不了
+handler 接了线。handler 可以明天再次忘记调用, 而 9 个测试全绿。
+
+补 2 个 **handler 层端到端测试**(`auth_handlers.rs` 的 `mod tests`), 用
+`actix_web::test::init_service` 发**真实 HTTP 请求**:
+
+- `token_exchange_without_valid_signature_returns_401_and_creates_nothing` ——
+  无签名 / 错签名 / 过期时间戳三种请求均 401, 且断言
+  `users` 表中该 `external_uid` 计数为 **0**(验签失败不得留下任何痕迹)
+- `token_exchange_with_valid_signature_returns_200` —— 正确签名换出非空
+  `access_token` + `refresh_token`, 且库中恰好 1 个 user
+
+因 `AppState.identity_service` 的类型写死为
+`IdentityService<PgUserRepository, PgDeviceSessionRepository>`, 这 2 个用例**必须连
+真 PG**; 未设 `DATABASE_URL` 时跳过(CI 无 PG)。
+
+#### 变异测试: 这 2 个测试确实抓得住回归(不能只看它变绿)
+
+「绿」本身不是证据 —— 跳过分支也可能让测试空跑通过。故把 handler 的验签调用
+**整段摘掉**(等于把漏洞装回去)再跑:
+
+| 用例 | 摘掉验签后 | 结论 |
+|---|---|---|
+| `..._401_and_creates_nothing` | **FAILED** — `left: 200, right: 401` | 无签名请求真的换出了 token, 与原漏洞现象一致 |
+| `..._valid_signature_returns_200` | **FAILED** — `left: 2, right: 1` | 确实打到了真 PG 并读到了真实行数 |
+
+两个失败互为佐证: 后者能报出**具体的库内计数**, 顺带证明这组用例不是空跑。
+
+#### 变异过程中发现并修掉的测试自身缺陷
+
+第二个用例原本把 `external_uid` 写死为 `e2e-valid-uid`。变异跑完还原后再跑一次,
+它就会因为**上一轮已落库**而报 `count == 2` 失败 —— 即该用例**不可重入**,
+在持久化 DB 上第二次跑必然假失败。已改为每次运行拼 `Uuid::new_v4()` 前缀,
+并连跑两次验证 `ok, ok`。
+
+**教训(与本文件其余条目同源)**: 「测试通过」和「测试有判别力」是两件事。
+判别力只能靠**故意注入缺陷**来证明, 不能靠绿灯推断; 而注入缺陷的过程本身
+会暴露测试自身的不可重入等缺陷。
+
+
 ---
 
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
