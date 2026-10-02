@@ -77,6 +77,15 @@ pub enum ServerFrame {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<crate::error_body::ErrorBody>,
     },
+    /// 新消息广播 (per aux-13 §1.2.5)
+    ///
+    /// 2026-10-03 新增。此前本枚举**没有**这个变体, 而 `ws_frames` 模块文档
+    /// 声称「aux-13 §1.2 服务端 11 类」—— 缺的就是它。后果: 即便
+    /// `send_message` 实装成功, 其它客户端**收不到任何广播**, WS 端点等于
+    /// 只能对发起方自己说话。`im-testkit/src/mock_ws_frames.rs:238` 当时已
+    /// 记录了这个缺口(「ServerFrame::MessageNew 在 im-protocol 当前未实装」),
+    /// 靠 JSON Value 绕道。
+    MessageNew { message: WireMessage },
     /// 消息被编辑
     MessageEdited {
         message_id: Uuid,

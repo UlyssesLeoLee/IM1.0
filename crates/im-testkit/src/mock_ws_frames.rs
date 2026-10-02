@@ -253,24 +253,53 @@ pub fn ack_error_frame(req_id: Uuid, code: &str, message: &str) -> ServerFrame {
 }
 
 /// §1.2.5 `message_new` —— 强类型版
+///
+/// 2026-10-03 修正。此前本函数**名不副实**: 它返回的是 `ServerFrame::MessageEdited`,
+/// 注释写「`MessageNew` 在 im-protocol 未实现, 故用占位」。当时确实没实现,
+/// 但结果是: 任何调用 `message_new_frame()` 并断言「这是 message_new 帧」的测试
+/// 都会拿到 `message_edited` —— 这正是「验证对象与被测对象不同源」。
+///
+/// `ServerFrame::MessageNew` 现已实装(aux-13 §1.2.5), 本函数改为返回真变体。
+/// 时间戳取**固定值**而非 `Utc::now()`: mock 应当可复现, 且固定值让
+/// `message_new_json()` 与本函数能被 `message_new_frame_matches_json_mock`
+/// 逐字段交叉校验。
 pub fn message_new_frame() -> ServerFrame {
-    // 注意:ServerFrame::MessageNew 在 im-protocol 当前未实现(im-protocol 当前 11 帧不含 message_new),
-    // 故使用 WireMessage 强类型 + JSON Value 路径
-    let _ = (
-        Uuid::parse_str(MESSAGE_ID_TEXT).expect("valid uuid"),
-        Uuid::parse_str(CONVERSATION_ID_DM).expect("valid uuid"),
-    );
-    // 强类型路径仅占位(WireMessage 用于其他场景);若 im-protocol 加 MessageNew 变体,本函数可切换
-    ServerFrame::MessageEdited {
-        message_id: Uuid::parse_str(MESSAGE_ID_TEXT).expect("valid uuid"),
-        content: MessageContent::Text {
-            text: "你好".into(),
+    ServerFrame::MessageNew {
+        message: WireMessage {
+            id: Uuid::parse_str(MESSAGE_ID_TEXT).expect("valid uuid"),
+            conversation_id: Uuid::parse_str(CONVERSATION_ID_DM).expect("valid uuid"),
+            sequence: 42,
+            sender_id: Some(Uuid::parse_str(USER_ID_SENDER).expect("valid uuid")),
+            kind: "text".into(),
+            content: MessageContent::Text {
+                text: "你好".into(),
+            },
+            reply_to: None,
+            state: "sent".into(),
+            created_at: fixed_created_at(),
+            edited_at: None,
+            reactions: Vec::new(),
         },
-        edited_at: chrono::Utc::now(),
     }
 }
 
+/// §1.2.5 `message_new` 的 `created_at` 固定值(与 `wire_message_json()` 同源)
+pub const CREATED_AT_TEXT: &str = "2026-08-23T00:00:00Z";
+
+fn fixed_created_at() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(CREATED_AT_TEXT)
+        .expect("CREATED_AT_TEXT 必须是合法 RFC3339")
+        .with_timezone(&chrono::Utc)
+}
+
 /// §1.2.5 `message_new` —— JSON Value 版(完整结构,严格按 aux-13)
+///
+/// **content 必须带 `"kind"` tag** —— `MessageContent` 的 serde tag 就是
+/// `kind`(见 im-protocol::content)。此前本 mock 写的是 `{"text":"你好"}`,
+/// 少了 tag, 于是**与真实下行帧不一致**; 而唯一用到它的测试
+/// (`message_new_json_has_message_payload`) 恰好只断言 id/sequence/kind,
+/// 没碰 content, 所以一直没被发现。现由
+/// `message_new_frame_matches_json_mock` 交叉校验, 漂移会直接让它变红。
 pub fn message_new_json() -> Value {
     json!({
         "type": "message_new",
@@ -286,10 +315,10 @@ pub fn wire_message_json() -> Value {
         "sequence": 42,
         "sender_id": USER_ID_SENDER,
         "kind": "text",
-        "content": { "text": "你好" },
+        "content": { "kind": "text", "text": "你好" },
         "reply_to": null,
         "state": "sent",
-        "created_at": "2026-08-23T00:00:00Z",
+        "created_at": CREATED_AT_TEXT,
         "edited_at": null,
         "reactions": [],
     })
@@ -471,6 +500,37 @@ mod tests {
         assert_eq!(v["message"]["id"], MESSAGE_ID_TEXT);
         assert_eq!(v["message"]["sequence"], 42);
         assert_eq!(v["message"]["kind"], "text");
+    }
+
+    #[test]
+    fn message_new_frame_is_really_a_message_new_variant() {
+        // 回归: 本函数此前返回 `MessageEdited` 却叫 `message_new_frame`。
+        match message_new_frame() {
+            ServerFrame::MessageNew { message } => {
+                assert_eq!(message.id.to_string(), MESSAGE_ID_TEXT);
+                assert_eq!(message.conversation_id.to_string(), CONVERSATION_ID_DM);
+                match &message.content {
+                    MessageContent::Text { text } => assert_eq!(text, "你好"),
+                    other => panic!("content 变体不符: {other:?}"),
+                }
+            }
+            other => panic!("必须返回 MessageNew, 实际 {other:?}"),
+        }
+    }
+
+    /// **交叉校验**: 强类型帧序列化的结果, 必须与 JSON mock **逐字段相等**。
+    ///
+    /// 这是本文件最重要的一条测试: 强类型版与 JSON 版是同一帧的两种表述, 二者
+    /// 漂移时(例如 `content` 少了 `"kind"` tag)不会有任何编译错误, 也不会有
+    /// 其它测试变红 —— 只有把两者放在一起比才会暴露。
+    #[test]
+    fn message_new_frame_matches_json_mock() {
+        let typed = serde_json::to_value(message_new_frame()).expect("序列化");
+        let mocked = message_new_json();
+        assert_eq!(
+            typed, mocked,
+            "强类型帧与 JSON mock 不一致 —— 二者必须表达同一帧(aux-13 §1.2.5)"
+        );
     }
 
     #[test]

@@ -117,6 +117,16 @@ impl ConversationService {
             .await
     }
 
+    /// 用户所属的**全部**会话 id(无上限)—— WS 广播成员过滤用
+    ///
+    /// 与 `list_user_conversations` 分开是有意的, 不是重复: 后者给 UI 列表
+    /// (完整行 + 排序 + 上限 50), 本方法给广播过滤(只要 id, **一个都不能少**)。
+    /// 复用的后果是「加入 >50 个会话的用户收不到老会话的实时消息」且无任何报错。
+    /// 详见 `ConversationRepository::list_all_memberships_for_user` 的说明。
+    pub async fn list_membership_ids(&self, user: UserId) -> Result<Vec<ConversationId>, AppError> {
+        self.repo.list_all_memberships_for_user(user).await
+    }
+
     pub async fn is_member(&self, conv: ConversationId, user: UserId) -> Result<bool, AppError> {
         self.repo.is_member(conv, user).await
     }

@@ -51,12 +51,17 @@
 //!      `[PROTOCOL-FROZEN]`。是否新增「未实装」类错误码属规范所有者的决定。已记入
 //!      `docs/gap-ledger.md` §1.6。
 //! 2. **im-proto gRPC 客户端**: 有 stub (per worker-C 探索 `im_proto::im::core::v1::core_service_client::CoreServiceClient`), 但 MVP Day 3 没 wire-up gRPC channel; Auth 帧的 TokenClaims 解析走本地 TokenService (已经在 im-gateway 进程内), 不走 gRPC
-//! 3. **ForceDisconnect broadcast**: 占位 broadcast channel, 实际 broadcasting 留 G-1 presence
-//! 4. **`ServerFrame` 缺 `message_new` 变体**: aux-13 §1.2.5 定义的「新消息广播」
-//!    无对应变体 —— 即便 `send_message` 成功, 其他客户端也收不到广播。随 G-1
-//!    presence / 广播分发一并补, 见 `docs/gap-ledger.md` §2
 //!
 //! 已于 2026-10-03 结清:
+//! - 曾列为缺口 3 的「ForceDisconnect broadcast: 占位 broadcast channel」——
+//!   该「占位物」**其实根本不存在**(文档说有、代码没有)。现已实装 `ws::hub::WsHub`:
+//!   单个 `broadcast` 通道, `main.rs` 以 `web::Data` 注入为进程内单例。
+//! - 曾列为缺口 4 的「`ServerFrame` 缺 `message_new` 变体」—— 已补
+//!   `ServerFrame::MessageNew { message: WireMessage }`(aux-13 §1.2.5),
+//!   并由 `handle_send_message` 在**新落库**后经 `WsHub::publish` 广播。
+//!   投递范围由 `ws::hub::Audience` 判定, 其中「不带 conversation_id 的帧」
+//!   (MessageEdited / ReactionAdded) 与「单连接响应」(Ack / Connected / Pong)
+//!   判为 `Undeliverable` **一律不发**, 避免跨会话泄漏。
 //! - 曾列为缺口 5 的「60s 无帧超时未真正关闭连接」已修复 —— tick 搬进
 //!   `run_ws_loop` 的 `select!`, 超时即退出主循环并走 close。
 //! - 曾列为缺口 6 的「device_session_id 来自 JWT claims / TokenClaims 没 `dsid` 字段」
@@ -72,6 +77,7 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use actix_ws::{CloseCode, CloseReason, Message};
 use futures::StreamExt;
 use serde::Deserialize;
+use tokio::sync::broadcast;
 use tokio::time::interval;
 use uuid::Uuid;
 
@@ -147,6 +153,7 @@ pub async fn ws_handler(
     req: HttpRequest,
     stream: web::Payload,
     app: web::Data<AppState>,
+    hub: web::Data<super::hub::WsHub>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let (response, mut session, mut msg_stream) =
         actix_ws::handle(&req, stream).map_err(|e| -> actix_web::Error {
@@ -170,11 +177,13 @@ pub async fn ws_handler(
 
     // 主 loop — 异步 spawn, 不阻塞 HTTP upgrade response 返回
     let app_for_loop = app.clone();
+    let hub_for_loop = hub.clone();
     actix_web::rt::spawn(async move {
         if let Err(e) = run_ws_loop(
             &mut session,
             &mut msg_stream,
             &app_for_loop,
+            &hub_for_loop,
             &mut ws_session,
         )
         .await
@@ -198,6 +207,7 @@ async fn run_ws_loop(
     ws_session: &mut actix_ws::Session,
     msg_stream: &mut actix_ws::MessageStream,
     app: &web::Data<AppState>,
+    hub: &super::hub::WsHub,
     state: &mut WsSession,
 ) -> Result<(), AppError> {
     // 2026-10-03 修(缺口 #H): 心跳 tick 原先放在一个独立后台 task 里, 但
@@ -208,6 +218,11 @@ async fn run_ws_loop(
     // 主循环用 select! 直接判定并退出(退出后由 ws_handler 统一走 close)。
     let mut tick = interval(HEARTBEAT_TICK);
 
+    // 广播订阅**必须在进入循环前**完成: broadcast 通道只向「订阅之后」的
+    // 接收者投递, 若在循环内首次收到帧时才订阅, 连接建立到进入循环之间的
+    // 广播会被静默漏掉。
+    let mut hub_rx = hub.subscribe();
+
     loop {
         // biased: 有帧时优先处理帧。客户端持续发帧时 tick 分支不会命中是**正确**
         // 的 —— 每帧都会 `heartbeat().on_frame()` 重置 idle, 本就不会超时;
@@ -215,6 +230,9 @@ async fn run_ws_loop(
         let msg_result = tokio::select! {
             biased;
             m = msg_stream.next() => m,
+            // tick 排在广播**之前**是刻意的: biased 按书写顺序轮询, 若广播在前,
+            // 通道里一旦有积压帧就会每次都命中广播分支, tick 永远轮不到 ——
+            // 广播洪水能把心跳超时判定饿死, 正是本函数上一轮修掉的那类漏洞。
             _ = tick.tick() => {
                 if state.tick_heartbeat() {
                     tracing::warn!(
@@ -224,6 +242,34 @@ async fn run_ws_loop(
                     );
                     state.force_close();
                     return Ok(());
+                }
+                continue;
+            }
+            b = hub_rx.recv() => {
+                match b {
+                    Ok(frame) => {
+                        deliver_broadcast(ws_session, state, frame).await?;
+                    }
+                    // Lagged: 慢客户端漏掉了最旧的若干帧。这里**只记不补** ——
+                    // 补齐要按 conversation 逐个拉 REST, 属于另一个量级的逻辑。
+                    // 但必须留痕: 静默跳过会让客户端以为「对方没发言」。
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            session_id = %state.session_id(),
+                            skipped,
+                            "ws broadcast lagged; client must resync via GET /v1/conversations/{{id}}/messages"
+                        );
+                    }
+                    // Closed: hub 已被销毁, 不会再有任何广播。这条连接已失去意义,
+                    // 继续留着只会变成一个永远静默的连接。
+                    Err(broadcast::error::RecvError::Closed) => {
+                        tracing::warn!(
+                            session_id = %state.session_id(),
+                            "ws hub closed, terminating connection"
+                        );
+                        state.force_close();
+                        return Ok(());
+                    }
                 }
                 continue;
             }
@@ -271,10 +317,40 @@ async fn run_ws_loop(
                         }) => {
                             match handle_auth(state, &access_token, &app.token_service).await {
                                 Ok((uid, env, dsid)) => {
+                                    // 广播成员集合在**回 auth_ok 之前**加载, 且失败
+                                    // 即拒绝连接。
+                                    //
+                                    // 反过来做(先回 ack 再加载、失败只记日志)的后果是:
+                                    // 连接鉴权通过、能收发自己的消息, 但**收不到任何
+                                    // 别人的消息**, 且**没有任何报错** —— 用户只会
+                                    // 以为对方没发言。这种故障比连不上难查得多。
+                                    //
+                                    // 用 `list_membership_ids` 而非
+                                    // `list_user_conversations`: 后者 limit 被 clamp
+                                    // 到 50 且 cursor 被忽略, 加入超过 50 个会话的
+                                    // 用户会**静默漏收**老会话的广播。
+                                    let conv_ids = match app
+                                        .conversation_service
+                                        .list_membership_ids(uid)
+                                        .await
+                                    {
+                                        Ok(ids) => ids,
+                                        Err(e) => {
+                                            let code = e.code();
+                                            let msg = format!("membership load failed: {e}");
+                                            send_error(ws_session, code, &msg, req_id).await;
+                                            return Err(e);
+                                        }
+                                    };
+
                                     state.mark_authenticated(uid, env, dsid);
+                                    state.set_conversation_ids(super::hub::membership_set(
+                                        conv_ids.iter(),
+                                    ));
                                     tracing::info!(
                                         user_id = %uid,
                                         session_id = %state.session_id(),
+                                        conversations = state.conversation_count(),
                                         "ws authenticated"
                                     );
                                     // 鉴权成功 ack
@@ -361,7 +437,9 @@ async fn run_ws_loop(
                         // sender 来自**已鉴权的会话状态**, 不取自帧内容 ——
                         // 客户端没有资格声明自己是谁。
                         match state.user_id() {
-                            Some(uid) => handle_send_message(ws_session, app, uid, frame).await,
+                            Some(uid) => {
+                                handle_send_message(ws_session, app, hub, uid, frame).await
+                            }
                             None => {
                                 send_error(
                                     ws_session,
@@ -529,6 +607,7 @@ async fn handle_auth(
 async fn handle_send_message(
     ws_session: &mut actix_ws::Session,
     app: &web::Data<AppState>,
+    hub: &super::hub::WsHub,
     sender_id: UserId,
     frame: ClientFrame,
 ) {
@@ -553,6 +632,10 @@ async fn handle_send_message(
         .await
     {
         Ok(Some(existing)) => {
+            // **刻意不广播**: 命中幂等说明这条消息在更早的请求里已落库, 那时已经
+            // 广播过。客户端用同一个 idempotency_key 重试(网络超时后很常见)若
+            // 再广播一次, 所有其它在线端都会收到**同一条消息的第二个副本** ——
+            // 而它们根本没发起过这个请求, 无从去重。
             send_ack(
                 ws_session,
                 req_id,
@@ -594,6 +677,8 @@ async fn handle_send_message(
 
     match app.message_service.send_message(cmd).await {
         Ok(msg) => {
+            // 先 ack 再广播: 广播是同步的(非阻塞通道), 但把发送方的确认路径排在
+            // 最前, 广播侧的耗时不会推迟「我发出去了」这个反馈。
             send_ack(
                 ws_session,
                 req_id,
@@ -602,6 +687,7 @@ async fn handle_send_message(
                 false,
             )
             .await;
+            publish_new_message(hub, &msg);
         }
         Err(e) => {
             // service 侧的校验/权限错误按其 AppError 映射到已注册错误码,
@@ -626,6 +712,12 @@ async fn handle_send_message(
 ///
 /// sender 同样取自已鉴权的会话状态; service 内部会再校验「仅原 sender 可编辑」
 /// 与「已撤回/已删除不可编辑」。
+///
+/// **不广播, 且这是 wire 形状的硬限制而非疏漏**: 对应的 `ServerFrame::MessageEdited`
+/// (aux-13 §1.2.6) 只带 `message_id` + `content` + `edited_at`, **不带
+/// `conversation_id`**。广播中枢因此无法判断接收方是不是该会话成员 ——
+/// 发给所有人就是跨会话泄漏, 不发则编辑无法实时同步。补 `conversation_id`
+/// 属协议变更, 不在本文件拍板范围(见 `ws::hub::Audience::Undeliverable`)。
 async fn handle_edit_message(
     ws_session: &mut actix_ws::Session,
     app: &web::Data<AppState>,
@@ -681,6 +773,69 @@ async fn handle_edit_message(
             .await;
         }
     }
+}
+
+/// 把一条新落库的消息广播出去 (per aux-13 §1.2.5 `message_new`)
+///
+/// **任何失败都只记日志、不影响发送方**: 消息已落库、发送方已收到 ack, 此时
+/// 广播失败影响的是「别人什么时候看到」, 而不是「消息有没有发出去」。让它
+/// 影响发送方的 ack 是错的 —— 离线接收方本来就靠 REST 拉取。
+fn publish_new_message(hub: &super::hub::WsHub, msg: &im_core::message::repository::Message) {
+    let frame = match super::hub::to_wire_message(msg) {
+        Ok(m) => ServerFrame::MessageNew { message: m },
+        Err(e) => {
+            // 库里 content 不合 schema。**不伪造**一条空消息糊弄过去 ——
+            // 那会让客户端看到一条空消息而真实内容被吞掉。
+            tracing::error!(
+                error = %e,
+                message_id = %msg.id.0,
+                "message_new broadcast skipped: stored content does not match MessageContent schema"
+            );
+            return;
+        }
+    };
+    let delivered = hub.publish(frame);
+    if delivered == 0 {
+        // 无人在线(常态): 消息已落库, 对方上线后靠 REST 补。
+        tracing::debug!(
+            message_id = %msg.id.0,
+            "message_new broadcast: no subscribers (recipients resync via REST)"
+        );
+    } else {
+        tracing::debug!(
+            delivered,
+            message_id = %msg.id.0,
+            "message_new broadcast"
+        );
+    }
+}
+
+/// 广播帧的接收侧投递 —— 过滤规则的**唯一**执行点
+///
+/// 过滤判定本身在 `ws::hub::should_deliver`(纯函数, 有单测); 本函数只负责
+/// 「判完之后把帧写出去」。**不在这里写过滤逻辑** —— 两处各写一遍过滤, 早晚会
+/// 漂移, 而漂移的那一侧就是数据泄漏。
+async fn deliver_broadcast(
+    ws_session: &mut actix_ws::Session,
+    state: &WsSession,
+    frame: ServerFrame,
+) -> Result<(), AppError> {
+    let audience = super::hub::Audience::of(&frame);
+    if !super::hub::should_deliver(&audience, state) {
+        // 只在「不可投递」时留痕: 过滤掉绝大多数帧是正常现象(非成员), 逐帧 warn
+        // 会把日志淹掉。而 Undeliverable 是**帧本身的性质问题**, 值得每次记录。
+        if let super::hub::Audience::Undeliverable(why) = &audience {
+            tracing::warn!(%why, "broadcast frame is not deliverable; dropped");
+        }
+        return Ok(());
+    }
+    let body = serde_json::to_string(&frame)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("ws broadcast serialize: {e}")))?;
+    ws_session
+        .text(body)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("ws broadcast send: {e}")))?;
+    Ok(())
 }
 
 /// 发成功 ack (per aux-13 §1.2.2)

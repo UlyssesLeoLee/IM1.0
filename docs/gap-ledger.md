@@ -575,6 +575,114 @@ edited_at 真落盘, 不只信返回值) / `edit_rejected_for_non_sender` /
 工作再失败**」。共同点: 两者都让人**高估完成度**。排查此类代码时, 该看的是
 「最后一步是不是真的存在」, 而不是「前面几步做得像不像」。
 
+### 1.10 WS 广播中枢: 文档声称的「占位 broadcast channel」根本不存在 (2026-10-03 已修)
+
+**发现的矛盾** (三处独立文档都这么说):
+
+| 位置 | 声称 |
+|---|---|
+| `ws/handler.rs` 模块文档缺口 3 | 「ForceDisconnect broadcast: **占位 broadcast channel**」 |
+| `ws/mod.rs` 模块文档 | 同上 |
+| `ws_frames.rs` 模块文档 | 「aux-13 §1.2 **服务端 11 类**」, 实际枚举只有 9 个变体 |
+
+但代码里**没有任何 broadcast channel**。所谓「占位物」是**文档虚构的** ——
+与 §1.8.2 的 `auth_ok`(凭空发明的 wire 帧)同族, 方向相反: 这次是**文档说有、
+代码没有**。
+
+**后果不是「功能少一点」, 而是端点没有意义**: `send_message` 实装后发送方能
+收到 `ack`, 但**其它客户端收不到任何东西**。一个只能对发起者自己说话的 WS
+端点, 对 IM 协议没有意义。
+
+#### 实装
+
+1. `im-protocol` 补 `ServerFrame::MessageNew { message: WireMessage }`(aux-13 §1.2.5)
+2. 新建 `im-gateway/src/ws/hub.rs`:
+   - `WsHub` = 单个 `tokio::sync::broadcast` 通道(容量 1024), `main.rs` 以
+     `web::Data` 注入为**进程内单例**
+   - `Audience` **三态**投递范围判定 + `should_deliver` 纯函数
+   - `to_wire_message`: `Message` → `WireMessage`
+3. `WsSession` 加 `conversation_ids` 集合, 鉴权时**快照一次**
+4. `run_ws_loop` 的 `select!` 加广播分支; `handle_send_message` 落库后 publish
+
+#### 设计决策: 为什么选「单通道 + 连接侧过滤」
+
+per-conversation 通道需要动态增减订阅, 而 `select!` 无法对「数量不定的一组
+receiver」做分支(除非 `FuturesUnordered`, 复杂度显著上升)。单通道 + 内存过滤
+同等正确且简单得多。
+
+#### 三处「静默出错」的地方 —— 本条的真正价值
+
+这三处都不会编译报错、不会 panic, 只是**结果悄悄是错的**:
+
+1. **广播过滤是安全边界, 不是优化**: 不过滤则用户 A 收到用户 B 所在会话的
+   消息 = **跨会话数据泄漏**。所以 `Audience::All` 分支**自己判鉴权状态**
+   (未鉴权连接即使「看起来该收」也不能收, 否则成为「连上就能听」的旁听入口)。
+2. **`Option<ConversationId>` 二态签名是陷阱**: 初版 `frame_conversation` 用
+   `None` 表示「与具体会话无关, 所有人都该收到」, 把两类语义完全不同的帧混成
+   同一个值 —— `PresenceUpdate`(确实该全局发)与 `MessageEdited` /
+   `ReactionAdded`(语义上属于某会话, 但 **wire 形状不带 `conversation_id`**,
+   无从判断接收方是否成员)。二态下后者会被当成「发给所有人」→ 跨会话泄漏,
+   **且不会有任何报错**。故改为三态 `Audience`, 第三态 `Undeliverable`
+   (含 `&'static str` 原因) 明确表示「不知道该发给谁, 一律不发」。
+   `Ack` / `Connected` / `Pong` 同归此类 —— 它们承载的是某个请求的 `req_id`,
+   广播出去等于把别人的请求回执塞给无关客户端。
+3. **成员集合不能用 `list_user_conversations`**: 它的 `cursor` 参数**被完全
+   忽略**(`PgConversationRepository::list_for_user` 形参名 `_cursor`, SQL 里
+   没有 OFFSET), 且 `ConversationService` 把 limit clamp 到 50。于是
+   **加入超过 50 个会话的用户会静默漏收**老会话的实时消息 —— 无任何报错,
+   用户只会以为对方没发言。故新增 `list_all_memberships_for_user`(只 SELECT
+   id, 无 JOIN / 无 LIMIT / 无排序)。
+
+#### 另外两处
+
+- **`biased` 的分支顺序**: `select!` 的 `biased` 按书写顺序轮询, 所以 tick 必须
+  排在广播**之前** —— 否则通道一旦有积压帧就每次命中广播分支, tick 永远轮不到,
+  **广播洪水能把心跳超时判定饿死**(正是 §1.1 缺口 #H 刚修掉的那类漏洞)。
+- **幂等重放不广播**: 命中 `idempotency_key` 时消息在更早的请求已落库并广播过。
+  客户端超时重试(很常见)若再广播一次, 所有其它在线端都会收到**同一条消息的
+  第二个副本**, 而它们根本没发起过这个请求, 无从去重。
+
+#### 顺带修掉的两个 mock 缺陷 (同族: 验证对象与被测对象不同源)
+
+| 位置 | 缺陷 |
+|---|---|
+| `im-testkit::mock_ws_frames::message_new_frame()` | 名为 message_new 却返回 `ServerFrame::MessageEdited`(当时变体不存在, 注释写「占位」)。**零测试覆盖**, 所以一直没人发现 |
+| `im-testkit::mock_ws_frames::wire_message_json()` | `content` 写 `{"text":"你好"}`, **少了 `"kind"` tag**, 与 `MessageContent` 实际 serde 输出不符。唯一用到它的测试恰好只断言 `id`/`sequence`/`kind`, 没碰 `content` |
+
+现 `message_new_frame()` 返回真变体(时间戳取固定值使 mock 可复现), 并补
+`message_new_frame_matches_json_mock` —— **强类型帧序列化结果与 JSON mock 逐字段
+相等**。这类漂移不会有编译错误, 也不会让其它测试变红, 只有把两种表述放在一起
+比才会暴露。
+
+#### 本条**未**覆盖的边界 (如实声明)
+
+**没有 WS 端到端测试** —— 本仓库无任何 WS 客户端依赖(`Cargo.lock` 里只有
+`actix-http 3.13.3`, 无 `tungstenite` / `awc` / `actix-test`), 加依赖需 crates.io
+而 TLS 被本地代理掐断。故已覆盖的是: 投递范围判定(10 个变体逐一断言)、
+过滤规则(含未鉴权连接、非成员、不可投递帧)、真实 broadcast 通道行为
+(订阅/无人订阅/Lagged)、`Message → WireMessage` 转换(含坏 content 报错)。
+**未覆盖**的是「帧真的写到了 socket 上」以及「两条真实连接之间的端到端投递」。
+
+#### 变异测试 —— 证明这些断言有判别力
+
+绿灯只证明「没报错」。故对 `should_deliver` 故意注入两处缺陷并实测:
+
+| 注入的缺陷 | 变红的测试 | 失败信息 |
+|---|---|---|
+| `Audience::Conversation(_) => true`(摘掉成员校验) | `typing_and_recall_target_their_conversation` | `!should_deliver(&Audience::of(&typing), &authed_session(&[other]))` — **非成员收到了他人会话的帧** |
+| 同上 | `unauthenticated_connection_receives_nothing` | 未鉴权连接也收到了会话帧 |
+| `Audience::Undeliverable(_) => true` | `frames_without_conversation_id_are_never_delivered` | 不可投递帧被投出 |
+
+3 FAILED / 7 passed。两个变异**分别**被不同测试捕获(而不是全部倒在同一条),
+证明覆盖确实是按分支对齐的; 7 个正向测试保持绿, 说明不是无差别失败。
+恢复正确实现后全 workspace **325 passed / 0 failed**。
+
+**过程中测试自己抓到一处我写错的断言**: `to_wire_message_roundtrips_content_and_state`
+原写 `serde_json::to_string(&w)` 却断言 `"type":"message_new"` —— `type` tag 来自
+外层 `ServerFrame` 枚举, 序列化 `WireMessage` 本身根本没有该字段。这与
+`f42f8e8` 那次「测试注释过度声称」同源: 断言写得比被测对象更强时, 先暴露的
+往往是断言自己的错。
+
 
 
 
@@ -593,7 +701,9 @@ edited_at 真落盘, 不只信返回值) / `edit_rejected_for_non_sender` /
 | `crates/im-gateway/src/http/auth_handlers.rs` `token_exchange` **nonce 防重放** | 协议有 `X-IM-Nonce`, 但服务端**未校验也未记录** —— 同一合法请求可在 ±300s 窗口内重放 | 需跨实例共享存储 → **WBS D-4 (Valkey)** 落地后接 |
 | `crates/im-gateway/src/placeholder.rs` (整文件) | 10 个端点桩函数未被调用 | 该文件唯一职责就是存放未接线桩; 各端点随对应 WBS 项落地 |
 | ~~`im_protocol::ServerFrame::Ack` **缺 error 载荷**~~ | ~~规范 (aux-13 §1.2.4) 规定的失败形状表达不了, 实现因此另造顶层 `{"type":"error",...}` 帧~~ | ✅ **已修复** (2026-10-03): `Ack` 补 `error: Option<ErrorBody>`, im-gateway 改发规范形状并删除 `WsErrorFrame`, im-testkit 补齐强类型版。见 §1.7.3 |
-| `im_protocol::ServerFrame` **缺 `message_new` 变体** | `ws_frames.rs` 模块文档称「aux-13 §1.2 服务端 11 类」, 实际枚举只有 9 个变体; aux-13 §1.2.5 定义的 `message_new`(新消息广播)**无对应变体** —— 即便 `send_message` 实装成功, 其他客户端也收不到广播 | 随 G-1 presence / 广播分发一并补; 需确认 wire 形状(`WireMessage` 已存在但未挂在 `ServerFrame` 上)。见 §1.8.1 |
+| ~~`im_protocol::ServerFrame` **缺 `message_new` 变体**~~ | ~~`ws_frames.rs` 模块文档称「aux-13 §1.2 服务端 11 类」, 实际枚举只有 9 个变体; aux-13 §1.2.5 定义的 `message_new`(新消息广播)**无对应变体** —— 即便 `send_message` 实装成功, 其他客户端也收不到广播~~ | ✅ **已修复** (2026-10-03): 补 `ServerFrame::MessageNew { message: WireMessage }`, 并实装 `ws::hub::WsHub` 广播中枢 + 成员过滤 + `handle_send_message` 接线。见 §1.10 |
+| `ServerFrame::MessageEdited` / `ReactionAdded` **不可广播** | aux-13 §1.2.6 / §1.2.8 的 wire 形状**不带 `conversation_id`**, 广播中枢无从判断接收方是否该会话成员 —— 发给所有人即跨会话泄漏。故判为 `Audience::Undeliverable` 一律不发 | **需规范所有者给这两个帧补 `conversation_id`**, 属协议变更(同 §1.6 的 `[PROTOCOL-FROZEN]` 约束), 不由实现方拍板。在此之前「编辑消息」无法实时同步到其它端 |
+| `ws/hub.rs` 成员关系**鉴权时快照一次** | 会话期间被移出会话, 仍会收到该会话广播, 直到该连接重连 | 需基于事件的成员变更通知, 随 **G-1 presence** 落地 |
 | `ws/handler.rs` 鉴权成功回 **`{"type":"auth_ok"}`** | **`auth_ok` 不是 aux-13 §1.2 定义的任何帧类型**(§1.2.1 定义的是 `connected { session_id }`)。继 §1.6 的 `UNSUPPORTED_OPERATION` 之后**第二处凭空发明的 wire 帧** | **只记录不擅改**(见 §1.8.2): 改它变动客户端可见的 wire 形状, 且**无证据表明 `connected` 就是原意** —— 与 §1.7.3 的 `ack` 形状不同(那次有 testkit 证据, 方向无歧义)。需规范所有者确认该帧形状 |
 
 ---

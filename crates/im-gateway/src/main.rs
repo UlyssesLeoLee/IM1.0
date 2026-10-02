@@ -187,12 +187,24 @@ async fn main() -> std::io::Result<()> {
         identity_service,
     );
 
+    // 9b. WS 广播中枢 —— 进程内单例。
+    //
+    // 必须是**所有 WS 连接共享的同一个** instance: 广播的意义就在于把一条
+    // 消息送到「其它连接」, 每连接一个 hub 等于没有 hub(发给自己都不行)。
+    // 用 `web::Data` 注入而非构造时 `new()`, 是为了让 actix 的每个 worker
+    // 线程拿到的是同一份 —— `web::Data` 内部是 `Arc`, 克隆不复制。
+    //
+    // 若漏掉这一行, 编译仍会通过(extract 器是运行期解析的), 但每个
+    // `/v1/ws` 请求都会拿到 500 —— 故在此显式注册。
+    let ws_hub = web::Data::new(ws::hub::WsHub::new());
+
     let http_port = cfg.http_port;
     tracing::info!(http_port, "im-gateway binding HTTP server");
 
     HttpServer::new(move || {
         App::new()
             .app_data(web::Data::new(app_state.clone()))
+            .app_data(ws_hub.clone())
             .service(web::scope("/v1").configure(http::configure))
             .route("/healthz", web::get().to(health::healthz))
             .route("/readyz", web::get().to(readyz))

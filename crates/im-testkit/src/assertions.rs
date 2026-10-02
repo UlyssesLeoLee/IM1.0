@@ -74,6 +74,7 @@ fn server_frame_kind(frame: &ServerFrame) -> &'static str {
     match frame {
         ServerFrame::Connected { .. } => "connected",
         ServerFrame::Ack { .. } => "ack",
+        ServerFrame::MessageNew { .. } => "message_new",
         ServerFrame::MessageEdited { .. } => "message_edited",
         ServerFrame::MessageRecalled { .. } => "message_recalled",
         ServerFrame::ReactionAdded { .. } => "reaction_added",

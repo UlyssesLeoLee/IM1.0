@@ -20,8 +20,20 @@ pub async fn readyz() -> HttpResponse {
 }
 
 /// Prometheus 指标(MVP 占位)
-pub async fn metrics() -> HttpResponse {
+pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpResponse {
+    // 广播订阅数是本进程**唯一**能立刻回答的运营问题(WS 到底连上了几个),
+    // 且它就挂在 `WsHub` 上, 不需要额外的指标框架即可暴露。
+    //
+    // 语义: **已订阅广播的连接数**。未鉴权的连接也算在内(它们在建连时就
+    // subscribe 了), 所以这个值略大于「在线用户数」—— 排查时以
+    // `ws::hub::Audience` 过滤后的实际投递为准。
+    let subs = hub.subscriber_count();
     HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4")
-        .body("# MVP: prometheus exporter not yet enabled (set IM_PROMETHEUS_BIND to enable)\n")
+        .body(format!(
+            "# MVP: prometheus exporter not yet enabled (set IM_PROMETHEUS_BIND to enable)\n\
+             # HELP im_ws_broadcast_subscriptions 已订阅 WS 广播的连接数\n\
+             # TYPE im_ws_broadcast_subscriptions gauge\n\
+             im_ws_broadcast_subscriptions {subs}\n"
+        ))
 }

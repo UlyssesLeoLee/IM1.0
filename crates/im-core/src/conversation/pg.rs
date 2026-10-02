@@ -159,6 +159,25 @@ impl ConversationRepository for PgConversationRepository {
         Ok(rows.into_iter().map(ConvRow::into_conversation).collect())
     }
 
+    async fn list_all_memberships_for_user(
+        &self,
+        user: UserId,
+    ) -> Result<Vec<ConversationId>, AppError> {
+        // 只 SELECT id: 不 JOIN conversations(过滤只需要 id), 无 LIMIT(少一个就漏),
+        // 无 ORDER BY(顺序对集合语义无意义, 也省掉一次 sort)。
+        let ids: Vec<Uuid> = sqlx::query_scalar(
+            r#"
+            SELECT conversation_id FROM conversation_members
+            WHERE user_id = $1
+            "#,
+        )
+        .bind(user.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx: {}", e)))?;
+        Ok(ids.into_iter().map(ConversationId).collect())
+    }
+
     async fn add_member(
         &self,
         conv: ConversationId,

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use im_common::ids::{DeviceSessionId, EnvironmentId, UserId};
+use im_common::ids::{ConversationId, DeviceSessionId, EnvironmentId, UserId};
 
 use super::heartbeat::{HeartbeatState, PongFrame, SharedHeartbeat};
 
@@ -55,6 +55,11 @@ pub struct WsSession {
     user_id: Option<UserId>,
     environment_id: Option<EnvironmentId>,
     device_session_id: Option<DeviceSessionId>,
+    /// 本连接所属的会话集合(鉴权时快照一次)
+    ///
+    /// 2026-10-03 新增, 供 `ws::hub` 做广播过滤。**这不是优化, 是安全边界**:
+    /// 不过滤的话用户 A 会收到用户 B 所在会话的消息。
+    conversation_ids: std::collections::HashSet<ConversationId>,
     heartbeat: SharedHeartbeat,
 }
 
@@ -66,6 +71,7 @@ impl WsSession {
             user_id: None,
             environment_id: None,
             device_session_id: None,
+            conversation_ids: std::collections::HashSet::new(),
             heartbeat,
         }
     }
@@ -95,6 +101,24 @@ impl WsSession {
     /// 鉴权后的 user_id (供业务帧取 sender —— 身份只能来自会话状态, 不能来自帧内容)
     pub fn user_id(&self) -> Option<UserId> {
         self.user_id
+    }
+
+    /// 设置本连接所属会话集合(鉴权成功后快照一次)
+    pub fn set_conversation_ids(&mut self, ids: std::collections::HashSet<ConversationId>) {
+        self.conversation_ids = ids;
+    }
+
+    /// 该连接是否属于某会话 —— 广播过滤的安全边界
+    ///
+    /// 鉴权前(`state != Authenticated`)一律返回 false: 未鉴权的连接不该
+    /// 收到任何广播, 否则会成为「连上就能听」的旁听入口。
+    pub fn is_member_of(&self, conv: ConversationId) -> bool {
+        self.state == SessionState::Authenticated && self.conversation_ids.contains(&conv)
+    }
+
+    /// 本连接所属会话数(诊断用)
+    pub fn conversation_count(&self) -> usize {
+        self.conversation_ids.len()
     }
 
     // 守门 #1 缺口台账: 缺口 #G — 同 user_id,多租户路由待 C-11 接线。保留不删。
