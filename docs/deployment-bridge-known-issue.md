@@ -5,7 +5,7 @@ phase: 15-management
 activity_no: 133
 owners: 架构师 (Mavis 接手 agent per DEC-008)
 status: Blocked-Intermittent
-version: 1.2.0
+version: 1.3.0
 ---
 
 # 133-aux-f1. F-1 Docker Desktop Daemon Bridge 已知问题
@@ -14,6 +14,7 @@ version: 1.2.0
 > 责任方: 架构师 (Mavis 接手 agent per DEC-008) 代 Ulysses 排查
 > 编制日: 2026-09-01 JST
 > **状态更新 2026-10-03: Blocker 仍然成立,但已定性为「间歇性」** —— 见 §0。
+> **状态更新 2026-10-03 02:00: daemon 再次恢复,已找到无需人工点图标的恢复手段** —— 见 §0.5。
 > 下列 §1–§5 保留为 2026-09-01 的原始诊断记录,不代表当前状态。
 
 ## 0. 2026-10-02/03 实测:间歇性,非已解除
@@ -71,6 +72,46 @@ H-1 → H-3 → C-1 → C-2 → C-9 → C-11 → D-3 → E-3 → F-2 → F-3
 
 - **B-1**:已完成(见 §0.3),后续回归验证在 daemon 稳定前需手工重跑
 - **F-2 / F-3 / F-4**:仍被 F-1 阻塞,需 daemon 能稳定保持
+
+### 0.5 2026-10-03 02:00 再次恢复:无需人工点图标的恢复手段
+
+**这次 daemon 恢复不需要 Ulysses 手动点开始菜单。** 已授权 Mavis 直接执行:
+
+```powershell
+Start-Process "C:\Program Files\Docker\Docker\Docker Desktop.exe"
+```
+
+约 1 分钟后 daemon 就绪, `docker info` 返回 `Server Version: 29.8.1`,
+`diag-docker-bridge.ps1` exit 0 并报 `[OK] Docker daemon 已就绪`。
+
+容器 `im10-pg18b1` 会随之变成 `Exited (255)`, `docker start im10-pg18b1` 即可恢复
+(端口 5544, `im/im/im_test`, 数据卷保留); 7 份 migration 幂等重放后 **14 张表**在位。
+
+> **F-1 的处置成本已从「需人工介入」降为「一条命令 + 约 1 分钟」**。
+> 但这只是**恢复手段**, 不是**根因修复** —— daemon 为什么会毫无征兆地全部
+> 进程消失仍未定位。`status: Blocked-Intermittent` 不变。
+
+### 0.6 排查该问题时, 诊断脚本自身暴露的两处缺陷
+
+用 `diag-docker-bridge.ps1` 排查 10-03 的 F-1 复现时, 脚本**自己**先失效了,
+两次把我卡住。已修 (`ca6f89f`), 记录在此以免复发:
+
+1. **脚本自身会无限挂死**。第 1 段 `& $dockerExe version` 没有超时保护, 而
+   F-1 下 `docker.exe` 本就无限阻塞在 named pipe 连接上。此前只给第 6 段
+   (`docker info`) 加了 `Wait-Job` 兜底, 漏了第 1 段。已抽出 `Invoke-Docker`
+   统一包装(Start-Job + Wait-Job + 超时 Stop-Job), 第 1、6 段共用。
+   修后: daemon 故障时 23.7s 跑完(3×8s), 不再挂死。
+
+2. **WSL distro 判据恒假**。输出里明明是 `docker-desktop    Running         2`,
+   下一行却打 `[FAIL] NOT Running`。根因: `wsl -l -v` 在 Windows 上走 UTF-16LE,
+   被 PowerShell 当字节流捕获后每行夹着 **NUL 字节**, 正则
+   `docker-desktop\s+Running` 的 `\s+` 匹配不上 NUL。不止误报一行 ——
+   判定末支依赖 `$dockerDesktopRunning`, 它恒为 false 时「distro 在跑但
+   `docker info` 慢」那一支永远走不到。修法: 匹配前剥掉 NUL 与回车。
+   修后同环境正确报 `[OK] docker-desktop WSL distro is Running`。
+
+**教训**: 诊断工具在**故障态**下的行为必须单独验证。只验「正常时能跑通」会
+漏掉「故障时自己挂死」这类缺陷 —— 而后者正是最需要它的时刻。
 
 ## 1. 现象(2026-09-01 记录)
 
