@@ -237,6 +237,22 @@ impl MessageService {
             return Err(AppError::Forbidden("not the message sender".into()));
         }
 
+        // 2.1 状态机: 已撤回 / 已删除的消息不可编辑
+        //
+        // 2026-10-03 新增。此前没有这道守卫 —— 若只看 sender, 已撤回的消息
+        // 仍可被编辑出内容, 与「撤回」的语义直接冲突(撤回后应只剩墓碑)。
+        // 用已注册错误码 `INVALID_STATE_TRANSITION`(per aux-03 §B, 409),
+        // 不新造码。
+        match existing.state {
+            MessageState::Recalled | MessageState::Deleted => {
+                return Err(AppError::InvalidStateTransition {
+                    from: existing.state.as_str().to_string(),
+                    to: "edited".into(),
+                });
+            }
+            _ => {}
+        }
+
         // 3. 大小校验
         let serialized = serde_json::to_string(&new_content).unwrap_or_default();
         if serialized.len() > max_size_bytes {
@@ -250,10 +266,19 @@ impl MessageService {
         validate_fields(&content)?;
         validate_serialized_size(&content, max_size_bytes)?;
 
-        // 5. 更新(留待 C-9 完整实装)
-        Err(AppError::Internal(anyhow::anyhow!(
-            "edit_message UPDATE not yet implemented in MVP; see ImplementationSpec §7.4.3"
-        )))
+        // 5. 落库
+        //
+        // 2026-10-03 实装。此前本函数做完上面 4 步校验后**无条件**返回
+        // `AppError::Internal("not yet implemented")` —— 也就是每次调用都得到
+        // 一个 500 级错误, 看起来像服务端故障而不是「功能没做」。仓储层当时
+        // 根本没有改 content 的方法(只有 `update_state`), 现已补
+        // `MessageRepository::update_content`。
+        let updated = self
+            .repo
+            .update_content(message_id, &new_content)
+            .await?
+            .ok_or(AppError::MessageNotFound(message_id.0))?;
+        Ok(updated)
     }
 
     /// 按幂等键预查既有消息 (2026-10-03 新增, 供 WS ack 判定 `idempotent_replay`)

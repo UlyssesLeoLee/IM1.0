@@ -23,6 +23,22 @@ pub enum MessageState {
     Deleted,
 }
 
+impl MessageState {
+    /// wire/DB 字符串形式(与 `messages.state` 的 CHECK 约束一致)
+    ///
+    /// 2026-10-03: 原先该转换是 pg.rs 里的私有函数, service 层拿不到, 导致
+    /// 错误信息里只能拼字面量。转换逻辑属于枚举本身, 故放到这里。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MessageState::Sent => "sent",
+            MessageState::Delivered => "delivered",
+            MessageState::Read => "read",
+            MessageState::Recalled => "recalled",
+            MessageState::Deleted => "deleted",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub id: MessageId,
@@ -70,6 +86,22 @@ pub trait MessageRepository: Send + Sync {
         message_id: MessageId,
         new_state: MessageState,
     ) -> Result<(), AppError>;
+
+    /// 更新消息内容并打上 `edited_at` 时间戳, 返回更新后的 message
+    ///
+    /// 2026-10-03 新增: `edit_message` 此前做完 4 步校验后直接返回
+    /// `AppError::Internal("not yet implemented")` —— 因为仓储层根本没有
+    /// 改 content 的方法(只有 `update_state`)。schema 侧一直是齐的
+    /// (`messages.content JSONB` + `messages.edited_at TIMESTAMPTZ`),
+    /// 缺的只是这一条 UPDATE。
+    ///
+    /// 返回 `Ok(None)` 表示目标消息不存在(调用方转 `MessageNotFound`);
+    /// 返回 `Ok(Some(m))` 携带**更新后**的行(edited_at 已填)。
+    async fn update_content(
+        &self,
+        message_id: MessageId,
+        new_content: &Value,
+    ) -> Result<Option<Message>, AppError>;
 }
 
 #[derive(Debug, Clone)]

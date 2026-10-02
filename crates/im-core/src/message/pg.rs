@@ -50,7 +50,7 @@ impl MessageRepository for PgMessageRepository {
         tx: &mut Transaction<'_, Postgres>,
         msg: NewMessage,
     ) -> Result<Message, AppError> {
-        let state_str = message_state_to_str(msg.state);
+        let state_str = msg.state.as_str();
         // 强校验 content 是 JSON object
         if !matches!(msg.content, JsonValue::Object(_)) {
             return Err(AppError::Validation("content must be JSON object".into()));
@@ -162,7 +162,7 @@ impl MessageRepository for PgMessageRepository {
         message_id: MessageId,
         new_state: MessageState,
     ) -> Result<(), AppError> {
-        let state_str = message_state_to_str(new_state);
+        let state_str = new_state.as_str();
         let n = sqlx::query(
             r#"
             UPDATE messages SET state = $1
@@ -179,6 +179,35 @@ impl MessageRepository for PgMessageRepository {
             return Err(AppError::MessageNotFound(message_id.0));
         }
         Ok(())
+    }
+
+    async fn update_content(
+        &self,
+        message_id: MessageId,
+        new_content: &JsonValue,
+    ) -> Result<Option<Message>, AppError> {
+        // 2026-10-03 新增。`UPDATE ... RETURNING` 一次往返拿到更新后的行,
+        // 免掉「UPDATE 再 SELECT」的第二趟 —— 也能保证返回的 content/edited_at
+        // 与库里一致(不与并发写竞争)。
+        //
+        // 不加 `WHERE state NOT IN ('recalled','deleted')`: 状态机判定属于
+        // service 层职责(它已经拿到旧行, 知道状态), 仓储层只负责落库。
+        // 两处都判会重复, 且仓储层无权决定业务规则。
+        let row: Option<MessageRow> = sqlx::query_as(
+            r#"
+            UPDATE messages
+            SET content = $1, edited_at = now()
+            WHERE id = $2
+            RETURNING id, conversation_id, sequence, sender_id, kind, content,
+                      reply_to, state, created_at, edited_at
+            "#,
+        )
+        .bind(new_content)
+        .bind(message_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx: {}", e)))?;
+        Ok(row.map(MessageRow::into_message))
     }
 }
 
@@ -269,16 +298,7 @@ impl MessageRow {
     }
 }
 
-fn message_state_to_str(s: MessageState) -> &'static str {
-    match s {
-        MessageState::Sent => "sent",
-        MessageState::Delivered => "delivered",
-        MessageState::Read => "read",
-        MessageState::Recalled => "recalled",
-        MessageState::Deleted => "deleted",
-    }
-}
-
+// 委托给枚举自身的 s_str(单一真源; 转换逻辑已移至 repository.rs)
 fn message_state_from_str(s: &str) -> MessageState {
     match s {
         "delivered" => MessageState::Delivered,
