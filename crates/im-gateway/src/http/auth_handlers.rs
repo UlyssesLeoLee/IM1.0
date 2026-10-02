@@ -440,29 +440,49 @@ pub async fn link_account(
 ///
 /// 流程:
 /// 1. Bearer 鉴权 (用 AuthedUser extractor)
-/// 2. 从 access_token claims 解 device_session_id (per aux-13 §3)
+/// 2. 从 access_token 的 `dsid` claim 取 device_session_id
 /// 3. 调 `IdentityService::logout(device_session_id)` → revoke session
 /// 4. 返 204 No Content
 ///
-/// 注: AuthedUser 当前 extract 出 user_id + env_id, 但 device_session_id 不在 claims 里.
-///     V1 实装时把 device_session_id 加 JWT claim; 当前 MVP 用 refresh_token split 提取.
-///     此处简化: 直接调 revoke 但需要 device_session_id, 列已知缺口 #2.
+/// ## 2026-10-03 实装 (此前本 handler 是死路)
+///
+/// 此前本函数无条件返回错误, 注释写「dsid claim 未实装」, 而 `mod.rs` 的注释
+/// 又写「兜底 401」—— 三处说法互不一致, 且实际返回的是 400 `ValidationError`。
+/// 后果: **access token 无法被吊销**, 泄露的 token 在有效期内一直可用。
+///
+/// 根因是 `TokenClaims` 里没有 `dsid`, 且 `issue_token_pair` 的顺序是
+/// 「先签 access token 后建 device session」—— 签名时 session id 还不存在。
+/// 两处都已修(im-core 侧), 本 handler 随之可以真正工作。
+///
+/// ## 旧 token 的行为
+///
+/// 本字段加入前签发的 token 没有 `dsid`, 解析为 `None`。此时返 **401** 而非
+/// 静默 204 —— 客户端须重新登录换一枚带 `dsid` 的 token 才能登出。
+/// 返 204 会让客户端以为已登出, 而服务端其实什么都没做(per 守门 #1
+/// 「缺标比错标安全」的同族原则: 宁可明确报错, 不给假的成功)。
 pub async fn logout(
     app: web::Data<AppState>,
-    _auth: super::state::AuthedUser,
+    auth: super::state::AuthedUser,
 ) -> Result<HttpResponse, actix_web::Error> {
-    // 已知缺口 (per 138 §8 + 2026-09-19 lane-backend-core-2):
-    // AuthedUser 当前不携带 device_session_id. JWT claims 需要扩展加 `dsid` 字段.
-    // 本 PR 走兜底路径: 从 Bearer token 的 JWT 解 claims, 找到 dsid 字段.
-    // 如果 dsid 缺失, 返 401 Unauthorized.
-    let _ = app; // 占位 — 实际需要解 dsid
+    let Some(session_id) = auth.device_session_id else {
+        return Err(json_response(
+            im_common::ErrorCode::Unauthorized,
+            None,
+            Some("access token carries no device session (dsid); re-authenticate to log out"),
+        ));
+    };
 
-    // 兜底: 返 501 Not Implemented + 缺口描述 (per守门 #1 缺标比错标)
-    Err(json_response(
-        im_common::ErrorCode::ValidationError,
-        None,
-        Some("C-7 logout: device_session_id (dsid) JWT claim 未实装, V1 实装 (per 138 §8 缺口 #2 + lane-backend-core-2 缺口)"),
-    ))
+    app.identity_service
+        .logout(session_id)
+        .await
+        .map_err(http_err)?;
+
+    tracing::info!(
+        user_id = %auth.user_id,
+        %session_id,
+        "device session revoked"
+    );
+    Ok(HttpResponse::NoContent().finish())
 }
 
 // ============================================================================
@@ -908,5 +928,134 @@ mod tests {
         .await
         .expect("count users");
         assert_eq!(count, 1, "验签通过应真的落库一个 user");
+    }
+
+    /// C-7: 登出必须**真的**吊销 device session, 而不是返个 204 就算数
+    ///
+    /// 此前本 handler 无条件报错(实为 400, 而两处注释分别写 501 / 401),
+    /// 后果是 access token 无法被吊销 —— 泄露的 token 在有效期内一直可用。
+    /// 故本测试的关键断言不是状态码, 而是 **`device_sessions.revoked_at`
+    /// 真的被写上了**(同源原则: 验「服务端状态真的变了」, 不验「返回了什么码」)。
+    #[actix_web::test]
+    async fn logout_revokes_the_device_session_in_db() {
+        let Some(p) = e2e_pool().await else { return };
+        let env = make_env(&p).await;
+        let state = test_app_state(&p, env, E2E_SECRET).await;
+
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(state)
+                .route("/v1/auth/token/exchange", web::post().to(token_exchange))
+                .route("/v1/auth/logout", web::post().to(logout)),
+        )
+        .await;
+
+        // 1. 先换一个 token(C-3 正常路径)
+        let uid = format!("e2e-logout-{}", Uuid::new_v4());
+        let body = format!(
+            r#"{{"environment_id":"{}","external_provider":"steam","external_uid":"{uid}"}}"#,
+            env.0
+        );
+        let now = chrono::Utc::now().timestamp();
+        let req = actix_web::test::TestRequest::post()
+            .uri("/v1/auth/token/exchange")
+            .insert_header(("Content-Type", "application/json"))
+            .insert_header((
+                "X-IM-Server-Signature",
+                sign_body(E2E_SECRET, body.as_bytes()),
+            ))
+            .insert_header(("X-IM-Timestamp", now.to_string()))
+            .set_payload(body)
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+
+        let json: serde_json::Value = actix_web::test::read_body_json(resp).await;
+        let access = json["access_token"]
+            .as_str()
+            .expect("access_token")
+            .to_string();
+        let dsid = Uuid::parse_str(
+            json["device_session_id"]
+                .as_str()
+                .expect("device_session_id"),
+        )
+        .expect("device_session_id 应是 UUID");
+
+        let revoked_of = |sid: Uuid| {
+            let p = p.clone();
+            async move {
+                sqlx::query_scalar::<_, Option<chrono::DateTime<chrono::Utc>>>(
+                    "SELECT revoked_at FROM device_sessions WHERE id = $1",
+                )
+                .bind(sid)
+                .fetch_one(&p)
+                .await
+                .expect("查 device_sessions")
+            }
+        };
+
+        // 2. 登出前: 该 session 必须是活的(否则本测试没有判别力)
+        assert!(
+            revoked_of(dsid).await.is_none(),
+            "登出前 session 不应已被吊销"
+        );
+
+        // 3. Bearer 登出
+        let req = actix_web::test::TestRequest::post()
+            .uri("/v1/auth/logout")
+            .insert_header(("Authorization", format!("Bearer {access}")))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::NO_CONTENT);
+
+        // 4. 关键断言: DB 里真的写了 revoked_at
+        assert!(
+            revoked_of(dsid).await.is_some(),
+            "logout 必须真的吊销 device session(不能只返 204)"
+        );
+    }
+
+    /// 缺 `dsid` 的旧 token 登出必须 401, **不能**返 204 假装成功
+    #[actix_web::test]
+    async fn logout_without_dsid_claim_returns_401() {
+        let Some(p) = e2e_pool().await else { return };
+        let env = make_env(&p).await;
+        let state = test_app_state(&p, env, E2E_SECRET).await;
+
+        // 走「不签 session」的旧路径: 这种 token 里没有 dsid claim
+        let user = im_core::identity::repository::User {
+            id: im_common::ids::UserId::new(),
+            environment_id: env,
+            kind: im_core::identity::repository::UserKind::User,
+            external_identity: None,
+            state: im_core::identity::repository::UserState::Active,
+            display_name: Some("legacy".into()),
+            username: None,
+            password_hash: None,
+            created_at: chrono::Utc::now(),
+        };
+        let legacy = state
+            .token_service
+            .issue_access_token(&user)
+            .expect("签旧式 token");
+
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(state)
+                .route("/v1/auth/logout", web::post().to(logout)),
+        )
+        .await;
+
+        let req = actix_web::test::TestRequest::post()
+            .uri("/v1/auth/logout")
+            .insert_header(("Authorization", format!("Bearer {}", legacy.0)))
+            .to_request();
+        let resp = actix_web::test::call_service(&app, req).await;
+        assert_eq!(
+            resp.status(),
+            actix_web::http::StatusCode::UNAUTHORIZED,
+            "无 dsid 的 token 无法定位会话, 应 401 而非假装登出成功"
+        );
     }
 }

@@ -223,6 +223,85 @@ handler 接了线。handler 可以明天再次忘记调用, 而 9 个测试全�
 判别力只能靠**故意注入缺陷**来证明, 不能靠绿灯推断; 而注入缺陷的过程本身
 会暴露测试自身的不可重入等缺陷。
 
+### 1.5 C-7 logout 是死路: access token 无法被吊销 (2026-10-03 发现并已修)
+
+#### 缺陷
+
+`POST /v1/auth/logout` **已注册路由**(`http/mod.rs`), 但 handler 无条件返回错误:
+
+```rust
+let _ = app; // 占位 — 实际需要解 dsid
+Err(json_response(ErrorCode::ValidationError, None, Some("C-7 logout: ... 未实装")))
+```
+
+**后果: 泄露的 access token 在有效期内无法被吊销** —— 服务端没有任何途径
+让一个 session 失效。这是**安全能力缺失**, 不是「功能没做」。
+
+#### 三处说法互相矛盾(比缺陷本身更值得记)
+
+同一个事实, 三处的描述各不相同:
+
+| 位置 | 说法 |
+|---|---|
+| `http/mod.rs` 路由注释 | 「device_session_id JWT claim 未实装, **兜底 401**」 |
+| handler 函数文档注释 | 「兜底: 返 **501** Not Implemented」 |
+| handler 实际代码 | 返 **400** `ValidationError` |
+
+**没有一处说对。** 读注释的人会以为「至少状态码是准确的」, 而实际行为与
+全部三处描述都不符。
+
+#### 根因: 签发顺序反了
+
+`IdentityService::issue_token_pair` 原本是:
+
+1. `issue_access_token(&user)` —— 先签 access token
+2. `device_repo.create(...)` —— 后建 device session
+
+但 `dsid` claim 要写进 access token, **签名时 session id 还不存在**。
+所以不是「忘了加 claim」这么简单, 是**顺序必须重排**才能加。
+
+修法(全部三处):
+
+1. `TokenClaims` 新增 `dsid: Option<String>`
+   (`#[serde(default, skip_serializing_if = "Option::is_none")]`)
+2. `TokenService::issue_access_token_for_session(user, Option<DeviceSessionId>)`;
+   原 `issue_access_token(user)` 保留为 `dsid=None` 的薄封装(不改动既有调用点)
+3. `issue_token_pair` **先建 session 再签 token**
+4. `AuthedUser` 新增 `device_session_id`, 由 extractor 从 claims 填充
+5. `logout` 真正调 `IdentityService::logout` → `device_repo.revoke` → 返 204
+
+#### 顺带更正: C-6 的路由注释是错的
+
+`http/mod.rs` 写「C-6 link_account 待 UPDATE 实现, 当前返 InternalError」——
+**不成立**。`IdentityService::link_account` 早已实装完整的 5 步
+guest→user 升级流程(验 token / 校验 kind='guest' / 唯一性由
+`uniq_users_env_extid` 兜底 / UPDATE / 重签 TokenPair)。已更正该注释。
+
+#### 旧 token 的降级行为
+
+本字段加入前签发的 token 没有 `dsid`, 解析为 `None`, 此时 logout 返 **401**
+而非静默 204 —— 返 204 会让客户端以为已登出而服务端什么都没做。
+客户端须重新登录换一枚带 `dsid` 的 token。
+
+#### 新增测试(5 个)
+
+`token.rs`(3 个, 纯 serde 层): `dsid` 往返 / 无 session 时 `dsid` 为 `None`
+而非空串(供 logout 区分新旧 token) / 旧 token 不含该 JSON 字段但仍能解析。
+`auth_handlers.rs`(2 个, 真 PG 端到端):
+
+- `logout_revokes_the_device_session_in_db` —— 登录 → 登出 → 断言
+  **`device_sessions.revoked_at` 真的被写入**。关键断言不是状态码, 而是
+  服务端状态真的变了(同源原则)
+- `logout_without_dsid_claim_returns_401` —— 缺 `dsid` 返 401 而非假装成功
+
+**变异测试**: 把 `logout` 改成「返 204 但不调 revoke」, 该用例在
+「logout 必须真吊销」断言上 **FAILED** —— 证明它测的是状态变化而非状态码。
+
+**共性**: 本例与 §1.1/§1.2/§1.3 同族 —— **文档/注释描述了一个不存在的
+实现**。不同之处在于前三处是「文档说有, 代码没有」, 本处是「文档说有,
+代码有一个永远失败的桩, 而文档对它的失败方式描述得都不一样」。
+
+
 
 ---
 

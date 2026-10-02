@@ -74,4 +74,10 @@ pub struct AuthedUser {
     #[allow(dead_code)]
     pub tenant_id: String,
     pub kind: String, // "user" | "guest"
+    /// 该 access token 绑定的 device session (来自 JWT `dsid` claim)
+    ///
+    /// 2026-10-03 (C-7 logout 实装): `POST /v1/auth/logout` 靠它调
+    /// `IdentityService::logout` → `device_repo.revoke` 真正吊销会话。
+    /// `None` = token 是本字段加入前签发的旧 token, 或非本服务签发。
+    pub device_session_id: Option<im_common::ids::DeviceSessionId>,
 }

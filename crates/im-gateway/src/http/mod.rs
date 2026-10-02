@@ -24,8 +24,11 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     //   C-3 POST /auth/token/exchange → auth_handlers::token_exchange
     //   C-4 POST /auth/guest         → auth_handlers::guest
     //   C-5 POST /auth/refresh       → auth_handlers::refresh (per 138 §8 缺口 #8 fix 用 find_by_id)
-    //   C-6 POST /auth/link          → auth_handlers::link_account (IdentityService::link_account 待 UPDATE 实现, 当前返 InternalError)
-    //   C-7 POST /auth/logout        → auth_handlers::logout (per 138 §8 缺口 #2 device_session_id JWT claim 未实装, 兜底 401)
+    //   C-6 POST /auth/link          → auth_handlers::link_account
+    //     (2026-10-03 更正: 本行原注释「待 UPDATE 实现, 当前返 InternalError」
+    //      已过时 —— IdentityService::link_account 早已实装 guest→user 升级)
+    //   C-7 POST /auth/logout        → auth_handlers::logout (2026-10-03 已实装:
+    //     dsid claim 加入 TokenClaims, 此前本端点无条件报错, access token 无法吊销)
     cfg.service(
         actix_web::web::scope("/auth")
             .route(

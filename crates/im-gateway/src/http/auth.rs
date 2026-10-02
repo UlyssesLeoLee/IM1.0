@@ -104,6 +104,7 @@ impl FromRequest for AuthedUser {
                 environment_id,
                 tenant_id: claims.tenant,
                 kind: claims.kind,
+                device_session_id: parse_dsid(claims.dsid.as_deref()),
             })
         })
     }
@@ -131,5 +132,15 @@ pub async fn validate_bearer(
         environment_id,
         tenant_id: claims.tenant,
         kind: claims.kind,
+        device_session_id: parse_dsid(claims.dsid.as_deref()),
     })
+}
+
+/// 解析 JWT `dsid` claim → `DeviceSessionId`
+///
+/// **fail-open 为 `None` 而非 401**: 本字段只决定 logout 能否定位到会话,
+/// 解析不了不该让整个请求失败(那会把一个可优雅降级的场景变成全局 401)。
+/// `logout` handler 见到 `None` 会返回明确错误, 不静默成功。
+fn parse_dsid(raw: Option<&str>) -> Option<im_common::ids::DeviceSessionId> {
+    raw?.parse().ok()
 }

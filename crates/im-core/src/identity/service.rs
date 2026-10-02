@@ -285,10 +285,11 @@ where
 
     /// 签发 token pair
     async fn issue_token_pair(&self, user: User) -> Result<TokenPair, AppError> {
-        let access = self
-            .token_service
-            .issue_access_token(&user)
-            .map_err(AppError::from)?;
+        // 2026-10-03 (C-7 logout 实装): 顺序必须是 **先建 device session, 再签
+        // access token** —— `dsid` claim 要写进 token, 签名时 session id 必须已知。
+        // 此前是反过来的(先签 token 后建 session), 导致 access token 里拿不到
+        // device session, `POST /v1/auth/logout` 永远无法吊销。
+        //
         // refresh token 用 crypto-random UUID,hash 后存 DB
         let refresh_raw = Uuid::new_v4().to_string();
         let refresh_hash = crate::common::crypto::sha256_hex(&refresh_raw);
@@ -296,6 +297,11 @@ where
             .device_repo
             .create(user.id, None, &refresh_hash)
             .await?;
+
+        let access = self
+            .token_service
+            .issue_access_token_for_session(&user, Some(device_session.id))
+            .map_err(AppError::from)?;
 
         Ok(TokenPair {
             access_token: access,

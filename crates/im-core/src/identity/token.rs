@@ -78,6 +78,14 @@ pub struct TokenClaims {
     pub iat: i64,       // issued at
     pub kind: String,   // user | guest
     pub kid: String,    // signing key id(用于轮换期识别)
+    /// device_session_id (UUID 字符串) —— 缺省时 `None`。
+    ///
+    /// 2026-10-03 实装 C-7 logout 所需: 没有它, Bearer token 里就取不到
+    /// device session, `POST /v1/auth/logout` 无法吊销该 session
+    /// (`IdentityService::logout` 只能靠这个 id 调 `device_repo.revoke`)。
+    /// 本字段加入前签发的旧 token 解析出来是 `None`, 处理方式见 `logout` handler。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dsid: Option<String>,
 }
 
 /// Token 对
@@ -122,8 +130,24 @@ impl TokenService {
         }
     }
 
-    /// 签发 Access Token
+    /// 签发 Access Token(不带 device session —— claims 里无 `dsid`)
+    ///
+    /// 保留本入口是为了不改动既有调用点/测试; **签发登录/注册类 token 时应改用
+    /// [`Self::issue_access_token_for_session`]**, 否则该 token 无法用于 logout。
     pub fn issue_access_token(&self, user: &User) -> Result<AccessToken, TokenError> {
+        self.issue_access_token_for_session(user, None)
+    }
+
+    /// 签发 Access Token, 把 device_session_id 写进 `dsid` claim
+    ///
+    /// 2026-10-03 (C-7 logout 实装): 调用方必须**先**建好 device session 拿到
+    /// id, 再签 access token —— 签发时 session id 还不存在的话, `dsid` 只能是
+    /// `None`, logout 随之失效。`IdentityService::issue_token_pair` 已按此顺序重排。
+    pub fn issue_access_token_for_session(
+        &self,
+        user: &User,
+        device_session_id: Option<DeviceSessionId>,
+    ) -> Result<AccessToken, TokenError> {
         // 用第 1 个 key 签发(轮换时仍可用 v1 签发,v2 用于校验新发的 v2 token)
         let key = &self.signing_keys[0];
         let now = Utc::now();
@@ -138,6 +162,7 @@ impl TokenService {
                 super::repository::UserKind::Guest => "guest".into(),
             },
             kid: key.kid.clone(),
+            dsid: device_session_id.map(|id| id.to_string()),
         };
 
         let mut header = Header::new(Algorithm::HS256);
@@ -257,6 +282,52 @@ mod tests {
         let token_v1 = svc.issue_access_token(&test_user()).unwrap();
         let claims = svc.validate_access_token(&token_v1.0).unwrap();
         assert_eq!(claims.kid, "v1");
+    }
+
+    // -------- C-7: dsid claim --------
+
+    fn svc1() -> TokenService {
+        TokenService::new(
+            vec![key("v1")],
+            ChronoDuration::seconds(900),
+            SecretString::new("pepper".into()),
+        )
+    }
+
+    #[test]
+    fn dsid_claim_roundtrips_when_session_known() {
+        // 实装 C-7 logout 的前提: access token 必须携带 device session id
+        let svc = svc1();
+        let sid = DeviceSessionId::new();
+        let token = svc
+            .issue_access_token_for_session(&test_user(), Some(sid))
+            .unwrap();
+        let claims = svc.validate_access_token(&token.0).unwrap();
+        assert_eq!(claims.dsid.as_deref(), Some(sid.to_string().as_str()));
+    }
+
+    #[test]
+    fn dsid_claim_absent_when_no_session() {
+        // 不带 session 签发的 token 必须**没有** dsid 字段(而非空串),
+        // 这样 logout 才能区分「旧 token」和「有 session 的 token」
+        let svc = svc1();
+        let token = svc.issue_access_token(&test_user()).unwrap();
+        let claims = svc.validate_access_token(&token.0).unwrap();
+        assert!(claims.dsid.is_none());
+    }
+
+    #[test]
+    fn legacy_token_without_dsid_field_still_parses() {
+        // 本字段加入前签发的 token 里根本没有 dsid 这个 JSON key。
+        // serde(default) 保证它们仍能解析(而不是整个 401), dsid 解析为 None。
+        let svc = svc1();
+        let token = svc.issue_access_token(&test_user()).unwrap();
+        assert!(
+            !token.0.contains("dsid"),
+            "skip_serializing_if 应让无 dsid 的 token 不带该字段"
+        );
+        let claims = svc.validate_access_token(&token.0).unwrap();
+        assert!(claims.dsid.is_none());
     }
 
     #[test]
