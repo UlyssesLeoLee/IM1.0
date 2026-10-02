@@ -15,6 +15,7 @@ use chrono::Utc;
 use im_common::ids::{DeviceSessionId, EnvironmentId, UserId};
 use im_common::AppError;
 use secrecy::Secret;
+use secrecy::SecretString;
 use uuid::Uuid;
 
 use super::repository::{ExternalIdentity, User, UserKind, UserRepository, UserState};
@@ -349,5 +350,176 @@ async fn c6_case3_link_account_ext_owned_by_other_user_returns_conflict() {
     assert!(
         user_b_after.external_identity.is_none(),
         "user B ext 仍为 None (conflict 不写入)"
+    );
+}
+
+// ============================================================================
+// S2S 签名校验 (2026-10-03 安全修复)
+// ============================================================================
+//
+// 背景: `POST /v1/auth/token/exchange` 曾把 `server_signature_verified`
+// 硬编码为 true, 注释假定"HMAC 在中间件层已校验" —— 但该中间件从未实现。
+// 结果是任何人 POST 任意 `external_uid` 即可换到该账号的 access token。
+// 现由 `IdentityService::verify_server_signature` 真实验签 (per aux-13 §3.1)。
+//
+// 这些用例锁住"没有正确签名就**一定**拿不到 token"这条不变量。
+
+const TEST_SERVER_SECRET: &str = "s2s-hmac-secret-for-signature-tests";
+const TEST_BODY: &[u8] = br#"{"environment_id":"7c9e6679-7425-40de-944b-e07fc1f90ae7","external_provider":"steam","external_uid":"12345"}"#;
+
+/// 造一个带 server_secrets 的 IdentityService (内存 repo 即可, 验签不碰 DB)
+fn make_identity_service_with_secrets(
+    secrets: Vec<(EnvironmentId, SecretString)>,
+) -> IdentityService<InMemoryUserRepo, InMemoryDeviceRepo> {
+    IdentityService::new(
+        InMemoryUserRepo::default(),
+        InMemoryDeviceRepo,
+        make_token_service(),
+        secrets.into_iter().collect(),
+    )
+}
+
+fn sign(secret: &str, body: &[u8]) -> String {
+    crate::common::crypto::hmac_sha256_hex(secret.as_bytes(), body)
+}
+
+#[test]
+fn valid_signature_is_accepted() {
+    let env = EnvironmentId::new();
+    let svc = make_identity_service_with_secrets(vec![(
+        env,
+        SecretString::new(TEST_SERVER_SECRET.to_string()),
+    )]);
+    let now = 1_700_000_000_i64;
+    let sig = sign(TEST_SERVER_SECRET, TEST_BODY);
+
+    svc.verify_server_signature(env, TEST_BODY, Some(&sig), Some(now), now)
+        .expect("正确签名 + 新鲜时间戳必须通过");
+}
+
+#[test]
+fn missing_signature_is_rejected() {
+    let env = EnvironmentId::new();
+    let svc = make_identity_service_with_secrets(vec![(
+        env,
+        SecretString::new(TEST_SERVER_SECRET.to_string()),
+    )]);
+    let now = 1_700_000_000_i64;
+
+    let res = svc.verify_server_signature(env, TEST_BODY, None, Some(now), now);
+    assert!(
+        matches!(res, Err(AppError::Unauthorized(_))),
+        "缺 X-IM-Server-Signature 必须拒, 实际 {res:?}"
+    );
+}
+
+#[test]
+fn wrong_signature_is_rejected() {
+    let env = EnvironmentId::new();
+    let svc = make_identity_service_with_secrets(vec![(
+        env,
+        SecretString::new(TEST_SERVER_SECRET.to_string()),
+    )]);
+    let now = 1_700_000_000_i64;
+
+    // 用错误 secret 算出的签名
+    let forged = sign("attacker-guessed-secret", TEST_BODY);
+    let res = svc.verify_server_signature(env, TEST_BODY, Some(&forged), Some(now), now);
+    assert!(
+        matches!(res, Err(AppError::Unauthorized(_))),
+        "签名不匹配必须拒, 实际 {res:?}"
+    );
+}
+
+#[test]
+fn signature_over_different_body_is_rejected() {
+    // 关键: 签名必须绑定**原始 body**。若攻击者截获一个合法请求, 把 body 里的
+    // external_uid 改成别人的, 原签名就失效。
+    let env = EnvironmentId::new();
+    let svc = make_identity_service_with_secrets(vec![(
+        env,
+        SecretString::new(TEST_SERVER_SECRET.to_string()),
+    )]);
+    let now = 1_700_000_000_i64;
+    let sig = sign(TEST_SERVER_SECRET, TEST_BODY);
+
+    let tampered: &[u8] = br#"{"environment_id":"7c9e6679-7425-40de-944b-e07fc1f90ae7","external_provider":"steam","external_uid":"99999-victim"}"#;
+    let res = svc.verify_server_signature(env, tampered, Some(&sig), Some(now), now);
+    assert!(
+        matches!(res, Err(AppError::Unauthorized(_))),
+        "body 被篡改后原签名必须失效, 实际 {res:?}"
+    );
+}
+
+#[test]
+fn stale_timestamp_is_rejected() {
+    let env = EnvironmentId::new();
+    let svc = make_identity_service_with_secrets(vec![(
+        env,
+        SecretString::new(TEST_SERVER_SECRET.to_string()),
+    )]);
+    let now = 1_700_000_000_i64;
+    let sig = sign(TEST_SERVER_SECRET, TEST_BODY);
+
+    // 窗口为 ±300s; 用超出窗口的旧时间戳
+    let stale = now
+        - IdentityService::<InMemoryUserRepo, InMemoryDeviceRepo>::SIGNATURE_TIMESTAMP_WINDOW_SECS
+        - 1;
+    let res = svc.verify_server_signature(env, TEST_BODY, Some(&sig), Some(stale), now);
+    assert!(
+        matches!(res, Err(AppError::Unauthorized(_))),
+        "过期时间戳必须拒(否则捕获的请求可重放), 实际 {res:?}"
+    );
+}
+
+#[test]
+fn missing_timestamp_is_rejected() {
+    let env = EnvironmentId::new();
+    let svc = make_identity_service_with_secrets(vec![(
+        env,
+        SecretString::new(TEST_SERVER_SECRET.to_string()),
+    )]);
+    let now = 1_700_000_000_i64;
+    let sig = sign(TEST_SERVER_SECRET, TEST_BODY);
+
+    let res = svc.verify_server_signature(env, TEST_BODY, Some(&sig), None, now);
+    assert!(
+        matches!(res, Err(AppError::Unauthorized(_))),
+        "缺 X-IM-Timestamp 必须拒, 实际 {res:?}"
+    );
+}
+
+#[test]
+fn environment_without_configured_secret_is_rejected() {
+    // 未配 secret 的环境不能被兑换 —— fail-closed, 而不是"没有 secret 就放行"
+    let svc = make_identity_service_with_secrets(vec![]);
+    let now = 1_700_000_000_i64;
+    let sig = sign(TEST_SERVER_SECRET, TEST_BODY);
+
+    let res =
+        svc.verify_server_signature(EnvironmentId::new(), TEST_BODY, Some(&sig), Some(now), now);
+    assert!(
+        matches!(res, Err(AppError::Unauthorized(_))),
+        "该环境未配 server secret 时必须拒, 实际 {res:?}"
+    );
+}
+
+#[test]
+fn signature_from_other_environment_secret_is_rejected() {
+    // A 环境的 secret 不能给 B 环境用
+    let env_a = EnvironmentId::new();
+    let env_b = EnvironmentId::new();
+    let svc = make_identity_service_with_secrets(vec![(
+        env_a,
+        SecretString::new("secret-for-env-a".to_string()),
+    )]);
+    let now = 1_700_000_000_i64;
+    let sig_a = sign("secret-for-env-a", TEST_BODY);
+
+    // 用 A 的 secret 签的, 拿去请求 B
+    let res = svc.verify_server_signature(env_b, TEST_BODY, Some(&sig_a), Some(now), now);
+    assert!(
+        matches!(res, Err(AppError::Unauthorized(_))),
+        "A 环境的签名不得用于 B 环境, 实际 {res:?}"
     );
 }

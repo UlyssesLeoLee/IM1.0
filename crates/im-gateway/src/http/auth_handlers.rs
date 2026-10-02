@@ -6,7 +6,16 @@
 //! ## 范围 (per 132-wbs.md §5.3.2 + task brief 2026-09-19)
 //!
 //! ### C-3 `POST /v1/auth/token/exchange`
-//! - 游戏服务器 token 兑换 (HMAC 签名已在中间件层验证;此处假定 `server_signature_verified=true`)
+//! - 游戏服务器 token 兑换
+//! - **2026-10-03 安全修复**: 本 handler 此前**假定**"HMAC 签名已在中间件层验证"
+//!   并把 `server_signature_verified` 硬编码为 `true`, 但该中间件从未实现
+//!   (`http/auth.rs` 明说"留给 auth-lane worker")。结果是任何能访问本端点的人
+//!   POST 任意 `external_uid` 即可换到该账号的 access token。
+//!   现改为**真实验签** (per aux-13 §3.1):
+//!   `X-IM-Server-Signature` = hex(HMAC-SHA256(server_secret, 原始 body)),
+//!   外加 `X-IM-Timestamp` 新鲜度校验 (±300s), 由
+//!   `IdentityService::verify_server_signature` 承担。
+//! - nonce 防重放**尚未实现**(需 Valkey 共享存储, WBS D-4), 见 gap-ledger
 //! - 接收 `{ environment_id, external_provider, external_uid, display_name }`
 //! - 调 `IdentityService::server_exchange_token`
 //! - 返回 `{ access_token, refresh_token, user_id, expires_in, device_session_id }`
@@ -35,7 +44,7 @@
 //!
 //! 不测真实 sqlx 调用 (留 PG 集成测试,WSL PG 18.6 未启 → FAIL 是已知)
 
-use actix_web::{web, HttpResponse};
+use actix_web::{web, HttpRequest, HttpResponse};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -123,21 +132,36 @@ pub struct TokenExchangeRequest {
 /// `POST /v1/auth/token/exchange`
 ///
 /// 流程:
-/// 1. 校验必填字段 (external_provider / external_uid 非空)
-/// 2. 构造 `ServerExchangeCommand` (server_signature_verified=true — HMAC 校验在中间件层)
-/// 3. 调 `IdentityService::server_exchange_token`
-/// 4. 返 TokenResponse 200
+/// 1. 读取**原始 body 字节**并解析 DTO (签名基于原始字节, 不能先反序列化)
+/// 2. 校验 `X-IM-Server-Signature` + `X-IM-Timestamp` (per aux-13 §3.1)
+/// 3. 构造 `ServerExchangeCommand` (`server_signature_verified` = 第 2 步的真实结果)
+/// 4. 调 `IdentityService::server_exchange_token`
+/// 5. 返 TokenResponse 200
 ///
 /// 错误:
-/// - 400 `VALIDATION_ERROR` — external_provider / external_uid 空
-/// - 401 `UNAUTHORIZED` — signature 未通过 (理论上中间件已拦, 此处兜底)
+/// - 400 `VALIDATION_ERROR` — external_provider / external_uid 空 / body 非合法 JSON
+/// - 401 `UNAUTHORIZED` — 签名缺失/不匹配/时间戳不新鲜/该环境未配 server secret
 /// - 403 `ACCOUNT_BANNED` / `ACCOUNT_SUSPENDED` — 用户 state 禁用
 /// - 500 `INTERNAL_ERROR` — sqlx / 其他
 pub async fn token_exchange(
     app: web::Data<AppState>,
-    body: web::Json<TokenExchangeRequest>,
+    body: web::Bytes,
+    http_req: HttpRequest,
 ) -> Result<HttpResponse, actix_web::Error> {
-    let req = body.into_inner();
+    // 2026-10-03 安全修复(可利用漏洞): 此前本 handler 用 `web::Json<..>` 直接
+    // 反序列化, 并把 `server_signature_verified` **硬编码为 true**, 注释假定
+    // "HMAC 在中间件层已校验" —— 但该中间件从未实现(auth.rs 明说留给后续
+    // worker)。后果: 任何能访问本端点的人 POST 任意 external_uid 即可换到
+    // 该账号的 access token。现改为真实验签。
+    //
+    // 签名基于**原始字节**, 所以不能用 `web::Json`(它会消费并丢弃原始 body)。
+    let req: TokenExchangeRequest = serde_json::from_slice(&body).map_err(|e| {
+        json_response(
+            im_common::ErrorCode::ValidationError,
+            None,
+            Some(&format!("invalid JSON body: {e}")),
+        )
+    })?;
 
     // 1. field validation
     if req.external_provider.trim().is_empty() {
@@ -155,19 +179,39 @@ pub async fn token_exchange(
         ));
     }
 
-    // 2. 构造 command
-    // 注: server_signature_verified 假定 = true (HMAC 中间件层已校验, 本 handler 不重做)
-    // V1 时: 从 request extension / TLS context 拿真实验签结果
+    // 2. 真实验签 (per aux-13 §3.1)
+    let sig = header_str(&http_req, "X-IM-Server-Signature");
+    let ts = header_str(&http_req, "X-IM-Timestamp").and_then(|s| s.trim().parse::<i64>().ok());
+    let now = chrono::Utc::now().timestamp();
+    app.identity_service
+        .verify_server_signature(
+            EnvironmentId(req.environment_id),
+            &body,
+            sig.as_deref(),
+            ts,
+            now,
+        )
+        .map_err(|e| {
+            json_response(
+                im_common::ErrorCode::Unauthorized,
+                None,
+                Some(&e.to_string()),
+            )
+        })?;
+
+    // 3. 构造 command —— 走到这里说明验签已通过
     let provider = req.external_provider.clone();
     let cmd = ServerExchangeCommand {
         environment_id: EnvironmentId(req.environment_id),
         external_provider: req.external_provider,
         external_uid: req.external_uid,
         display_name: req.display_name,
+        // 走到这里说明 `verify_server_signature` 已返回 Ok; 这个 true 是上一步
+        // 验签成功的**结果**, 不再是"假定中间件已验过"的硬编码。
         server_signature_verified: true,
     };
 
-    // 3. dispatch
+    // 4. dispatch
     let pair: TokenPair = app
         .identity_service
         .server_exchange_token(cmd)
@@ -182,6 +226,14 @@ pub async fn token_exchange(
         "token exchanged"
     );
     Ok(HttpResponse::Ok().json(resp))
+}
+
+/// 读一个 header 并转为 owned String; 缺失或非 UTF-8 时返回 None
+fn header_str(req: &HttpRequest, name: &str) -> Option<String> {
+    req.headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
 }
 
 // ============================================================================

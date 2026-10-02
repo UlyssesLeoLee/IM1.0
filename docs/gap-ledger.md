@@ -126,6 +126,61 @@ match serde_json::from_str::<ClientFrame>(text_str) {
 让编译或任何现有测试失败 —— 它们只会在真实客户端按协议发帧时才暴露。故本次
 一并把 WS 分派的每个分支对照 `im_protocol::ws_frames` 核过一遍。
 
+### 1.3 严重安全漏洞: token_exchange 端点**无任何签名验证** (2026-10-03 发现并已修)
+
+**这是至今发现的最严重问题, 严重性高于前两个 WS 功能缺陷 —— 前两个导致资源泄漏,
+这个导致凭据伪造。**
+
+#### 缺陷
+
+`POST /v1/auth/token/exchange` **已注册路由**(`http/mod.rs` L31-34), 而
+`http/mod.rs` L7 的注释还声称「MVP Day 4: C-3..C-7 wired」。但实际上:
+
+- `http/auth.rs` L11 明确写着「C-3 (token_exchange + **HMAC 签名校验**) 留给
+  auth-lane worker」—— **该中间件从未实现**
+- `auth_handlers.rs` 把 `server_signature_verified` **硬编码为 `true`**, 注释
+  假定「HMAC 在中间件层已校验」
+- `IdentityService::server_secrets` 字段收了 `main.rs` 传入的
+  `HashMap<EnvironmentId, SecretString>`, 但**从未被读取**
+- `server_exchange_token` 只信任调用方传的布尔值, 内部无任何签名校验
+
+**后果**: 任何能访问该端点的人, POST 任意
+`{environment_id, external_provider, external_uid}` 即可换到**该 external_uid
+对应账号的 access token** —— 即冒充任意游戏账号。`server_exchange_token` 里那句
+`if !cmd.server_signature_verified { return Unauthorized }` 的保护形同虚设。
+
+#### 修法
+
+协议早已定义(aux-13 §3.1), 依赖也早已在 workspace 里(`hmac`/`sha2`/`hex`),
+`main.rs` 也已把 secret 传进 `IdentityService` —— **唯一缺的是验证逻辑本身**:
+
+1. `IdentityService::verify_server_signature(env, raw_body, sig, ts, now)`:
+   - 缺 signature / 缺 timestamp → `Unauthorized`
+   - `|now - ts| > 300s` → `Unauthorized`(压重放窗口到 10 分钟)
+   - 该 environment 未配 secret → `Unauthorized`(**fail-closed**)
+   - `hex(HMAC-SHA256(secret, raw_body))` 用**恒定时间比较**(新加
+     `common::crypto::constant_time_eq`, 防时序攻击)
+2. handler 签名从 `web::Json<TokenExchangeRequest>` 改为 `web::Bytes` + `HttpRequest`
+   —— 签名基于**原始字节**, `web::Json` 会消费并丢弃原始 body, 无法复原
+3. 验签通过后才设 `server_signature_verified: true` —— 此时的 `true` 是验签结果,
+   不是假设
+
+#### 新增测试(9 个)
+
+`identity/tests.rs`: 正确签名通过 / 缺签名拒 / 错签名拒 / **body 被篡改后原签名失效**
+/ 过期时间戳拒 / 缺时间戳拒 / 未配 secret 拒(fail-closed)/ **A 环境签名不能用于
+B 环境**; `crypto.rs`: 恒定时间比较与普通 `==` 行为一致。
+
+#### 仍然未做: nonce 防重放
+
+协议有 `X-IM-Nonce`, 但服务端既不校验也不记录 —— 同一合法请求可在 ±300s 窗口内
+**重放**。完整防重放需跨实例共享存储 → 依赖 **WBS D-4 (Valkey)**。已记入 §2 缺口表。
+时间戳窗口只能把重放窗口压到 10 分钟, **不能消除**。
+
+**教训**: 这个漏洞的成因是「注释里写了一个不存在的前置条件(中间件已校验), 而后来者
+读到注释就相信了它」。它和 §1.1/§1.2 的两个 WS 缺陷是同一族 —— **注释/文档里的
+断言必须由代码验证, 不能由注释自证**。三处都是「文档声称有, 代码里没有」。
+
 ---
 
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
@@ -134,7 +189,8 @@ match serde_json::from_str::<ClientFrame>(text_str) {
 |---|---|---|
 | `crates/im-gateway/src/health.rs:15` `readyz()` | F-4 (healthz/readyz) 路由尚未接线 | 依赖 **F-2 / F-3 (K3s 部署)**, 二者受 F-1 (Docker daemon 间歇性故障) 阻塞 |
 | `crates/im-gateway/src/http/state.rs:71` `AuthedUser.tenant_id` | 已聚合进鉴权上下文, 但现有 handler 尚未按租户过滤 | 多租户隔离随 **G-1 / V1** 落地 |
-| `crates/im-core/src/identity/service.rs:49` `server_secrets` | S2S token exchange 要按 environment 取 secret, 接线未完成 | **WBS C-3** 接线 |
+| ~~`crates/im-core/src/identity/service.rs` `server_secrets`~~ | ~~S2S token exchange 要按 environment 取 secret, 接线未完成~~ | ✅ **已接线** (2026-10-03): 被 `IdentityService::verify_server_signature` 真正使用, 见 §1.3 |
+| `crates/im-gateway/src/http/auth_handlers.rs` `token_exchange` **nonce 防重放** | 协议有 `X-IM-Nonce`, 但服务端**未校验也未记录** —— 同一合法请求可在 ±300s 窗口内重放 | 需跨实例共享存储 → **WBS D-4 (Valkey)** 落地后接 |
 | `crates/im-gateway/src/placeholder.rs` (整文件) | 10 个端点桩函数未被调用 | 该文件唯一职责就是存放未接线桩; 各端点随对应 WBS 项落地 |
 
 ---

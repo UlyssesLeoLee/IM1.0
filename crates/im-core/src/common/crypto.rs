@@ -17,9 +17,35 @@ pub fn hmac_sha256_hex(key: &[u8], input: &[u8]) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
+/// 恒定时间字节串比较(防时序攻击)
+///
+/// 用于比对本该是**密文/签名**的值: 普通 `==` 会在第一个不同字节处短路,
+/// 攻击者可通过测量响应时间逐字节猜出正确签名。
+///
+/// 注意: 本实现只在**长度相同**时逐字节 XOR; 长度不同直接返回 false。
+/// 长度本身通常不是秘密(HMAC-SHA256 固定 32 字节), 故不额外隐藏。
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_time_eq_matches_regular_eq() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"ab"));
+        assert!(constant_time_eq(b"", b""));
+    }
 
     #[test]
     fn sha256_known_vector() {

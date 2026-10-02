@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use im_common::ids::{EnvironmentId, UserId};
 use im_common::AppError;
+use secrecy::ExposeSecret;
 
 use super::password::{
     hash_password, validate_password_strength, validate_username, verify_password,
@@ -43,9 +44,11 @@ pub struct IdentityService<U: UserRepository, D: DeviceSessionRepository> {
     pub(crate) user_repo: U,
     pub(crate) device_repo: D,
     token_service: std::sync::Arc<TokenService>,
-    // 守门 #1 缺口台账: S2S token exchange 要按 environment 取 secret, 接线未完成。
-    // 保留字段不删, 待 WBS C-3 接线; per docs/Project-Status.md 1.1.1 占位符保留约定。
-    #[allow(dead_code)]
+    /// S2S token exchange 的每环境 HMAC 密钥 (per aux-13 §3.1)
+    ///
+    /// 2026-10-03 起**已被真正使用** —— 见 [`Self::verify_server_signature`]。
+    /// 此前该字段收了但从不读取, 导致 handler 只能把
+    /// `server_signature_verified` 硬编码为 true, 认证端点形同无门。
     server_secrets: std::collections::HashMap<EnvironmentId, secrecy::SecretString>,
 }
 
@@ -70,6 +73,64 @@ where
 
     /// Server-to-Server Token Exchange
     /// GAME-ID-003 红线:仅游戏服务器可调,HMAC 签名已校验
+    /// S2S 签名时间戳允许的偏差 (秒) —— ±300s
+    ///
+    /// 超出该窗口的签名即便 HMAC 正确也拒绝, 否则捕获的请求可被无限期重放。
+    /// 取 300s 是为了容忍跨区部署的游戏服务器时钟漂移。
+    pub const SIGNATURE_TIMESTAMP_WINDOW_SECS: i64 = 300;
+
+    /// 校验 S2S 请求的 HMAC 签名 (per aux-13 §3.1)
+    ///
+    /// 协议:
+    /// ```text
+    /// X-IM-Server-Signature: hex(HMAC-SHA256(server_secret, raw_body))
+    /// X-IM-Timestamp: <unix 秒>
+    /// X-IM-Nonce: <random>
+    /// ```
+    ///
+    /// 注意: **nonce 防重放未实现** —— 那需要跨实例共享存储(Valkey, WBS D-4),
+    /// 在此之前同一请求可在时间窗口内重放。已记入 `docs/gap-ledger.md`。
+    /// 时间戳窗口只能把重放窗口压到 10 分钟, 不能消除。
+    ///
+    /// `raw_body` 必须是**未经反序列化的原始字节** —— 若先 parse 成 struct 再
+    /// 重新序列化, 字段顺序/空白可能变化, 签名就对不上了。
+    ///
+    /// # Errors
+    /// - `Unauthorized` — 缺 header / 签名不匹配 / 时间戳不新鲜 / 该环境未配 secret
+    pub fn verify_server_signature(
+        &self,
+        environment_id: EnvironmentId,
+        raw_body: &[u8],
+        signature_hex: Option<&str>,
+        timestamp_secs: Option<i64>,
+        now_unix: i64,
+    ) -> Result<(), AppError> {
+        let sig = signature_hex
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| AppError::Unauthorized("missing X-IM-Server-Signature header".into()))?;
+        let ts = timestamp_secs
+            .ok_or_else(|| AppError::Unauthorized("missing X-IM-Timestamp header".into()))?;
+
+        // 时间新鲜度先查(比 HMAC 便宜, 且失败时不泄漏 secret 是否存在)
+        if (now_unix - ts).abs() > Self::SIGNATURE_TIMESTAMP_WINDOW_SECS {
+            return Err(AppError::Unauthorized(format!(
+                "signature timestamp out of range (|now-ts| > {}s)",
+                Self::SIGNATURE_TIMESTAMP_WINDOW_SECS
+            )));
+        }
+
+        let secret = self.server_secrets.get(&environment_id).ok_or_else(|| {
+            AppError::Unauthorized("no server secret configured for this environment".into())
+        })?;
+
+        let expected =
+            crate::common::crypto::hmac_sha256_hex(secret.expose_secret().as_bytes(), raw_body);
+        if !crate::common::crypto::constant_time_eq(expected.as_bytes(), sig.as_bytes()) {
+            return Err(AppError::Unauthorized("signature mismatch".into()));
+        }
+        Ok(())
+    }
+
     pub async fn server_exchange_token(
         &self,
         cmd: ServerExchangeCommand,
