@@ -41,40 +41,47 @@ spec:
           ports:
             - name: http
               containerPort: 8080
-            - name: grpc
-              containerPort: 9000
           env:
-            - name: IM_ENV
-              value: dev
+            # ── 2026-10-03 逐项核对过 im_common::config::AppConfig 的字段名 ──
+            #
+            # 此前这份清单 8 个变量里 **6 个**与代码对不上, 而 im-gateway 在
+            # 容器里**必然启动失败**: `AppConfig::load()` 传 config_dir=None,
+            # 生产环境不读任何 TOML, 唯一配置来源就是 env; 而必填字段
+            # `postgres_url` 的正确名字是 `IM_POSTGRES_URL`。名字写错 → 反序列化
+            # 失败 → 进程起不来。详见 docs/gap-ledger.md §1.17。
+            #
+            # 规则: `IM_<UPPER_SNAKE>` → `AppConfig` 同名小写字段。
+            # 结构化字段(Vec / HashMap / 嵌套 struct)给 **JSON**, 见 config.rs。
             - name: IM_HTTP_PORT
               value: "8080"
-            - name: IM_GRPC_PORT
-              value: "9000"
-            - name: IM_DATABASE_URL
+            - name: IM_POSTGRES_URL
               valueFrom:
                 secretKeyRef:
                   name: postgres-credentials
                   key: database-url
-            - name: IM_VALKEY_URL
-              valueFrom:
-                secretKeyRef:
-                  name: im-core-env
-                  key: valkey-url
-            - name: IM_NATS_URL
-              valueFrom:
-                secretKeyRef:
-                  name: im-core-env
-                  key: nats-url
             - name: IM_JWT_SIGNING_KEYS
               valueFrom:
                 secretKeyRef:
                   name: im-core-env
                   key: jwt-signing-keys
-            - name: IM_REFRESH_TOKEN_PEPPER
+            - name: IM_REFRESH_PEPPER
               valueFrom:
                 secretKeyRef:
                   name: im-core-env
-                  key: refresh-token-pepper
+                  key: refresh-pepper
+            - name: IM_EVENT_PUBLISHER
+              valueFrom:
+                secretKeyRef:
+                  name: im-core-env
+                  key: event-publisher
+            # HMAC X-IM-Server-Signature 按 env_id 取 secret (S2S token exchange)
+            - name: IM_SERVER_SECRETS
+              valueFrom:
+                secretKeyRef:
+                  name: im-core-env
+                  key: server-secrets
+          # Valkey (D-4) 未落地前**没有**对应 env: 配置里没有 valkey 字段。
+          # 写一个读不掉的 IM_VALKEY_URL 只会让人以为「配了就能用」。
           readinessProbe:
             httpGet:
               path: /readyz
@@ -107,6 +114,8 @@ spec:
     - name: http
       port: 8080
       targetPort: 8080
-    - name: grpc
-      port: 9000
-      targetPort: 9000
+    # 2026-10-03 删除 gRPC 9000: im-gateway **没有** gRPC server
+    # (`grep -rn 9000 crates/im-gateway/src` 无命中)。proto 里的 CoreService
+    # 由 im-gateway **进程内直接调 im-core**, 不走网络 —— 声明一个永不监听的
+    # 端口, 只会让 Service 的使用者以为有一个可连的 gRPC 端点。
+    # 若将来真要独立 gRPC 服务, 那是另一个进程的事, 需另配。

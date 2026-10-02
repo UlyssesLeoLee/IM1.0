@@ -1052,13 +1052,101 @@ sender」这个用例实际测的仍是「非成员」。
 
 ---
 
+### 1.17 `deploy/k3s/dev/` 清单**从未被执行过** —— 6/8 环境变量名对不上, 且**没有任何东西能构建镜像** (2026-10-03 已修配置层, 部分修清单)
+
+F-2 (K3s 部署) 一直标着「受阻于 F-1 Docker daemon 间歇故障」。2026-10-03
+Docker daemon 恢复后逐项核对, 发现阻塞**不止 Docker**:
+
+#### 根因 1: 清单的环境变量与 `AppConfig` 的字段名**大面积不一致**
+
+`AppConfig::load()`(即 `main.rs` 调用的入口)传 `config_dir = None`, 所以
+**生产环境不读任何 TOML 文件** —— 容器里唯一的配置来源就是环境变量。而映射
+规则是 `IM_<UPPER_SNAKE>` → `AppConfig` 同名小写字段。逐项对比:
+
+| 清单里写的 | 代码里的字段 | 结果 |
+|---|---|---|
+| `IM_HTTP_PORT` | `http_port` | ✅ |
+| `IM_JWT_SIGNING_KEYS` | `jwt_signing_keys` | ✅(名字对, 但**值**配不出来, 见根因 2) |
+| `IM_DATABASE_URL` | **`IM_POSTGRES_URL`** | ❌ 名字错 |
+| `IM_REFRESH_TOKEN_PEPPER` | **`IM_REFRESH_PEPPER`** | ❌ 名字错 |
+| `IM_NATS_URL` | **`IM_EVENT_PUBLISHER`**(嵌套 struct) | ❌ 无此字段 |
+| `IM_VALKEY_URL` | (无 — D-4 未落地) | ❌ 无此字段 |
+| `IM_ENV` | (无) | ❌ 无此字段 |
+| `IM_GRPC_PORT` | (无 — **im-gateway 没有 gRPC server**) | ❌ 无此字段 |
+
+`postgres_url` 是**必填**字段(无 `#[serde(default)]`), 名字写错即反序列化失败
+→ 进程起不来。所以这份清单不是「还没跑」, 是**跑必然红**。
+
+#### 根因 2: 结构化字段**结构上**无法从环境变量配置
+
+即使把名字改对, 仍然起不来。实测(新增 `crates/im-common/tests/config_env_only.rs`
+的探针, 已转正为正式测试):
+
+```
+config load failed: invalid type: found string "v1:somekey",
+expected a sequence for key "default.jwt_signing_keys"
+```
+
+`env_value_to_toml` 原本只处理标量(bool / 整数 / 浮点 / 字符串), 于是
+`jwt_signing_keys: Vec<SigningKeyConfig>` 拿到扁平字符串就报错。而
+`event_publisher`(嵌套 struct)与 `server_secrets`(`HashMap`)同样配不出来 ——
+后者一坏, S2S token exchange 的 HMAC 验签在容器里就不可用。
+
+**既有测试为什么没抓到**: `config.rs` 的测试只覆盖了「必填字段**缺失** → Err」。
+也就是说「四个必填变量都给了, 能不能真的加载出来」**从未被验证过**。
+
+**修法**: `[` / `{` 开头的值按 JSON 解析后转成 TOML 字面量; JSON 解析失败则
+原样透传给 TOML 解析器(于是直接写 TOML 内联表也仍可用, 且语法错误照样报错)。
+这同时**取代**了 docstring 里声称但从未实现的 `IM__SECTION__KEY` 嵌套语法。
+
+> 一个自己踩的坑: 我第一版实现是「JSON 原样透传」, 并在注释里断言
+> 「TOML 的数组/内联表与 JSON 语法高度重合」。**这是错的** —— JSON 用
+> `"k": v`, TOML 内联表用 `k = v`。测试当场报 `TOML parse error`。
+> 「我以为两种格式兼容」和「我验证过它们兼容」之间隔着一个测试。
+
+#### 根因 3: 仓库里**没有 Dockerfile**, 也没有任何 CI build job
+
+`im-gateway.yaml` 引用 `ghcr.io/yourorg/im1.0-im-gateway:latest`, 但没有任何
+东西能构建它。`migrate-job.yaml` 引用的 `im1.0-im-migrate` 镜像同理(仓内
+**没有** migrate 二进制, 只有 `sqlx migrate run` 这个外部命令)。
+
+**新增 `Dockerfile`**(多阶段 / 显式钉 `rust:1.98.1` / `--locked` / 非 root)与
+`.dockerignore`。缺 `.dockerignore` 的后果很具体: 本机 `target/`(Windows
+编译产物, 数 GB)会被整个塞进构建上下文。
+
+#### 顺带删掉一处**不存在的端口**
+
+`im-gateway.yaml` 的容器与 Service 都声明了 `grpc 9000`, 但
+`grep -rn 9000 crates/im-gateway/src` **无命中** —— im-gateway 没有 gRPC
+server(proto 里的 `CoreService` 由 gateway **进程内**直接调 im-core, 不走
+网络)。声明一个永不监听的端口, 只会让 Service 的使用者以为有可连的端点。
+已删除并注明原因。
+
+#### 仍未闭合
+
+- **`Dockerfile` 未经实际构建验证**。实测结果: BuildKit 成功 `load build
+  definition from Dockerfile ... DONE`(即语法有效), 随后在拉
+  `rust:1.98.1-slim-bookworm` 时报 `registry-1.docker.io ... EOF`。
+  本机本地代理掐断外网 registry(与 GitHub 同一个问题), 且无 `rust:*` 缓存
+  可用。故**只声称 Dockerfile 语法有效, 不声称镜像可用**。代理恢复后
+  `docker build -t im1.0-im-gateway:local .` 即可验证。
+- `migrate-job.yaml` 仍引用**无法构建**的 `im1.0-im-migrate`。需要一个 migrate
+  目标(要么加一个 bin, 要么改用 `sqlx/sqlx-cli` 基础镜像 + 挂载
+  `migrations/`)。本次未做 —— 它不影响 gateway 起不来这个已修的问题。
+- `readyz` 当前**无条件返回 200**, 不检查 PG/NATS/Valkey 可达性
+  (`DetailedDesign §5` 要求「PG/Valkey/NATS 全部可达才 200」)。即 k8s 会把
+  一个连不上数据库的实例判为 ready 并把流量打过去。**未擅自改**: 该改哪些
+  依赖算「可达」涉及部署形态决策, 且 Valkey(D-4) 根本不存在。
+- F-2/F-3 的端到端仍**未跑通**: 本机 Docker Desktop 的 k8s API 超时
+  (`172.28.176.169:6443 context deadline exceeded`), 而项目目标是 K3s。
+
+---
+
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
-
-| 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
 |---|---|---|
-| `crates/im-gateway/src/health.rs:15` `readyz()` | F-4 (healthz/readyz) 路由尚未接线 | 依赖 **F-2 / F-3 (K3s 部署)**, 二者受 F-1 (Docker daemon 间歇性故障) 阻塞 |
+| ~~`crates/im-gateway/src/health.rs:15` `readyz()` 路由尚未接线~~ | ~~F-4 (healthz/readyz) 路由尚未接线~~ | ✅ **已接线** (2026-10-03 更正本行旧描述): `main.rs` 早已注册 `/healthz` `/readyz` `/metrics` 三条路由。**但** `/readyz` 当前**无条件返回 200**, 不检查 PG/NATS/Valkey 可达性 —— 而 `DetailedDesign §5` 要求「PG/Valkey/NATS 全部可达才 200」。即 k8s 会把连不上库的实例判为 ready 并把流量打过去。未擅自改: 哪些依赖算「可达」涉及部署形态决策, 且 Valkey (D-4) 根本不存在。见 §1.17 |
 | `crates/im-gateway/src/http/state.rs:71` `AuthedUser.tenant_id` | 已聚合进鉴权上下文, 但现有 handler 尚未按租户过滤 | 多租户隔离随 **G-1 / V1** 落地 |
 | ~~`crates/im-core/src/identity/service.rs` `server_secrets`~~ | ~~S2S token exchange 要按 environment 取 secret, 接线未完成~~ | ✅ **已接线** (2026-10-03): 被 `IdentityService::verify_server_signature` 真正使用, 见 §1.3 |
 | `crates/im-gateway/src/http/auth_handlers.rs` `token_exchange` **nonce 防重放** | 协议有 `X-IM-Nonce`, 但服务端**未校验也未记录** —— 同一合法请求可在 ±300s 窗口内重放 | 需跨实例共享存储 → **WBS D-4 (Valkey)** 落地后接 |
@@ -1072,7 +1160,9 @@ sender」这个用例实际测的仍是「非成员」。
 | `ws/handler.rs` 鉴权成功回 **`{"type":"auth_ok"}`** | **`auth_ok` 不是 aux-13 §1.2 定义的任何帧类型**(§1.2.1 定义的是 `connected { session_id }`)。继 §1.6 的 `UNSUPPORTED_OPERATION` 之后**第二处凭空发明的 wire 帧** | **只记录不擅改**(见 §1.8.2): 改它变动客户端可见的 wire 形状, 且**无证据表明 `connected` 就是原意** —— 与 §1.7.3 的 `ack` 形状不同(那次有 testkit 证据, 方向无歧义)。需规范所有者确认该帧形状 |
 | im-gateway 26 个 e2e 用例**连不上 PG 就静默通过** | 沿用 `auth_handlers` 约定 `let Some(p) = .. else { return }`。CI 若无 `DATABASE_URL`, 全部「跑过」与「没跑」**无法区分** —— 假绿灯向量 | 需 D-4 后在 CI 挂 PG service container; 或改「连不上即 fail」(会让无 PG 的本地全红, 属取舍, 未擅自改)。见 §1.15 |
 | `GET /v1/friends` **aux-13 与 proto 互相矛盾** | aux-13 说 `repeated Friend {user_id, display_name, state, since}`, proto 说 `repeated User`(带 `external_identity_json` / `environment_id`)。按 `User` 实装 = 把**每个人的外部身份**发给所有能列好友的人; 按 `Friend` 实装 = 要新增类型并改 proto。仓储层另缺 cursor 支持 | **需规范所有者裁决**。不擅自选边。见 §1.16 |
-| `POST /v1/media/presign` / `GET /v1/media/{id}` **无对象存储** | aux-13 §3.6 请求/响应样例齐全、proto 也有 message, 但预签名 URL 只能由真实 MinIO/S3 签发; 仓库无 media 模块、无 media 表、无对象存储配置。aux-06 line 442 亦写明「V1+ 实装」 | 依赖对象存储基础设施落地。返 mock URL 比不实现**更糟**(客户端拿着签不出东西的 URL 去 PUT, 失败难以诊断), 故不实装。见 §1.16 |
+| `POST /v1/media/presign` / `GET /v1/media/{id}` **无对象存储** | aux-13 §3.6 请求/响应样例齐全、proto 也有 message, 但预签名 URL 只能由真实 MinIO/S3 签发; 仓库无 media 模块、无 media 表、无对象存储配置。aux-06 line 442 亦写明「V1+ 实装」 | 依赖对象存储基础设施落地。返 mock URL 比不实现**更糟**(客户端拿着签不出东西的 URL 去 PUT, 失败难以诊断), 故不实装。即 WBS **G-2**, 状态 `Blocked` 等 **H-6**。见 §1.16 |
+| `deploy/k3s/dev/migrate-job.yaml` 引用**无法构建**的镜像 | 清单跑 `ghcr.io/yourorg/im1.0-im-migrate:latest` 执行 `sqlx migrate run`, 但仓内**没有** migrate 二进制, 也没有任何东西能构建该镜像 | 需加 migrate 目标(新 bin, 或改用 `sqlx/sqlx-cli` 基础镜像 + 挂 `migrations/`)。本次未做: 它不影响「gateway 起不来」这个已修的问题。见 §1.17 |
+| **Dockerfile 无法在本机构建验证** | 2026-10-03 实测: BuildKit 成功加载并解析 `Dockerfile`(语法有效), 但拉 `rust:1.98.1-slim-bookworm` 报 `registry-1.docker.io ... EOF` —— 与 GitHub 同一个代理问题, 且本地无 `rust:*` 缓存 | 与「推送本地 commit」同一个阻塞源: **本地代理掐断外网 registry**。代理恢复后跑 `docker build -t im1.0-im-gateway:local .` 即可验证。**本条不声称镜像可用** —— 只声称 Dockerfile 语法有效。见 §1.17 |
 
 ### 1.16 friends / media / me 共 8 个端点: 5 个已实装, 3 个卡在规范矛盾或缺基础设施 (2026-10-03)
 

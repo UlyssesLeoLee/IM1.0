@@ -35,11 +35,72 @@ use serde::{Deserialize, Serialize};
 use crate::ids::EnvironmentId;
 use crate::AppError;
 
+/// JSON 值 → TOML 字面量
+///
+/// JSON 与 TOML 的**分隔符不同**: JSON 对象用 `"k": v`, TOML 内联表用
+/// `k = v`。所以不能原样透传 —— 那会在 TOML 解析器那里报语法错
+/// (2026-10-03 实测: 以为两者兼容, 写完测试当场报 `TOML parse error`)。
+/// 故这里做一次真正的转换。
+fn json_value_to_toml(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::Null => "\"\"".to_string(),
+        serde_json::Value::Bool(b) => b.to_string(),
+        serde_json::Value::Number(n) => n.to_string(),
+        serde_json::Value::String(s) => {
+            let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{escaped}\"")
+        }
+        serde_json::Value::Array(items) => {
+            let inner: Vec<String> = items.iter().map(json_value_to_toml).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        serde_json::Value::Object(map) => {
+            let inner: Vec<String> = map
+                .iter()
+                .map(|(k, v)| {
+                    let key = k.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!("{key} = {}", json_value_to_toml(v))
+                })
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+    }
+}
+
 /// env 字符串值 → TOML 字面量 (按字面值顺序尝试类型)
 /// - `true`/`false` → bool
 /// - 整数 → i64
 /// - 浮点 → f64
+/// - 以 `[` / `{` 开头 → **按 JSON 解析后转成 TOML**; JSON 解析失败则原样透传,
+///   交由 TOML 解析器报错(于是「直接写 TOML 内联表」也仍然可用)
 /// - 其它 → quoted string (含 TOML 转义)
+///
+/// ## 为什么需要结构化支持 (2026-10-03 实测修复)
+///
+/// 原来只处理标量, 于是**结构化字段根本无法从环境变量配置**:
+/// `jwt_signing_keys: Vec<SigningKeyConfig>` 收到 `"v1:somekey"` 后报
+/// `invalid type: found string, expected a sequence`, 配置加载整体失败。
+///
+/// 叠加第二个事实就更致命: `AppConfig::load()` 传 `config_dir = None`,
+/// 所以**生产环境根本不读任何 TOML 文件** —— 容器里唯一的配置来源就是环境
+/// 变量。而 `jwt_signing_keys` 是必填字段, 于是 im-gateway **在容器里必然启动
+/// 失败**。这正是 `deploy/k3s/dev/` 清单从未端到端跑过的原因: 它不是「还没跑」,
+/// 是「跑必然红」。
+///
+/// 容器侧写法(JSON, 与 Docker/K8s Secret 习惯一致):
+/// ```text
+/// IM_JWT_SIGNING_KEYS='[{"kid":"v1","key":"...","active":true}]'
+/// IM_EVENT_PUBLISHER='{"kind":"nats","nats_url":"nats://nats:4222"}'
+/// IM_SERVER_SECRETS='{"<env-uuid>":"secret"}'
+/// ```
+/// 这同时**取代**了 docstring 里声称但从未实现的 `IM__SECTION__KEY` 嵌套语法
+/// —— 嵌套字段直接给一个 JSON 对象即可, 不需要发明第二套命名规则。
+///
+/// ## 坏 JSON 为什么必须报错而不是被静默接受
+///
+/// 若把解析失败的值「尽力而为」地当字符串塞进去, 服务会带着一份**没人预期**
+/// 的配置跑起来(签名密钥解析成空数组 → 所有 token 都验不过, 且这类故障极难
+/// 定位)。启动失败一眼可见, 静默改写不是。故解析失败一律让 TOML 解析器报错。
 fn env_value_to_toml(v: &str) -> String {
     match v {
         "true" => "true".to_string(),
@@ -50,6 +111,15 @@ fn env_value_to_toml(v: &str) -> String {
             }
             if let Ok(f) = v.parse::<f64>() {
                 return f.to_string();
+            }
+            let trimmed = v.trim();
+            if trimmed.starts_with('[') || trimmed.starts_with('{') {
+                return match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Ok(j) => json_value_to_toml(&j),
+                    // 不是 JSON → 原样透传: 允许直接写 TOML 内联表,
+                    // 且语法错误会由 TOML 解析器报出来(而不是被吞掉)
+                    Err(_) => trimmed.to_string(),
+                };
             }
             // escape backslash + double-quote for TOML basic string
             let escaped = v.replace('\\', "\\\\").replace('"', "\\\"");

@@ -1,0 +1,44 @@
+# Docker 构建上下文排除 —— 2026-10-03 新增
+#
+# **这个文件缺失的后果很具体**: `target/` 里有本机 Windows 编译产物
+# (debug 目录几个 GB), 全部会被塞进构建上下文传给 Docker daemon。
+# 既拖垮构建, 又可能把本机路径/中间产物带进镜像层。
+#
+# 判定标准: 「构建 im-gateway 需要吗? 不需要就排除」。
+# 宁可多排除 —— 漏排除只是构建慢, 误排除会在 build 时立刻报缺文件。
+
+# ── Rust 构建产物 (本机 target, 由 CARGO_TARGET_DIR 指向 E:\DevCache) ──
+target/
+target-*/
+**/target/
+
+# ── Git ──
+.git/
+.gitignore
+.gitattributes
+
+# ── CI / 编辑器 ──
+.github/
+.vscode/
+.idea/
+
+# ── 本地配置与密钥 (绝不能进镜像层) ──
+.env
+.env.*
+!.env.example
+config/local.toml
+deploy/k3s/dev/secrets-template.yaml
+
+# ── 文档: 不参与编译 ──
+# 注意: migrations/ **不能**排除 —— migrate job 需要它。
+docs/
+*.md
+!README.md
+
+# ── 本地调试残留 (根目录一堆 out.txt / fix*.txt / genout*.txt, 均为未跟踪) ──
+*.txt
+auxout.txt
+
+# ── 测试与基准产物 ──
+*.profraw
+coverage/

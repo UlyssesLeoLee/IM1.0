@@ -288,7 +288,9 @@ async fn friendship_request_after_terminal_state_is_invalid_state_transition() {
         .create_request(env_id, alice, bob)
         .await
         .expect("create failed");
-    repo.respond_request(req.id, true).await.expect("accept failed");
+    repo.respond_request(req.id, true)
+        .await
+        .expect("accept failed");
 
     let dup = repo.create_request(env_id, alice, bob).await;
     assert!(
