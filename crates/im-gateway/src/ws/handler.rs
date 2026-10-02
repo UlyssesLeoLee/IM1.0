@@ -11,7 +11,10 @@
 //! - actix-ws 0.3 Text/Binary 帧收发循环
 //! - 第一帧 `Auth` (JSON text, type="auth", access_token=...) → 走 TokenService::validate_access_token → mark_authenticated
 //! - 后续帧:
-//!   - `Ping` (per C-12 skeleton) → HeartbeatState::on_frame + 回 PongFrame(ts)
+//!   - `Ping` → `HeartbeatState::on_frame()` 重置心跳 + 回
+//!     `ServerFrame::Pong { ts }`(ts 原样回传, per aux-13 §1.1.8)。
+//!     **2026-10-03 已修复**: 此前没有 Ping 分支, ping 落进业务帧兜底被回
+//!     `UNSUPPORTED_OPERATION`, 客户端永远收不到 pong。
 //!   - 其他业务帧 (SendMessage / Edit / Recall / React / MarkRead / Typing) → 列已知缺口 (C-9 messages handler 还没做)
 //! - 30s 心跳检查间隔(常量 `HEARTBEAT_TICK`)与 60s 无帧超时(`HeartbeatConfig::no_frame_timeout`)
 //!   在 `run_ws_loop` 的 `select!` 内**同处判定**: 每 30s 查一次 idle, 满 60s
@@ -45,7 +48,7 @@ use uuid::Uuid;
 use im_common::ids::{DeviceSessionId, EnvironmentId, UserId};
 use im_common::AppError;
 use im_core::identity::token::TokenService;
-use im_protocol::ws_frames::ClientFrame;
+use im_protocol::ws_frames::{ClientFrame, ServerFrame};
 
 use super::session::{SessionState, WsSession};
 
@@ -285,6 +288,39 @@ async fn run_ws_loop(
                             None,
                         )
                         .await;
+                    }
+                    Ok(ClientFrame::Ping { ts }) => {
+                        // per aux-13 §1.1.8: 客户端 ping → 服务端 pong, ts 原样回传。
+                        //
+                        // 2026-10-03 修复: 此前**没有这个分支** —— `ClientFrame::Ping`
+                        // 落进了下面的 `Ok(_)` 兜底, 被当成业务帧返回
+                        // UNSUPPORTED_OPERATION, 于是客户端发 ping 永远收不到 pong,
+                        // 而模块文档写的是"回 PongFrame(ts)"。这也是 #F 的
+                        // `PingFrame`/`into_pong` 一直无人调用的直接原因。
+                        // 现统一走 `im_protocol::ws_frames::ServerFrame::Pong` ——
+                        // 与本分支族已有的 `ClientFrame` 出自同一套 wire 定义。
+                        let pong = ServerFrame::Pong {
+                            ts: ts.unwrap_or(0),
+                        };
+                        match serde_json::to_string(&pong) {
+                            Ok(body) => {
+                                if ws_session.text(body).await.is_err() {
+                                    return Err(AppError::Internal(anyhow::anyhow!(
+                                        "ws send pong failed"
+                                    )));
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = ?e, "ws pong serialize failed");
+                                send_error(
+                                    ws_session,
+                                    im_common::ErrorCode::InternalError,
+                                    "pong serialize failed",
+                                    None,
+                                )
+                                .await;
+                            }
+                        }
                     }
                     Ok(_) => {
                         // 业务帧 (SendMessage / Edit / Recall / React / MarkRead / Typing):
@@ -530,34 +566,40 @@ mod tests {
 
     #[tokio::test]
     async fn silent_session_is_flagged_timeout_once_threshold_passed() {
-        // 同构于生产: 每 30s 查一次(tick), 静默满 60s(timeout)判超时
-        let tick_dur = Duration::from_millis(30);
-        let state = scaled_session(tick_dur, Duration::from_millis(50));
+        // 同构于生产: tick / timeout = 1:2 比例(生产是 30s / 60s)
+        //
+        // **为什么是 100ms/200ms 而不是更小的数值**: 用真实 `sleep` 测时序必然
+        // 有抖动 —— 机器负载高时 30ms 的 sleep 可能实际耗 50ms+。最初取
+        // 30ms/50ms(余量仅 20ms)时, 这个测试在编译后机器繁忙时序的重复运行里
+        // 出现过 flaky 失败(第一次 sleep 后就误判超时)。现在余量 100ms,
+        // 总耗时约 300ms。**不要再把阈值压到余量 < 50ms 的水平。**
+        let tick_dur = Duration::from_millis(100);
+        let state = scaled_session(tick_dur, Duration::from_millis(200));
         let mut ticker = tokio::time::interval(tick_dur);
 
         // tokio interval 首次 tick 立即完成: idle≈0, 绝不能误判
         ticker.tick().await;
         assert!(!state.tick_heartbeat(), "首次 tick 时 idle≈0,不应判超时");
 
-        // 一个周期后: idle≈30ms < 50ms, 仍不应超时(对应生产的前 30s)
+        // 一个周期后: idle≈100ms < 200ms, 仍不应超时(对应生产的前 30s)
         tokio::time::sleep(tick_dur).await;
         ticker.tick().await;
-        assert!(!state.tick_heartbeat(), "idle 30ms < 阈值 50ms,不应超时");
+        assert!(!state.tick_heartbeat(), "idle ~100ms < 阈值 200ms,不应超时");
 
-        // 再一个周期: idle≈60ms >= 50ms, 必须判超时 —— 这正是修复前
+        // 再一个周期: idle≈200ms >= 200ms, 必须判超时 —— 这正是修复前
         // 永远不会发生的那次判定
         tokio::time::sleep(tick_dur).await;
         ticker.tick().await;
         assert!(
             state.tick_heartbeat(),
-            "idle 60ms >= 阈值 50ms,必须判超时(生产即 60s 无帧)"
+            "idle ~200ms >= 阈值 200ms,必须判超时(生产即 60s 无帧)"
         );
     }
 
     #[tokio::test]
     async fn frames_keep_session_alive_past_threshold() {
-        let tick_dur = Duration::from_millis(30);
-        let state = scaled_session(tick_dur, Duration::from_millis(50));
+        let tick_dur = Duration::from_millis(100);
+        let state = scaled_session(tick_dur, Duration::from_millis(200));
         let mut ticker = tokio::time::interval(tick_dur);
 
         // 连续 4 个周期, 每周期都收到一帧(模拟客户端持续发 ping)
@@ -574,5 +616,65 @@ mod tests {
                 "第 {i} 个周期: 持续发帧的连接不应被判超时"
             );
         }
+    }
+
+    // ========================================================================
+    // Ping → Pong wire 契约 (per aux-13 §1.1.8)
+    // ========================================================================
+    //
+    // 2026-10-03: 修复前 `ClientFrame::Ping` 落进 `Ok(_)` 业务帧兜底, 客户端
+    // 发 ping 收不到 pong。下面锁住"ping 能被解析成 ClientFrame::Ping"且
+    // "pong 的 wire 形状与 ts 回传"这两个环节 —— 它们是主循环 Ping 分支的
+    // 前提, 且可在纯 serde 层验证(不需要真实 WS 连接)。
+
+    #[test]
+    fn client_ping_frame_parses_into_ping_variant() {
+        // 修复前这个 JSON 会被解析成功, 然后落进 `Ok(_)` 兜底
+        let parsed: ClientFrame = serde_json::from_str(r#"{"type":"ping","ts":1692528000000}"#)
+            .expect("ping 帧必须能解析成 ClientFrame::Ping");
+        match parsed {
+            ClientFrame::Ping { ts } => assert_eq!(ts, Some(1692528000000)),
+            other => panic!("期望 ClientFrame::Ping, 实际是 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_ping_frame_without_ts_parses_as_none() {
+        let parsed: ClientFrame =
+            serde_json::from_str(r#"{"type":"ping"}"#).expect("无 ts 的 ping 也应可解析");
+        match parsed {
+            ClientFrame::Ping { ts } => assert_eq!(ts, None, "缺省 ts 应为 None"),
+            other => panic!("期望 ClientFrame::Ping, 实际是 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_pong_echoes_ts_and_uses_pong_type() {
+        let pong = ServerFrame::Pong { ts: 1692528000000 };
+        let s = serde_json::to_string(&pong).unwrap();
+        assert!(s.contains("\"type\":\"pong\""), "snake_case type: {s}");
+        assert!(s.contains("\"ts\":1692528000000"), "ts 必须原样回传: {s}");
+    }
+
+    #[test]
+    fn server_pong_with_missing_client_ts_uses_zero() {
+        // ts 缺省时回 0 —— 与 aux-13 的 pong.ts 保持同构, 不让字段消失
+        let parsed: ClientFrame =
+            serde_json::from_str(r#"{"type":"ping"}"#).expect("无 ts 的 ping 也应可解析");
+        let ts = match parsed {
+            ClientFrame::Ping { ts } => ts.unwrap_or(0),
+            other => panic!("期望 ClientFrame::Ping, 实际是 {other:?}"),
+        };
+        let s = serde_json::to_string(&ServerFrame::Pong { ts }).unwrap();
+        assert!(s.contains("\"ts\":0"), "缺省 ts 回 0 而非省略字段: {s}");
+    }
+
+    #[test]
+    fn ping_is_not_mistaken_for_a_business_frame() {
+        // 显式锁住"ping 不会落进业务帧兜底"这一事实: 枚举里 Ping 是独立变体
+        let parsed: ClientFrame =
+            serde_json::from_str(r#"{"type":"ping","ts":1}"#).expect("ping 可解析");
+        let is_ping = matches!(parsed, ClientFrame::Ping { .. });
+        assert!(is_ping, "ping 必须匹配到 Ping 变体, 而非被业务帧分支吞掉");
     }
 }

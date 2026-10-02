@@ -134,8 +134,13 @@ impl WsSession {
 ///    - SendMessage / Edit / Recall / React / MarkRead / Typing → 调对应 im-core RPC,回 Ack
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-// 守门 #1 缺口台账: 缺口 #I — C-11 driver 统一入站分派入口,待 driver 实装后接线。
-// 保留不删,per docs/Project-Status.md §1.1.1 占位符保留约定。
+// 守门 #1 缺口台账: 缺口 #I — ⚠️ **2026-10-03 状态变更**。
+// 入站分派**已存在**于 `ws/handler.rs::run_ws_loop` 的主循环 `match`, 且已补齐
+// 此前缺失的 `ClientFrame::Ping` 分支(ping 原先落进业务帧兜底, 收不到 pong)。
+// 但该主循环走的是 `im_protocol::ws_frames::ClientFrame`, **不经过本枚举**
+// —— 本枚举(含 `handle_ping()`)因此成为未接线的第二套入站抽象。
+// 按 §1.1.1 占位符保留约定先留不删; 接线方向已与 #F 一致定为 im_protocol,
+// 故**不再是待决项**, 清理时应与 `From<ClientFrame>` 及其单测一并处理。
 #[allow(dead_code)]
 pub enum WsInbound {
     /// 心跳 ping(per aux-13 §1.1.8:`{"type":"ping","ts":...}`)

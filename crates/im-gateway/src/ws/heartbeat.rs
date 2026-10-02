@@ -108,9 +108,12 @@ impl HeartbeatState {
 /// 注:im-protocol 已有 `ClientFrame::Ping { ts }` 枚举,本 struct 仅作独立心跳路径
 /// 的 wire 兼容镜像(避免强耦合 im-protocol 的全部 8 类帧)。后续 C-11 主实装时,
 /// 若决定统一走 im_protocol::ws_frames,直接复用即可。
-// 守门 #1 缺口台账: 缺口 #F — C-12 预留的 wire 镜像,待 C-11 driver 决定走本 struct
-// 还是 im_protocol::ws_frames::ClientFrame 后二选一接线。保留不删,
-// per docs/Project-Status.md §1.1.1 占位符保留约定。
+// 守门 #1 缺口台账: 缺口 #F — ✅ **二选一已于 2026-10-03 落地: 走
+// im_protocol::ws_frames**。`ws/handler.rs` 的 Ping 分支解析用
+// `ClientFrame::Ping`, 回包用 `ServerFrame::Pong { ts }`, 与其余 7 类帧
+// 同源。下面的 `PingFrame`/`PongFrame`/`PingPongType`/`into_pong` 因此成为
+// 未接线的重复定义。按 §1.1.1 占位符保留约定先留不删, 但**接线方向已定,
+// 不再是待决项**; 若要清理应连同其 3 个单测一并删除。
 #[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PingFrame {

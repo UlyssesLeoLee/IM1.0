@@ -29,10 +29,10 @@
 | **#C** | `src/http/auth_handlers.rs:203` `GuestRegisterRequest.device_fingerprint` | task 规范要求的可选 fingerprint, 字段在但没人读 | `IdentityService::guest_register` 支持 fingerprint 入参后写入 |
 | **#D** | `src/ws/heartbeat.rs:27` `HeartbeatConfig.expected_ping_interval` | C-11 driver 接线后用于检测 ping 迟到; 当前 tick 只判 `no_frame_timeout`, 不消费本字段 | C-11 driver 接线 |
 | **#E** | `src/ws/heartbeat.rs:77` `remaining()` / `config()` | 供 driver 在 tick 循环设 wakeup 间隔 / 读超时配置做日志上报; 当前 driver 走固定 30s tick | C-11 driver 接线 |
-| **#F** | `src/ws/heartbeat.rs:101/110/118/125` `PingFrame` / `PongFrame` / `PingPongType` / `into_pong` | C-12 预留的 wire 镜像 | C-11 driver 决定走本 struct 还是 `im_protocol::ws_frames::ClientFrame`, 二选一 |
+| **#F** | `src/ws/heartbeat.rs` `PingFrame` / `PongFrame` / `PingPongType` / `into_pong` | C-12 预留的 wire 镜像 | ✅ **二选一已定(2026-10-03)**: 走 `im_protocol::ws_frames`。`handler.rs` 的 Ping 分支用 `ClientFrame::Ping` + `ServerFrame::Pong`, 故这批定义成为未接线的重复实现, 保留不删(§1.1.1) |
 | **#G** | `src/ws/session.rs:95/102` `user_id()` / `environment_id()` | 鉴权后身份读取接口; 另有「同 user_id 多租户路由」 | C-11 driver 做 ForceDisconnect / 广播分发时按 user_id 定位 |
 | **#H** | `src/ws/session.rs:104` `tick_heartbeat()` | 心跳 tick 返回 true 表示应主动 close | ✅ **已结清** (2026-10-03, `d89b88d`): 调用点搬进 `run_ws_loop` 的 `select!`, 超时真正关闭连接 |
-| **#I** | `src/ws/session.rs:129/139` `WsInbound` / `handle_ping()` | C-11 driver 统一入站分派入口 | C-11 driver 实装后接线 |
+| **#I** | `src/ws/session.rs` `WsInbound` / `handle_ping()` / `From<ClientFrame>` | C-11 driver 统一入站分派入口 | 入站分派**已存在**于主循环 `match` 并已补 Ping 分支; 但走 `ClientFrame` 而非本枚举, 故本枚举成为第二套未接线抽象, 清理时与 #F 一并处理 |
 
 > #D/#E/#F/**#G**/#H/**#I** 中, **#H 已于 2026-10-03 结清**; 余下 #D/#E/#F/#G/#I
 > 仍全部阻塞在 C-11 (WsSession + actix-ws driver 实装)。换句话说这 5 个剩余缺口
@@ -92,6 +92,39 @@ task 已删除。`select!` 用 `biased` 让帧优先 —— 客户端持续发�
 `std::time::Instant` 计时」的失败是同一类 —— **我控制的量与被测对象读的不是同一
 个**。写验证前先问「我推进的时钟 / 解析的范围 / 判断的环境, 是不是生产代码实际
 用的那一套」。
+
+### 1.2 同类第二例: ping 不回 pong (2026-10-03 发现并已修)
+
+修完 #H 后顺手复核 WS 入站分派, 立刻发现**同一形状的第二个功能漏洞**:
+
+`run_ws_loop` 鉴权后的分派原本只有两个分支 ——
+
+```rust
+match serde_json::from_str::<ClientFrame>(text_str) {
+    Ok(ClientFrame::Auth { .. }) => { /* 拒绝重复 auth */ }
+    Ok(_) => { /* 业务帧兜底: 返回 UNSUPPORTED_OPERATION */ }   // ← Ping 落这里
+    Err(_) => { /* invalid frame json */ }
+}
+```
+
+`ClientFrame::Ping` **是存在的独立变体**(见 `im-protocol/src/ws_frames.rs`),
+但没有对应分支, 于是被 `Ok(_)` 兜底吞掉, 回 `UNSUPPORTED_OPERATION`。
+**结果: 客户端发 ping 永远收不到 pong**, 违反 aux-13 §1.1.8。
+
+这也是 #F 里 `PingFrame::into_pong` 一直无人调用的**直接原因** —— 不是忘了接线,
+是接线点从来没被执行到。
+
+**修法**: 补 `Ok(ClientFrame::Ping { ts })` 分支, 回
+`ServerFrame::Pong { ts: ts.unwrap_or(0) }` —— 与该分支族已有的 `ClientFrame`
+同源, 顺带把 #F 的二选一决策落地为「走 im_protocol」。
+
+**新增 5 个 wire 契约测试**(纯 serde 层, 无需 WS 连接): ping 能解析成
+`Ping` 变体、缺省 ts 解析为 None、pong 的 type/ts 形状、缺省 ts 回 0 而非省略
+字段、以及显式锁住「ping 不会被误判成业务帧」。
+
+**共性**: #H 与本例都是「模块文档描述了一条从未真正执行的行为」。这类缺陷不会
+让编译或任何现有测试失败 —— 它们只会在真实客户端按协议发帧时才暴露。故本次
+一并把 WS 分派的每个分支对照 `im_protocol::ws_frames` 核过一遍。
 
 ---
 
