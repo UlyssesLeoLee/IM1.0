@@ -51,6 +51,10 @@ mod placeholder;
 mod ws;
 
 /// 默认 access token TTL (秒) — 15 分钟
+// 守门 #1 缺口台账: 缺口 #A — http/auth_handlers.rs 响应 `expires_in` 当前写死 900,
+// 待 V1 抽 `TokenService::access_ttl_seconds()` 后改为读本常量 (per auth_handlers.rs 模块 doc)。
+// 保留常量而非删除,per docs/Project-Status.md §1.1.1 占位符保留约定。
+#[allow(dead_code)]
 const DEFAULT_ACCESS_TOKEN_TTL_SECONDS: i64 = 900;
 
 #[actix_web::main]
@@ -92,7 +96,7 @@ async fn main() -> std::io::Result<()> {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(error = %e, "PgPool connect failed");
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, e));
+            return Err(std::io::Error::other(e));
         }
     };
 
@@ -130,7 +134,7 @@ async fn main() -> std::io::Result<()> {
             Arc::new(
                 NatsEventPublisher::connect(url)
                     .await
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?,
+                    .map_err(|e| std::io::Error::other(e.to_string()))?,
             )
         }
     };

@@ -32,6 +32,7 @@
 //! - request DTO 解析 (环境 UUID / 字段 required check)
 //! - response shape / 字段 wire-format
 //! - refresh_token split → device_session_id 提取
+//!
 //! 不测真实 sqlx 调用 (留 PG 集成测试,WSL PG 18.6 未启 → FAIL 是已知)
 
 use actix_web::{web, HttpResponse};
@@ -40,8 +41,7 @@ use uuid::Uuid;
 
 use im_common::ids::{EnvironmentId, UserId};
 use im_common::AppError;
-use im_core::identity::repository::{ExternalIdentity, UserKind};
-use im_core::identity::service::{IdentityService, ServerExchangeCommand};
+use im_core::identity::service::ServerExchangeCommand;
 use im_core::identity::token::TokenPair;
 
 use super::error_response::json_response;
@@ -199,6 +199,10 @@ pub async fn token_exchange(
 #[derive(Debug, Clone, Deserialize)]
 pub struct GuestRegisterRequest {
     pub environment_id: Uuid,
+    // 守门 #1 缺口台账: 缺口 #C — task 规范要求的可选 fingerprint,
+    // 待 IdentityService::guest_register 支持 fingerprint 入参后写入 (per 本 struct doc)。
+    // wire 契约字段,先保留不删,per docs/Project-Status.md §1.1.1 占位符保留约定。
+    #[allow(dead_code)]
     #[serde(default)]
     pub device_fingerprint: Option<String>,
 }
@@ -427,6 +431,9 @@ fn http_err(e: AppError) -> actix_web::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 非测试路径用全限定名 `im_core::identity::repository::ExternalIdentity` 构造,
+    // 短名仅本测试模块需要 (per external_identity_construction)。
+    use im_core::identity::repository::ExternalIdentity;
 
     // -------- refresh_token 解析 --------
 

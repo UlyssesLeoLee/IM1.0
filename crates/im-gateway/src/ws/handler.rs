@@ -37,7 +37,6 @@ use im_common::AppError;
 use im_core::identity::token::TokenService;
 use im_protocol::ws_frames::ClientFrame;
 
-use super::heartbeat::{PingFrame, PingPongType, PongFrame};
 use super::session::{SessionState, WsSession};
 
 use crate::http::state::AppState;
@@ -355,6 +354,9 @@ async fn send_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    // C-12 心跳骨架帧仅测试路径引用 (per ping_frame_pong_roundtrip_via_c12_skeleton);
+    // 真实收发循环接线前 driver 走 ClientFrame::Ping (per 本文件模块 doc 已知缺口 #2)。
+    use crate::ws::heartbeat::{PingFrame, PingPongType, PongFrame};
 
     #[test]
     fn auth_frame_deserialize_full() {

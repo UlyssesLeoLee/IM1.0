@@ -92,15 +92,23 @@ impl WsSession {
         self.session_id
     }
 
+    // 守门 #1 缺口台账: 缺口 #G — 鉴权后身份读取接口,待 C-11 driver 做 ForceDisconnect
+    // / 广播分发时按 user_id 定位。保留不删,per docs/Project-Status.md §1.1.1。
+    #[allow(dead_code)]
     pub fn user_id(&self) -> Option<UserId> {
         self.user_id
     }
 
+    // 守门 #1 缺口台账: 缺口 #G — 同 user_id,多租户路由待 C-11 接线。保留不删。
+    #[allow(dead_code)]
     pub fn environment_id(&self) -> Option<EnvironmentId> {
         self.environment_id
     }
 
     /// 心跳 tick — 返回 true 表示应主动 close
+    // 守门 #1 缺口台账: 缺口 #H — 30s background task 调用点待 C-11 driver 实装。
+    // 保留不删,per docs/Project-Status.md §1.1.1 占位符保留约定。
+    #[allow(dead_code)]
     pub fn tick_heartbeat(&self) -> bool {
         self.heartbeat.tick()
     }
@@ -126,6 +134,9 @@ impl WsSession {
 ///    - SendMessage / Edit / Recall / React / MarkRead / Typing → 调对应 im-core RPC,回 Ack
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// 守门 #1 缺口台账: 缺口 #I — C-11 driver 统一入站分派入口,待 driver 实装后接线。
+// 保留不删,per docs/Project-Status.md §1.1.1 占位符保留约定。
+#[allow(dead_code)]
 pub enum WsInbound {
     /// 心跳 ping(per aux-13 §1.1.8:`{"type":"ping","ts":...}`)
     Ping {
@@ -136,6 +147,8 @@ pub enum WsInbound {
 
 impl WsInbound {
     /// 处理 ping,回 pong
+    // 守门 #1 缺口台账: 缺口 #I — 待 C-11 driver 接线。保留不删。
+    #[allow(dead_code)]
     pub fn handle_ping(&self) -> PongFrame {
         match self {
             WsInbound::Ping { ts } => PongFrame {

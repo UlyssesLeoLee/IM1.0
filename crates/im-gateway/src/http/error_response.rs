@@ -23,6 +23,10 @@ use im_common::{AppError, ErrorCode};
 use crate::error::error_to_response;
 
 /// AppError → HTTP JSON 响应(existing 用法,这里重导出)
+// 守门 #1 缺口台账: 缺口 #B — 现有 handler 走 `crate::error::error_to_response`,
+// 本重导出待 error 层收敛后统一走本模块入口 (per http/error.rs 收敛计划)。保留不删,
+// per docs/Project-Status.md §1.1.1 占位符保留约定。
+#[allow(dead_code)]
 pub fn app_error_to_response(err: &AppError) -> HttpResponse {
     error_to_response(err)
 }
@@ -64,7 +68,7 @@ mod tests {
         ] {
             let _err = json_response(code, None, None);
             // wire format 字符串双重断言
-            assert!(code.as_str().len() > 0);
+            assert!(!code.as_str().is_empty());
         }
     }
 }

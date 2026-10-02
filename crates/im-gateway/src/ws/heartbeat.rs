@@ -24,6 +24,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone)]
 pub struct HeartbeatConfig {
     /// 客户端 ping 间隔(期望,非强制) — 30s
+    // 守门 #1 缺口台账: 缺口 #D — C-11 driver 接线后用于检测 ping 迟到;
+    // 当前 tick 只判 no_frame_timeout,不消费本字段。保留不删,
+    // per docs/Project-Status.md §1.1.1 占位符保留约定。
+    #[allow(dead_code)]
     pub expected_ping_interval: Duration,
     /// 服务端无帧超时 — 60s(2 × 30s,允许一次 ping 丢)
     pub no_frame_timeout: Duration,
@@ -74,6 +78,10 @@ impl HeartbeatState {
     }
 
     /// 距离超时的剩余时间(已超时则返回 0)
+    // 守门 #1 缺口台账: 缺口 #E — 供 C-11 driver 在 tick 循环里设 wakeup 间隔;
+    // 当前 driver 走固定 30s tick,故未接线。保留不删,
+    // per docs/Project-Status.md §1.1.1 占位符保留约定。
+    #[allow(dead_code)]
     pub fn remaining(&self) -> Duration {
         let idle = self.idle();
         self.cfg
@@ -87,6 +95,9 @@ impl HeartbeatState {
         self.idle() >= self.cfg.no_frame_timeout
     }
 
+    // 守门 #1 缺口台账: 缺口 #E — 供 C-11 driver 读超时配置做日志/上报;当前未接线。
+    // 保留不删,per docs/Project-Status.md §1.1.1 占位符保留约定。
+    #[allow(dead_code)]
     pub fn config(&self) -> &HeartbeatConfig {
         &self.cfg
     }
@@ -97,6 +108,10 @@ impl HeartbeatState {
 /// 注:im-protocol 已有 `ClientFrame::Ping { ts }` 枚举,本 struct 仅作独立心跳路径
 /// 的 wire 兼容镜像(避免强耦合 im-protocol 的全部 8 类帧)。后续 C-11 主实装时,
 /// 若决定统一走 im_protocol::ws_frames,直接复用即可。
+// 守门 #1 缺口台账: 缺口 #F — C-12 预留的 wire 镜像,待 C-11 driver 决定走本 struct
+// 还是 im_protocol::ws_frames::ClientFrame 后二选一接线。保留不删,
+// per docs/Project-Status.md §1.1.1 占位符保留约定。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PingFrame {
     #[serde(rename = "type")]
@@ -106,6 +121,8 @@ pub struct PingFrame {
 }
 
 /// pong 帧 wire 镜像(同上)
+// 守门 #1 缺口台账: 缺口 #F — 同 PingFrame,待 C-11 driver 接线。保留不删。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PongFrame {
     #[serde(rename = "type")]
@@ -113,6 +130,8 @@ pub struct PongFrame {
     pub ts: i64,
 }
 
+// 守门 #1 缺口台账: 缺口 #F — 同 PingFrame,待 C-11 driver 接线。保留不删。
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum PingPongType {
@@ -122,7 +141,9 @@ pub enum PingPongType {
 
 impl PingFrame {
     /// 构造标准 pong 响应(回 ts)
-    pub fn into_pong(&self) -> PongFrame {
+    // 守门 #1 缺口台账: 缺口 #F — 待 C-11 driver 接线。保留不删。
+    #[allow(dead_code)]
+    pub fn into_pong(self) -> PongFrame {
         PongFrame {
             ty: PingPongType::Pong,
             ts: self.ts.unwrap_or(0),
