@@ -177,17 +177,19 @@ fn unknown_fields_are_currently_ignored() {
     // serde 未加 deny_unknown_fields, 故未知字段被忽略 —— 这给了扩展作者
     // 前向兼容(新版 manifest 字段喂给旧宿主不会炸)。
     //
-    // ⚠️ **待团队拍板**: 对不可信输入, 忽略未知字段有风险 —— 一个扩展作者可以
-    // 写 "permissionz": [...](拼错) 而静默拿不到权限, 却以为已声明成功。
-    // 两种取舍:
-    //   (a) 保持忽略 —— 前向兼容好, 代价是拼写错误静默失效
-    //   (b) 加 deny_unknown_fields —— 早失败, 代价是宿主升级前旧 manifest 会被拒
-    // 本测试**只钉住当前行为**, 不代表 (a) 已被认定为正确策略。
+    // ✅ **已拍板 (Ulysses 2026-10-03): 保持忽略, 不加 deny_unknown_fields。**
+    // 理由: 前向兼容优先 —— 宿主升级新增字段后, 旧 manifest 仍能被加载。
+    //
+    // 已知并接受的代价(故本测试长期钉住该行为):
+    //   扩展作者写 "permissionz": [...](拼错) 会静默拿不到权限, 却以为已声明成功。
+    //   这属于**策略取舍**, 不是缺陷; 若将来要收紧, 正确做法是配套版本协商
+    //   (manifest 带 host 最低版本要求), 而不是直接开 deny_unknown_fields ——
+    //   那会拒掉所有为旧宿主写的 manifest。
     let m: ExtensionManifest = serde_json::from_value(json!({
         "name": "acme.plugin",
         "version": "1.0.0",
         "future_field_from_newer_host": { "whatever": true }
     }))
-    .expect("当前实现忽略未知字段");
+    .expect("当前实现忽略未知字段 (2026-10-03 已拍板保持此行为)");
     assert_eq!(m.name, "acme.plugin");
 }

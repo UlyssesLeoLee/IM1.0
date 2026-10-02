@@ -357,12 +357,16 @@ sqlx 0.8 执行**。现已与 `ci.yml` 及 workspace 的 `sqlx = "0.9"` 三处�
 **对策**: 结论必须由**与结论同环境**的证据支撑 —— 债务要逐轮测干净,
 编码要测根因, 门禁要看 CI 记录本身。
 
-#### 待评估(未做): vendored protoc
+#### 已拍板不做: vendored protoc
 
 根治方案是让 `im-proto` 用 `protoc-bin-vendored` 内联 protoc, 一处修复同时覆盖
 CI / 本机 / 任意开发者环境 / Dockerfile, 达成可复现构建。**本次未做**, 因为它要改
 `build.rs` + `Cargo.toml` + `Cargo.lock`(CI 用 `--locked`), 触及构建链路, 而当前
-F-1(Docker 死)导致无法完整验证回归。属需要 lead 拍板的选型, 记录待办。
+F-1(Docker 死)导致无法完整验证回归。
+
+> **2026-10-03 Ulysses 拍板: 保持 apt 方案, 暂不引入 vendored protoc。**
+> 保留代价记录在案: 本机与新开发者环境仍需自行安装 protoc, 新环境容易再踩
+> 同一个坑 —— 若将来 CI 再次因 protoc 报红, 应重新评估本项。
 
 ### 1.2 第一个产品线:IM Core (消息为主)
 
