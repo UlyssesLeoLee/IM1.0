@@ -235,6 +235,29 @@ impl ConversationRepository for PgConversationRepository {
         Ok(n.0 > 0)
     }
 
+    async fn advance_last_read_sequence(
+        &self,
+        conv: ConversationId,
+        user: UserId,
+        sequence: i64,
+    ) -> Result<bool, AppError> {
+        // 守卫放在 WHERE 而非 `SET ... = GREATEST(...)`: 详见 trait 方法文档。
+        let n = sqlx::query(
+            r#"
+            UPDATE conversation_members SET last_read_sequence = $1
+            WHERE conversation_id = $2 AND user_id = $3 AND last_read_sequence < $1
+            "#,
+        )
+        .bind(sequence)
+        .bind(conv.0)
+        .bind(user.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx: {}", e)))?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
     async fn list_members(
         &self,
         conv: ConversationId,

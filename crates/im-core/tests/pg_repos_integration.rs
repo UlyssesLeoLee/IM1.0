@@ -425,6 +425,201 @@ async fn conversation_list_for_user() {
 }
 
 // ============================================================================
+// `mark_read` — 读指针推进 (per aux-04 §B.4 转换表 line 239)
+// ============================================================================
+//
+// 关键不变量有两条, 且**互相独立**:
+// 1. **单调**: 读指针只增不减(aux-08: 「幂等 UPDATE(单调 last_read_sequence)」)
+// 2. **写放大**: 未推进时**不写**(aux-04 §C.4: 「减少 80% 写」)
+//
+// 第 2 条正是本实现把守卫写在 `WHERE` 而不是 `SET ... = GREATEST(...)` 的原因
+// —— PG 的 UPDATE 即使写入同值也会产生新行版本, 用 `GREATEST` 一次都省不下。
+// 下面 `repeated_mark_read_does_not_advance_and_skips_the_write` 用
+// `xmin` (事务 id) 把这一点变成**可观测**的。
+
+async fn dm_with_members() -> (
+    im_core::conversation::service::ConversationService,
+    sqlx::PgPool,
+    EnvironmentId,
+    UserId,
+    UserId,
+    UserId,
+    im_common::ids::ConversationId,
+) {
+    let (env, alice, bob) = make_env().await;
+    let p = pool().await;
+    // **carol 是刻意不入群的第三人** —— 「非成员」用例需要一个真实的非成员,
+    // 拿 bob(已在群里)去测会让断言的前提就是错的: 上一版正是这么写的,
+    // 守卫正确地返回 Ok(true), 而测试却期待 Forbidden。
+    let carol_id: Uuid = sqlx::query_scalar(
+        r#"INSERT INTO users (id, environment_id, kind, display_name)
+           VALUES (gen_random_uuid(), $1, 'user', 'Carol') RETURNING id"#,
+    )
+    .bind(env.0)
+    .fetch_one(&p)
+    .await
+    .expect("create Carol");
+    let carol = UserId(carol_id);
+
+    let repo: Arc<dyn ConversationRepository> = Arc::new(PgConversationRepository::new(p.clone()));
+    let conv = repo
+        .create(env, ConversationKind::Dm, json!({}))
+        .await
+        .expect("create DM");
+    repo.add_member(conv.id, alice, MemberRole::Member)
+        .await
+        .unwrap();
+    repo.add_member(conv.id, bob, MemberRole::Member)
+        .await
+        .unwrap();
+    let svc = im_core::conversation::service::ConversationService::new(repo);
+    (svc, p, env, alice, bob, carol, conv.id)
+}
+
+#[tokio::test]
+async fn mark_read_advances_the_pointer() {
+    let (svc, _p, _env, alice, _bob, _carol, conv) = dm_with_members().await;
+    assert!(
+        svc.mark_read(conv, alice, 42).await.expect("mark_read"),
+        "首次上报 42 应推进"
+    );
+    let m = last_read_of(&svc, conv, alice).await;
+    assert_eq!(m, 42);
+}
+
+#[tokio::test]
+async fn mark_read_never_moves_backwards() {
+    // 不变量 1: 客户端重连后可能把**旧的** sequence 重新上报(例如本地存了
+    // 过期值), 读指针绝不能因此回退 —— 回退会让已读的消息重新变成未读。
+    let (svc, _p, _env, alice, _bob, _carol, conv) = dm_with_members().await;
+    svc.mark_read(conv, alice, 100).await.expect("first");
+
+    let r = svc.mark_read(conv, alice, 50).await;
+    assert!(
+        matches!(r, Ok(false)),
+        "更小的 sequence 不应推进, 且不是错误: {r:?}"
+    );
+    let m = last_read_of(&svc, conv, alice).await;
+    assert_eq!(m, 100, "读指针绝不能回退");
+}
+
+#[tokio::test]
+async fn repeated_mark_read_is_idempotent() {
+    // aux-08 把 mark_read 列为「幂等 UPDATE」: 同一个 sequence 重复上报必须
+    // 成功(而不是报错), 且不推进。
+    let (svc, _p, _env, alice, _bob, _carol, conv) = dm_with_members().await;
+    assert!(matches!(svc.mark_read(conv, alice, 7).await, Ok(true)));
+    let again = svc.mark_read(conv, alice, 7).await;
+    assert!(
+        matches!(again, Ok(false)),
+        "重复上报同一 sequence 应为 no-op 而非错误: {again:?}"
+    );
+    assert_eq!(last_read_of(&svc, conv, alice).await, 7);
+}
+
+#[tokio::test]
+async fn repeated_mark_read_skips_the_write() {
+    // 不变量 2 的**可观测**版本: PG 的 `xmin` 是该行最近一次 UPDATE 所在的事务
+    // id。若实现用了 `SET ... = GREATEST(...)`, 值虽不变但**行版本会变**,
+    // `xmin` 随之改变 —— 那是「没省下写」的直接证据。
+    //
+    // 用一个独立事务去读 xmin, 避免与断言共用同一快照。
+    let (svc, p, _env, alice, _bob, _carol, conv) = dm_with_members().await;
+    svc.mark_read(conv, alice, 55).await.expect("first");
+
+    let xmin_before: i64 = sqlx::query_scalar(
+        "SELECT xmin::text::bigint FROM conversation_members \
+         WHERE conversation_id = $1 AND user_id = $2",
+    )
+    .bind(conv.0)
+    .bind(alice.0)
+    .fetch_one(&p)
+    .await
+    .expect("read xmin before");
+
+    // 重复上报同一 sequence —— 走的是「不推进」分支
+    let again = svc.mark_read(conv, alice, 55).await;
+    assert!(matches!(again, Ok(false)), "{again:?}");
+
+    let xmin_after: i64 = sqlx::query_scalar(
+        "SELECT xmin::text::bigint FROM conversation_members \
+         WHERE conversation_id = $1 AND user_id = $2",
+    )
+    .bind(conv.0)
+    .bind(alice.0)
+    .fetch_one(&p)
+    .await
+    .expect("read xmin after");
+
+    assert_eq!(
+        xmin_before, xmin_after,
+        "未推进时不得产生新的行版本 —— 若 xmin 变了说明实现写成了 \
+         `SET ... = GREATEST(...)`(值没变但仍写盘, 达不到 aux-04 §C.4 的省写目标)"
+    );
+}
+
+#[tokio::test]
+async fn mark_read_by_non_member_is_forbidden_and_touches_nothing() {
+    // 转换表 guard: 「receiver 在线且为会话成员」。非成员若能写, 等于让他
+    // 任意篡改别人的未读数。
+    let (svc, p, _env, alice, _bob, carol, conv) = dm_with_members().await;
+    svc.mark_read(conv, alice, 9).await.expect("alice 先读");
+
+    let r = svc.mark_read(conv, carol, 999).await;
+    assert!(
+        matches!(r, Err(im_common::AppError::Forbidden(_))),
+        "非成员 mark_read 必须 Forbidden, 实际: {r:?}"
+    );
+
+    // alice 的读指针不能被 carol 的越权上报影响
+    assert_eq!(
+        last_read_of(&svc, conv, alice).await,
+        9,
+        "越权上报不得改动他人读指针"
+    );
+    // 也不该凭空给 carol 建出一行
+    let carol_rows: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM conversation_members \
+         WHERE conversation_id = $1 AND user_id = $2",
+    )
+    .bind(conv.0)
+    .bind(carol.0)
+    .fetch_one(&p)
+    .await
+    .expect("count carol rows");
+    assert_eq!(carol_rows, 0, "越权上报不得给非成员建行");
+}
+
+#[tokio::test]
+async fn mark_read_does_not_affect_other_members_pointers() {
+    // 每人的读指针是**各自的** —— 群聊里 A 读了不影响 B。
+    let (svc, _p, _env, alice, bob, _carol, conv) = dm_with_members().await;
+    svc.mark_read(conv, alice, 77).await.expect("alice");
+    assert_eq!(last_read_of(&svc, conv, alice).await, 77);
+    assert_eq!(
+        last_read_of(&svc, conv, bob).await,
+        0,
+        "bob 的读指针不应被 alice 的上报影响"
+    );
+}
+
+/// 读某成员的 `last_read_sequence`(测试读取口)
+///
+/// 走 `list_members` —— service 现有公开面里唯一能读到该列的路径, 故不额外
+/// 开一条只给测试用的查询, 免得测试能通过而线上读不到。
+async fn last_read_of(
+    svc: &im_core::conversation::service::ConversationService,
+    conv: im_common::ids::ConversationId,
+    user: UserId,
+) -> i64 {
+    let all = svc.repo().list_members(conv).await.expect("list_members");
+    all.into_iter()
+        .find(|m| m.user_id == user)
+        .map(|m| m.last_read_sequence)
+        .expect("该成员应在 members 列表中")
+}
+
+// ============================================================================
 // PgMessageRepository + PgSequenceAllocator 集成测试
 // ============================================================================
 

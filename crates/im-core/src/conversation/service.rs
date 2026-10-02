@@ -131,6 +131,37 @@ impl ConversationService {
         self.repo.is_member(conv, user).await
     }
 
+    /// 上报已读 (per aux-04 §B.4 转换表 line 239: `delivered` → `read`)
+    ///
+    /// guard: **会话成员**(转换表写「receiver 在线且为会话成员」)。非成员返
+    /// `Forbidden` —— 不能让任意用户给任意会话写 `last_read_sequence`, 那等于
+    /// 让他影响别人的未读数。
+    ///
+    /// 返回 `Ok(true)` = 读指针真的推进了; `Ok(false)` = 已在该 sequence 或更靠后
+    /// (**幂等重放, 正常**)。调用方据此决定要不要 fanout —— 对未推进的重复上报
+    /// 再广播一次已读事件是纯浪费。
+    ///
+    /// ## 为什么 fanout 不在本方法里
+    ///
+    /// 转换表的 effect 写的是「UPDATE last_read_sequence **+ fanout**」, 但
+    /// `ServerFrame` 的 10 个变体里**没有已读回执帧**(read receipt)。往哪个帧
+    /// 上捎带都是擅自发明 wire 形状, 与 §1.6 的 `UNSUPPORTED_OPERATION`、
+    /// §1.8.2 的 `auth_ok` 同一类错误。故此处只做可确证的 UPDATE 部分,
+    /// fanout 缺口记在 `docs/gap-ledger.md` §1.12。
+    pub async fn mark_read(
+        &self,
+        conv: ConversationId,
+        user: UserId,
+        sequence: i64,
+    ) -> Result<bool, AppError> {
+        if !self.repo.is_member(conv, user).await? {
+            return Err(AppError::Forbidden("not a conversation member".into()));
+        }
+        self.repo
+            .advance_last_read_sequence(conv, user, sequence)
+            .await
+    }
+
     pub async fn get(&self, id: ConversationId) -> Result<Option<Conversation>, AppError> {
         self.repo.find_by_id(id).await
     }

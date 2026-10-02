@@ -105,6 +105,34 @@ pub trait ConversationRepository: Send + Sync {
 
     async fn is_member(&self, conv: ConversationId, user: UserId) -> Result<bool, AppError>;
 
+    /// 推进 `last_read_sequence`, 返回**是否真的推进了**
+    ///
+    /// ## 为什么不用 `GREATEST(last_read_sequence, $1)`
+    ///
+    /// `aux-07` §H.4 与 `aux-08` §幂等性 都建议写成
+    /// `SET last_read_sequence = GREATEST(last_read_sequence, $1)`。那个写法能
+    /// 保证单调, 但**达不到 `aux-04 §C.4` 自己写的目标** —— 那张表的
+    /// 「`mark_read` 高频 | 写放大」一行要求「仅在 `new_sequence >
+    /// last_read_sequence` 时 UPDATE, **减少 80% 写**」。
+    ///
+    /// 原因是 PG 的 UPDATE 即使把列写成**同样的值**, 仍会产生新的行版本(tuple
+    /// version) —— 这正是 MVCC 的代价。所以 `GREATEST` 在「客户端重复上报同一个
+    /// sequence」(极常见: 每次收到新消息都上报当前最大 seq, 而多条消息的 seq
+    /// 可能重复上报)这种情形下**一次都没省下**。
+    ///
+    /// 把守卫放进 `WHERE` 才真正跳过写: 值没变时该行不匹配, 0 行受影响。
+    /// 单调性由同一个 `WHERE` 保证, 不需要 `GREATEST`。
+    ///
+    /// `Ok(false)` 表示「已是该 sequence 或更靠后, 未推进」—— 这是**正常**
+    /// (幂等重放), 不是错误。调用方若需区分「未推进」与「不是成员」, 须先查
+    /// 成员关系(本方法无法区分: 两者都是 0 行)。
+    async fn advance_last_read_sequence(
+        &self,
+        conv: ConversationId,
+        user: UserId,
+        sequence: i64,
+    ) -> Result<bool, AppError>;
+
     async fn list_members(&self, conv: ConversationId)
         -> Result<Vec<ConversationMember>, AppError>;
 }

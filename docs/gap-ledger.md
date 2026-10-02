@@ -793,6 +793,67 @@ conversation), 构造参数里也没有 settings 依赖。故与 `edit_message(m
 **写完断言后问「这个状态在真实执行中真的可达吗? 还是会像上面那样, 在两次
 操作之间就漂走了?」**
 
+### 1.12 `mark_read` 实装 + 规范之间的一处不自洽 (2026-10-03 已修)
+
+WS 6 类业务帧的第 4 类。`mark_read` 本身很简单, 但实现时撞上一个值得记的
+问题: **三份规范对同一条 SQL 给的目标互相打架**。
+
+#### 不自洽点
+
+| 出处 | 说法 |
+|---|---|
+| `aux-07` §H.4 + `aux-08` §幂等性 | `SET last_read_sequence = GREATEST(last_read_sequence, $1)` —— 保证单调 |
+| `aux-04` §C.4「mark_read 高频」行 | 「`last_read_sequence` 仅在 `new_sequence > last_read_sequence` 时 UPDATE, **减少 80% 写**」 |
+
+照 `GREATEST` 写能达成前者, **但达不到后者**: PG 的 UPDATE 即使把列写成
+**完全相同的值**, 仍会产生新的行版本(tuple version)—— 这是 MVCC 的代价。
+而「客户端重复上报同一个 sequence」是极常见的常态(每次收到新消息都上报当前
+最大 seq, 而多批消息的 seq 可能重复上报), 所以 `GREATEST` 在最需要省写的
+场景里**一次都省不下**。
+
+**修法**: 把守卫写进 `WHERE` 而非 `SET`:
+
+```sql
+UPDATE conversation_members SET last_read_sequence = $1
+WHERE conversation_id = $2 AND user_id = $3 AND last_read_sequence < $1
+```
+
+单调性与省写由同一个 `WHERE` 同时保证, 不需要 `GREATEST`。
+
+**并把它变成可观测的测试**: 用 PG 的 `xmin`(该行最近一次 UPDATE 所在事务 id)
+断言「未推进时 `xmin` 不变」。若实现退化成 `GREATEST`, 值虽然没变但**行版本会
+变**, `xmin` 随之改变 —— 那正是「没省下写」的直接证据。
+(`repeated_mark_read_skips_the_write`)
+
+#### 其它三处判断
+
+- **非成员必须 `Forbidden`**: 转换表 guard 写「receiver 在线且为会话成员」。
+  若不校验, 任意用户能给任意会话写 `last_read_sequence`, 等于让他影响别人的
+  未读数。`advance_last_read_sequence` 的 `Ok(false)` **无法区分**「未推进」
+  与「不是成员」(两者都是 0 行受影响), 故 service 先查成员关系再更新。
+- **ack 不带 `data`**: aux-13 §1.2.2 的 `AckData` 字段是 `message_id` +
+  `sequence`, 语义都指向**消息**。已读回执没有 message, 把 `last_read_sequence`
+  塞进 `sequence` 会让同一字段在两类响应里含义不同。故 `data: None`
+  (`skip_serializing_if` 使该字段整个不出现)。
+- **`Ok(false)` 仍回 `ok=true`**: aux-08 明确把 mark_read 列为「幂等 UPDATE」,
+  重复上报是**成功**而非错误。
+
+#### fanout 缺口: `ServerFrame` 没有已读回执变体
+
+转换表 line 239 的 effect 写「UPDATE last_read_sequence **+ fanout**」, 但
+`ServerFrame` 的 10 个变体里**没有 read receipt 帧**。往任何现有帧上捎带都
+是凭空发明 wire 形状 —— 与 §1.6 的 `UNSUPPORTED_OPERATION`、§1.8.2 的
+`auth_ok` 同一类错误。故本条只做可确证的 UPDATE 部分, fanout 记为待规范
+所有者补帧。`ConversationService::mark_read` 返回 `bool`(`advanced`)正是为了
+让将来补上 fanout 时能判断「值没变就别广播」, 不必再改接口。
+
+#### 测试
+
+6 个真 PG 用例: 首次推进 / 更小的 sequence **不回退** / 重复上报幂等 no-op /
+重复上报**不产生新行版本**(`xmin` 断言) / 非成员 `Forbidden` **且不改动他人
+读指针也不凭空建行** / A 读不影响 B 的读指针。
+
+
 
 
 

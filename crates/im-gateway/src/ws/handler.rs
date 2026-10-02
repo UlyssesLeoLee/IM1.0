@@ -27,7 +27,7 @@
 //! - ForceDisconnect hook stub (后续 G-1 presence 集成)
 //!
 //! ### 已知缺口 (per 守门 #1 缺标比错标)
-//! 1. **业务帧处理** —— **2026-10-03 已实装 3/6**:
+//! 1. **业务帧处理** —— **2026-10-03 已实装 4/6**:
 //!    - `SendMessage`: 走完整 `MessageService::send_message` 校验链
 //!      (幂等 / content schema / conversation member / 大小上限),
 //!      回 aux-13 §1.2.2 的 `ack`, 并经 `WsHub` 广播 `message_new`。
@@ -37,8 +37,11 @@
 //!      (per aux-04 §B.4 转换表: 仅原 sender / `sent`·`delivered`·`read`
 //!      三态可撤 / 终态拒绝 / 时间窗 `≤` 判定), 并广播 `message_recalled`
 //!      —— 该帧带 `conversation_id`, 是**当前唯一可安全广播的变更类帧**。
+//!    - `MarkRead`: 走 `ConversationService::mark_read`
+//!      (仅会话成员 / 读指针单调不回退 / 未推进时**不写库**)。
+//!      **不广播** —— `ServerFrame` 没有已读回执变体, 见该 handler 注释。
 //!
-//!    仍**未实装 3 类**: `React` / `MarkRead` / `Typing` ——
+//!    仍**未实装 2 类**: `React` / `Typing` ——
 //!    收到即回 `VALIDATION_ERROR`(带 req_id)。错误码语义不理想(帧格式合法,
 //!    缺的是服务端处理器), 但**不新造错误码**, 理由见下。
 
@@ -483,7 +486,20 @@ async fn run_ws_loop(
                             .await
                         }
                     },
-                    // 其余 3 类业务帧仍逐一显式列出, 不用 `Ok(_)` 兜底。两个理由:
+                    // C-9 已实装: mark_read (per aux-04 §B.4 转换表 line 239)
+                    Ok(frame @ ClientFrame::MarkRead { .. }) => match state.user_id() {
+                        Some(uid) => handle_mark_read(ws_session, app, uid, frame).await,
+                        None => {
+                            send_error(
+                                ws_session,
+                                im_common::ErrorCode::Unauthorized,
+                                "not authenticated",
+                                None,
+                            )
+                            .await
+                        }
+                    },
+                    // 其余 2 类业务帧仍逐一显式列出, 不用 `Ok(_)` 兜底。两个理由:
                     //
                     // (1) req_id 必须回传。aux-13 §1.2.4 规定 error 帧带 req_id,
                     //     客户端据此把失败响应关联回自己的请求。此前这里传 `None`,
@@ -494,11 +510,7 @@ async fn run_ws_loop(
                     //     `ClientFrame` 加变体会在此处编译报错, 而不会被 `Ok(_)`
                     //     静默吞掉。ping 漏洞(gap-ledger §1.2)就是这么藏的 ——
                     //     `ClientFrame::Ping` 解析成功, 却落进了 `Ok(_)`。
-                    Ok(
-                        ClientFrame::React { req_id, .. }
-                        | ClientFrame::MarkRead { req_id, .. }
-                        | ClientFrame::Typing { req_id, .. },
-                    ) => {
+                    Ok(ClientFrame::React { req_id, .. } | ClientFrame::Typing { req_id, .. }) => {
                         // 2026-10-03 更正: 本注释原写「当前返 UNSUPPORTED_OPERATION」——
                         // **该错误码不存在**。aux-03 §B(MVP 错误码唯一权威表)的 21 个
                         // 已注册码里没有它, 也没有 501。实际返回的是
@@ -945,6 +957,64 @@ async fn handle_recall_message(
                 ws_session,
                 code,
                 &format!("recall_message failed: {detail}"),
+                Some(req_id),
+            )
+            .await;
+        }
+    }
+}
+
+/// C-9 业务帧: `mark_read` (per aux-13 §1.1.6 + aux-04 §B.4 转换表 line 239)
+///
+/// 逻辑与 REST `POST /v1/conversations/{id}/read` 同源(同一个
+/// `ConversationService::mark_read`), 差别只在响应形状。
+///
+/// **ack 不带 data**: aux-13 §1.2.2 的 `AckData` 字段是 `message_id` +
+/// `sequence`, 语义都指向**消息**。已读回执没有 message, 把 `last_read_sequence`
+/// 塞进 `sequence` 会让同一个字段在两类响应里含义不同 —— 客户端无法安全地
+/// 读它。故 `data: None`(`skip_serializing_if` 使该字段整个不出现),
+/// 保留 `req_id` + `ok` 这两个跨帧一致的字段。
+///
+/// **不广播**: 见 `ConversationService::mark_read` 的说明 —— `ServerFrame`
+/// 没有已读回执变体, 擅自往别的帧上捎带等同凭空发明 wire 形状。
+async fn handle_mark_read(
+    ws_session: &mut actix_ws::Session,
+    app: &web::Data<AppState>,
+    user_id: UserId,
+    frame: ClientFrame,
+) {
+    let ClientFrame::MarkRead {
+        req_id,
+        conversation_id,
+        sequence,
+    } = frame
+    else {
+        unreachable!("调用方保证传入 MarkRead 变体");
+    };
+
+    match app
+        .conversation_service
+        .mark_read(ConversationId(conversation_id), user_id, sequence)
+        .await
+    {
+        Ok(advanced) => {
+            // `advanced=false` 是幂等重放(读指针已在该 seq 或更靠后), 仍是**成功** ——
+            // aux-08 把 mark_read 明确列为「幂等 UPDATE(单调 last_read_sequence)」。
+            // 故仍回 ok=true, 不能当成错误。
+            send_ack(ws_session, req_id, None, None, false).await;
+            tracing::trace!(
+                conversation_id = %conversation_id,
+                sequence,
+                advanced,
+                "mark_read"
+            );
+        }
+        Err(e) => {
+            let (code, detail) = map_service_error(&e);
+            send_error(
+                ws_session,
+                code,
+                &format!("mark_read failed: {detail}"),
                 Some(req_id),
             )
             .await;
