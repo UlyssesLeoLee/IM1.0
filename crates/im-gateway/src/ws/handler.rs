@@ -13,7 +13,12 @@
 //! - 后续帧:
 //!   - `Ping` (per C-12 skeleton) → HeartbeatState::on_frame + 回 PongFrame(ts)
 //!   - 其他业务帧 (SendMessage / Edit / Recall / React / MarkRead / Typing) → 列已知缺口 (C-9 messages handler 还没做)
-//! - 30s background task tick_heartbeat + 60s 无帧超时关闭
+//! - 30s background task 调 `HeartbeatState::tick()` 检测无帧
+//!   ⚠️ **2026-10-03 复核: 超时当前只会打日志, 不会真的关闭连接** —— 后台任务
+//!      拿不到 `actix_ws::Session`, 主循环 `run_ws_loop` 也只 `await
+//!      msg_stream.next()` 而无 `select!` 超时分支, 故 60s 无帧超时**当前不生效**
+//!      (半开连接会一直堆积到 TCP 超时)。修复需 C-11 driver 重构把超时信号送达
+//!      持有 Session 的主循环, 详见 `docs/gap-ledger.md` §1.1 缺口 #H。
 //! - ForceDisconnect hook stub (后续 G-1 presence 集成)
 //!
 //! ### 已知缺口 (per 守门 #1 缺标比错标)
@@ -21,6 +26,7 @@
 //! 2. **im-proto gRPC 客户端**: 有 stub (per worker-C 探索 `im_proto::im::core::v1::core_service_client::CoreServiceClient`), 但 MVP Day 3 没 wire-up gRPC channel; Auth 帧的 TokenClaims 解析走本地 TokenService (已经在 im-gateway 进程内), 不走 gRPC
 //! 3. **ForceDisconnect broadcast**: 占位 broadcast channel, 实际 broadcasting 留 G-1 presence
 //! 4. **device_session_id 来自 JWT claims**: 当前 TokenClaims 没 `dsid` 字段 (per 138 §8 缺口 + AuthedUser), 用 refresh_token split 兜底
+//! 5. **60s 无帧超时未真正关闭连接**: 后台 task 超时后仅 `tracing::info!` + `break`, 而 `actix_ws::Session` 归主循环所有且主循环无 `select!` 超时分支 —— 半开连接不会按预期回收。详见上方 §范围 的警告与 `docs/gap-ledger.md` §1.1
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -37,6 +37,46 @@
 > #D/#E/#F/#G/#H/#I **全部阻塞在 C-11 (WsSession + actix-ws driver 实装)**。
 > 换句话说这 6 个缺口是同一个上游任务的下游, 接线 C-11 可一次性清掉。
 
+### 1.1 #H 的严重性升级: 60s 无帧超时当前**根本不生效** (2026-10-03 复核)
+
+复核 `src/ws/handler.rs:113-147` 时发现, #H 不是一个"方法没被调用"的无害缺口,
+而是**行为与文档不符的功能漏洞**:
+
+```rust
+// 后台任务 (line 115-125)
+tokio::spawn(async move {
+    let mut tick = interval(Duration::from_secs(30));
+    loop {
+        tick.tick().await;
+        if hb_for_tick.tick() {
+            tracing::info!(... "heartbeat timeout, closing ws");
+            // 注: session 关闭由主 loop 检测; 此处仅日志, 实际关闭在主 loop
+            break;
+        }
+    }
+});
+
+// 主循环 (line 153-158)
+async fn run_ws_loop(ws_session: &mut actix_ws::Session, msg_stream: &mut actix_ws::MessageStream, ...) {
+    while let Some(msg_result) = msg_stream.next().await {   // ← 只等消息, 没有 select 超时信号
+```
+
+问题: 超时发生后后台任务只 `break` + 打日志, 而
+- 主循环只 `await msg_stream.next()`, **没有 `select!` 任何超时信号**;
+- `actix_ws::Session` 归主循环所有, 后台任务拿不到, 无法主动 close。
+
+**实际后果**: 客户端停止发帧后, 连接**不会被 60s 超时关闭**, 而是无限期保持。
+而 `handler.rs:16` 的模块文档写的是「30s background task tick_heartbeat +
+60s 无帧超时关闭」—— **文档描述的行为没有实现**。半开连接会一直堆积直到
+TCP 层超时, 属资源泄漏。
+
+**修法方向**(需 C-11 driver 重构, 且**端到端验证依赖 Docker/F-1**):
+让超时信号能到达持有 `Session` 的主循环, 例如后台任务通过
+`tokio::sync::oneshot` / `mpsc` 把超时事件发给主循环, 由主循环在
+`tokio::select!` 中 `msg_stream.next()` 与超时分支之间二选一后 close;
+或把 `interval` 直接搬进 `run_ws_loop`, 用 `select!` 同时等消息与 tick。
+**在此之前不应声称"无帧超时已实现"**。
+
 ---
 
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
