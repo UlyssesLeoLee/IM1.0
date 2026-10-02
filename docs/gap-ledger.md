@@ -463,6 +463,55 @@ aux-13 §1.2.4 规定失败响应形状为
 **`Ok(_)` 兜底与「返回看似合理的假值」都是把未实装伪装成已实装的手段**,
 且两者都不会让任何现有测试失败。
 
+### 1.8 C-9 `send_message` 实装 + `auth_ok` 幽灵帧 (2026-10-03)
+
+#### 1.8.1 6 类业务帧中的第 1 类实装
+
+`SendMessage` 此前落进 `Ok(_)` 兜底回「未实装」错误。现实装, 且**刻意与 REST
+`http::messages::send_message` 走同一条 `MessageService::send_message` 校验链**
+(幂等 / content schema / conversation member / 大小上限), 差别只在响应形状:
+REST 返 201 + body, WS 返 `ServerFrame::Ack { ok: true, data }`。
+
+- **sender 来自已鉴权的会话状态**(`state.user_id()`), 不取自帧内容 ——
+  客户端没有资格声明自己是谁
+- 幂等: 新增 `MessageService::find_by_idempotency_key` 透传, 因为
+  `send_message` 内部遇到重放会返回既有 message 但**不告诉调用方这是重放**,
+  而 WS 必须回填 `AckData.idempotent_replay`(per aux-13 §1.2.2/§1.2.3)。
+  已知偏差: 并发下两边都查不到时, 由 `send_message` 内部 + 唯一索引兜底, 此时
+  重放会被报成 `idempotent_replay: false` —— 保守偏差(把重放报成新消息好过
+  反过来), 已在该方法文档注明
+- `map_service_error` **不自己维护错误码映射**, 直接用 `AppError::code()`
+  (im-common 里的穷尽 match, 单一真源)。若另写一份, 两处会随变体新增而漂移。
+  它只自行决定**哪些错误的消息可外泄**: `InternalError` / `ServiceUnavailable`
+  只回通用文案(原因可能含 SQL / 连接串 / 凭据), 业务码原样回传
+  (aux-03 §B 要求 `VALIDATION_ERROR` 供客户端展示字段级原因)
+
+**仍未实装 5 类**: `EditMessage` / `RecallMessage` / `React` / `MarkRead` /
+`Typing`。
+
+#### 1.8.2 顺带发现: `auth_ok` 是 aux-13 里不存在的帧
+
+鉴权成功后本 handler 回:
+
+```rust
+let ack = serde_json::json!({ "type": "auth_ok", "req_id": req_id });
+```
+
+`auth_ok` **不是 aux-13 §1.2 定义的任何帧类型**。§1.2.1 定义的是
+`connected { session_id }`。这是继 `UNSUPPORTED_OPERATION`(§1.6)之后
+**第二处凭空发明的 wire 帧**。
+
+与 §1.7.3 的 `ack` 错误帧形状不同 —— 那次是实现偏离了规范且项目自己的 testkit
+已在用规范形状(证据充分, 方向无歧义); 这次**没有任何证据表明 `connected` 就是
+原意**, 无法排除当初是有意设计。故**只记录不擅改**(改它会变动客户端可见的
+wire 形状), 已记入 §2。
+
+**共性**: §1.6 / §1.8.2 都是「注释与代码自称实现了一个规范里没有的东西」。
+规范与实现的偏离在**两个方向**都发生过: 规范有而实现没有(§1.3 C-3 验签)、
+实现有而规范没有(本条 `auth_ok`、§1.6 的 `UNSUPPORTED_OPERATION`)。
+**双向都需要有人守** —— 只查「代码缺什么」会漏掉「代码多出什么」。
+
+
 
 
 
@@ -479,7 +528,8 @@ aux-13 §1.2.4 规定失败响应形状为
 | `crates/im-gateway/src/http/auth_handlers.rs` `token_exchange` **nonce 防重放** | 协议有 `X-IM-Nonce`, 但服务端**未校验也未记录** —— 同一合法请求可在 ±300s 窗口内重放 | 需跨实例共享存储 → **WBS D-4 (Valkey)** 落地后接 |
 | `crates/im-gateway/src/placeholder.rs` (整文件) | 10 个端点桩函数未被调用 | 该文件唯一职责就是存放未接线桩; 各端点随对应 WBS 项落地 |
 | ~~`im_protocol::ServerFrame::Ack` **缺 error 载荷**~~ | ~~规范 (aux-13 §1.2.4) 规定的失败形状表达不了, 实现因此另造顶层 `{"type":"error",...}` 帧~~ | ✅ **已修复** (2026-10-03): `Ack` 补 `error: Option<ErrorBody>`, im-gateway 改发规范形状并删除 `WsErrorFrame`, im-testkit 补齐强类型版。见 §1.7.3 |
-| `im_protocol::ServerFrame` **缺 `message_new` 变体** | `ws_frames.rs` 模块文档称「aux-13 §1.2 服务端 11 类」, 实际枚举只有 9 个变体; aux-13 §1.2.5 定义的 `message_new`(新消息广播)**无对应变体** | 随 C-9 业务帧实装一并补; 需确认 wire 形状(`WireMessage` 已存在但未挂在 `ServerFrame` 上) |
+| `im_protocol::ServerFrame` **缺 `message_new` 变体** | `ws_frames.rs` 模块文档称「aux-13 §1.2 服务端 11 类」, 实际枚举只有 9 个变体; aux-13 §1.2.5 定义的 `message_new`(新消息广播)**无对应变体** —— 即便 `send_message` 实装成功, 其他客户端也收不到广播 | 随 G-1 presence / 广播分发一并补; 需确认 wire 形状(`WireMessage` 已存在但未挂在 `ServerFrame` 上)。见 §1.8.1 |
+| `ws/handler.rs` 鉴权成功回 **`{"type":"auth_ok"}`** | **`auth_ok` 不是 aux-13 §1.2 定义的任何帧类型**(§1.2.1 定义的是 `connected { session_id }`)。继 §1.6 的 `UNSUPPORTED_OPERATION` 之后**第二处凭空发明的 wire 帧** | **只记录不擅改**(见 §1.8.2): 改它变动客户端可见的 wire 形状, 且**无证据表明 `connected` 就是原意** —— 与 §1.7.3 的 `ack` 形状不同(那次有 testkit 证据, 方向无歧义)。需规范所有者确认该帧形状 |
 
 ---
 

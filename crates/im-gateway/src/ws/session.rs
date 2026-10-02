@@ -92,9 +92,7 @@ impl WsSession {
         self.session_id
     }
 
-    // 守门 #1 缺口台账: 缺口 #G — 鉴权后身份读取接口,待 C-11 driver 做 ForceDisconnect
-    // / 广播分发时按 user_id 定位。保留不删,per docs/Project-Status.md §1.1.1。
-    #[allow(dead_code)]
+    /// 鉴权后的 user_id (供业务帧取 sender —— 身份只能来自会话状态, 不能来自帧内容)
     pub fn user_id(&self) -> Option<UserId> {
         self.user_id
     }

@@ -27,31 +27,38 @@
 //! - ForceDisconnect hook stub (后续 G-1 presence 集成)
 //!
 //! ### 已知缺口 (per 守门 #1 缺标比错标)
-//! 1. **业务帧处理 (SendMessage / Edit / Recall / React / MarkRead / Typing)**: 留 C-9 + 后续 lane
+//! 1. **业务帧处理** —— **2026-10-03 已实装 1/6**:
+//!    `SendMessage` 走完整 `MessageService::send_message` 校验链(幂等 / content
+//!    schema / conversation member / 大小上限), 回 aux-13 §1.2.2 的 `ack`。
+//!    仍**未实装 5 类**: `EditMessage` / `RecallMessage` / `React` / `MarkRead` /
+//!    `Typing` —— 收到即回 `VALIDATION_ERROR`(带 req_id), 错误码语义不理想
+//!    (帧格式合法, 缺的是服务端处理器), 但**不新造错误码**, 理由见下。
 //!
-//!    **2026-10-03 更正 —— 本条原注释是双重错误, 勿照抄**:
+//!    **2026-10-03 更正 —— 以下说明本条原注释为何不可照抄**:
 //!    - 原写「返 `UNSUPPORTED_OPERATION` (501, per aux-13 §4)」。**该错误码不存在**:
 //!      `aux-03-error-code-registry.md` §B 是 MVP 错误码的**唯一权威表**, 列出 21 个
 //!      已注册码, 与 `im_common::ErrorCode` 枚举逐项一致, 其中**没有**
 //!      `UNSUPPORTED_OPERATION`, 也没有 501。
 //!    - 原引用的 `aux-13 §4` 是**「前置条件 (Prerequisites)」**章节, 不是错误码章节 ——
 //!      出处本身也不成立。
-//!    - 实际代码返回 `VALIDATION_ERROR` (400)。它是个**已注册**码, 但语义不合:
-//!      业务帧格式完全合法, 缺的只是服务端处理器。aux-03 §B 对该码的定义是
-//!      「请求体校验失败 / 字段类型、长度、枚举值不合法」。
-//!
-//!    **为何不改成 501**: `aux-03 §B` 写明「任何 PR 增加必须同时更新本表与
-//!    DetailedDesign」, 即新增错误码是**协议变更**; 而 ImplementationSpec 处于
-//!    `[PROTOCOL-FROZEN]`。是否新增「未实装」类错误码属规范所有者的决定, 不是
-//!    架构师可自行拍板的实现细节。已记入 `docs/gap-ledger.md` §1.6。
+//!    - **为何不自行改成 501**: `aux-03 §B` 写明「任何 PR 增加必须同时更新本表与
+//!      DetailedDesign」, 即新增错误码是**协议变更**; 而 ImplementationSpec 处于
+//!      `[PROTOCOL-FROZEN]`。是否新增「未实装」类错误码属规范所有者的决定。已记入
+//!      `docs/gap-ledger.md` §1.6。
 //! 2. **im-proto gRPC 客户端**: 有 stub (per worker-C 探索 `im_proto::im::core::v1::core_service_client::CoreServiceClient`), 但 MVP Day 3 没 wire-up gRPC channel; Auth 帧的 TokenClaims 解析走本地 TokenService (已经在 im-gateway 进程内), 不走 gRPC
 //! 3. **ForceDisconnect broadcast**: 占位 broadcast channel, 实际 broadcasting 留 G-1 presence
+//! 4. **`ServerFrame` 缺 `message_new` 变体**: aux-13 §1.2.5 定义的「新消息广播」
+//!    无对应变体 —— 即便 `send_message` 成功, 其他客户端也收不到广播。随 G-1
+//!    presence / 广播分发一并补, 见 `docs/gap-ledger.md` §2
 //!
 //! 已于 2026-10-03 结清:
-//! - 曾列为缺口 4 的「60s 无帧超时未真正关闭连接」已修复 —— tick 搬进
+//! - 曾列为缺口 5 的「60s 无帧超时未真正关闭连接」已修复 —— tick 搬进
 //!   `run_ws_loop` 的 `select!`, 超时即退出主循环并走 close。
-//! - 曾列为缺口 5 的「device_session_id 来自 JWT claims / TokenClaims 没 `dsid` 字段」
-//!   已修复 —— 见 `docs/gap-ledger.md` §1.5 (C-7 logout 实装, 本轮一并补上)。
+//! - 曾列为缺口 6 的「device_session_id 来自 JWT claims / TokenClaims 没 `dsid` 字段」
+//!   已修复 —— 见 `docs/gap-ledger.md` §1.5 (C-7 logout 实装)。
+//! - 鉴权成功后回的是 `{"type":"auth_ok"}`, **该帧类型在 aux-13 中不存在**
+//!   (§1.2.1 规定的是 `connected`)。已记入 `docs/gap-ledger.md` §2, 未擅改 ——
+//!   改它会变动客户端可见的 wire 形状, 与 §1.7.3 的 `ack` 形状对齐性质不同。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -63,7 +70,7 @@ use serde::Deserialize;
 use tokio::time::interval;
 use uuid::Uuid;
 
-use im_common::ids::{DeviceSessionId, EnvironmentId, UserId};
+use im_common::ids::{ConversationId, DeviceSessionId, EnvironmentId, MessageId, UserId};
 use im_common::AppError;
 use im_core::identity::token::TokenService;
 use im_protocol::ws_frames::{ClientFrame, ServerFrame};
@@ -344,7 +351,24 @@ async fn run_ws_loop(
                             }
                         }
                     }
-                    // 6 类业务帧**逐一列出**, 不用 `Ok(_)` 兜底。两个理由:
+                    // C-9 已实装: send_message 走完整 MessageService 校验链
+                    Ok(frame @ ClientFrame::SendMessage { .. }) => {
+                        // sender 来自**已鉴权的会话状态**, 不取自帧内容 ——
+                        // 客户端没有资格声明自己是谁。
+                        match state.user_id() {
+                            Some(uid) => handle_send_message(ws_session, app, uid, frame).await,
+                            None => {
+                                send_error(
+                                    ws_session,
+                                    im_common::ErrorCode::Unauthorized,
+                                    "not authenticated",
+                                    None,
+                                )
+                                .await
+                            }
+                        }
+                    }
+                    // 其余 5 类业务帧仍逐一显式列出, 不用 `Ok(_)` 兜底。两个理由:
                     //
                     // (1) req_id 必须回传。aux-13 §1.2.4 规定 error 帧带 req_id,
                     //     客户端据此把失败响应关联回自己的请求。此前这里传 `None`,
@@ -356,8 +380,7 @@ async fn run_ws_loop(
                     //     静默吞掉。ping 漏洞(gap-ledger §1.2)就是这么藏的 ——
                     //     `ClientFrame::Ping` 解析成功, 却落进了 `Ok(_)`。
                     Ok(
-                        ClientFrame::SendMessage { req_id, .. }
-                        | ClientFrame::EditMessage { req_id, .. }
+                        ClientFrame::EditMessage { req_id, .. }
                         | ClientFrame::RecallMessage { req_id, .. }
                         | ClientFrame::React { req_id, .. }
                         | ClientFrame::MarkRead { req_id, .. }
@@ -376,7 +399,7 @@ async fn run_ws_loop(
                         send_error(
                             ws_session,
                             im_common::ErrorCode::ValidationError,
-                            "business frame handler not implemented in MVP (per 138 §C-9)",
+                            "frame handler not implemented in MVP (per 138 §C-9)",
                             Some(req_id),
                         )
                         .await;
@@ -476,6 +499,155 @@ async fn handle_auth(
         })?;
 
     Ok((user_id, environment_id, device_session_id))
+}
+
+/// C-9 业务帧: `send_message` (per aux-13 §1.1.2)
+///
+/// 逻辑与 REST `http::messages::send_message` **刻意保持一致**(同一条
+/// `MessageService::send_message` 校验链: 幂等 / content schema / conversation
+/// member / 大小上限), 差别只在响应形状: REST 返 201 + body, WS 返
+/// `ServerFrame::Ack { ok: true, data }`。
+///
+/// 2026-10-03 实装 —— 此前本帧落进 `Ok(_)` 兜底, 回一个「未实装」错误。
+async fn handle_send_message(
+    ws_session: &mut actix_ws::Session,
+    app: &web::Data<AppState>,
+    sender_id: UserId,
+    frame: ClientFrame,
+) {
+    let ClientFrame::SendMessage {
+        req_id,
+        conversation_id,
+        idempotency_key,
+        kind,
+        content,
+        reply_to,
+    } = frame
+    else {
+        unreachable!("调用方保证传入 SendMessage 变体");
+    };
+
+    // 幂等预判: 命中则回 `idempotent_replay: true`, 不重复发事件(per
+    // aux-13 §1.2.3)。见 MessageService::find_by_idempotency_key 的偏差说明。
+    let key = idempotency_key.to_string();
+    match app
+        .message_service
+        .find_by_idempotency_key(ConversationId(conversation_id), sender_id, &key)
+        .await
+    {
+        Ok(Some(existing)) => {
+            send_ack(
+                ws_session,
+                req_id,
+                Some(existing.id.0),
+                Some(existing.sequence),
+                true,
+            )
+            .await;
+            return;
+        }
+        Ok(None) => {}
+        Err(e) => {
+            send_error(
+                ws_session,
+                im_common::ErrorCode::InternalError,
+                &format!("idempotency lookup failed: {e}"),
+                Some(req_id),
+            )
+            .await;
+            return;
+        }
+    }
+
+    let cmd = im_core::message::service::SendMessageCommand {
+        conversation_id: ConversationId(conversation_id),
+        sender_id,
+        idempotency_key: key,
+        kind,
+        // `ClientFrame.content` 是 `MessageContent`(强类型), 而
+        // `SendMessageCommand.content` 是 `serde_json::Value` —— 序列化成
+        // JSON 交给 service 侧按 kind 反序列化回强类型(该 schema 校验在
+        // service 内, 见其 step 2)。
+        content: serde_json::to_value(&content).unwrap_or(serde_json::Value::Null),
+        reply_to: reply_to.map(MessageId),
+        // 默认 65536 (per REST messages.rs 同值 + SRS §16.4); V1 从
+        // environments.settings 读
+        max_size_bytes: 65_536,
+    };
+
+    match app.message_service.send_message(cmd).await {
+        Ok(msg) => {
+            send_ack(
+                ws_session,
+                req_id,
+                Some(msg.id.0),
+                Some(msg.sequence),
+                false,
+            )
+            .await;
+        }
+        Err(e) => {
+            // service 侧的校验/权限错误按其 AppError 映射到已注册错误码,
+            // 不再一律回「未实装」。
+            let (code, detail) = map_service_error(&e);
+            send_error(
+                ws_session,
+                code,
+                &format!("{}: {detail}", "send_message failed"),
+                Some(req_id),
+            )
+            .await;
+        }
+    }
+}
+
+/// 发成功 ack (per aux-13 §1.2.2)
+async fn send_ack(
+    session: &mut actix_ws::Session,
+    req_id: Uuid,
+    message_id: Option<Uuid>,
+    sequence: Option<i64>,
+    idempotent_replay: bool,
+) {
+    let frame = ServerFrame::Ack {
+        req_id,
+        ok: true,
+        data: Some(im_protocol::ws_frames::AckData {
+            message_id,
+            sequence,
+            idempotent_replay,
+        }),
+        error: None,
+    };
+    if let Err(e) = session
+        .text(serde_json::to_string(&frame).unwrap_or_default())
+        .await
+    {
+        tracing::warn!(error = ?e, "ws send ack failed");
+    }
+}
+
+/// `AppError` → (已注册错误码, 可安全回给客户端的说明)
+///
+/// **不自己维护映射** —— 直接用 `AppError::code()`(im-common 里的穷尽 match,
+/// 单一真源)。若在此另写一份映射, 两处会随变体新增而漂移。
+///
+/// 唯一自行决定的是**哪些错误的消息可以外泄**:
+/// - `InternalError` / `ServiceUnavailable`: 只回通用文案, 具体原因(可能含
+///   SQL / 连接串 / 内部路径)写服务端日志。aux-03 §B 对这两码的客户端建议是
+///   「重试」而非「展示细节」。
+/// - 其余业务码: 消息可直接回传。aux-03 §B 明确 `VALIDATION_ERROR` 的响应
+///   应含 `details: [{field, reason}]` 供客户端展示具体字段错误。
+fn map_service_error(e: &AppError) -> (im_common::ErrorCode, String) {
+    use im_common::ErrorCode as EC;
+    let code = e.code();
+    match code {
+        EC::InternalError | EC::ServiceUnavailable => {
+            tracing::error!(error = %e, "send_message internal failure");
+            (code, "internal error".into())
+        }
+        _ => (code, e.to_string()),
+    }
 }
 
 /// 通过 WS 发错误帧 (per aux-13 §1.2.4)
@@ -839,13 +1011,88 @@ mod tests {
     }
 
     #[test]
+    fn map_service_error_does_not_leak_internal_details() {
+        // 内部错误的原因可能含 SQL / 连接串 / 内部路径, 绝不能原样回给客户端。
+        let secret = "postgres://im:hunter2@10.0.0.5:5432/im SELECT * FROM users";
+        let e = AppError::Internal(anyhow::anyhow!(secret));
+        let (code, msg) = map_service_error(&e);
+        assert_eq!(code, im_common::ErrorCode::InternalError);
+        assert!(
+            !msg.contains("hunter2") && !msg.contains("10.0.0.5"),
+            "内部错误细节泄漏到客户端: {msg}"
+        );
+
+        // 服务不可用同理
+        let e = AppError::ServiceUnavailable("redis://:pw@cache:6379".into());
+        let (code, msg) = map_service_error(&e);
+        assert_eq!(code, im_common::ErrorCode::ServiceUnavailable);
+        assert!(!msg.contains("pw"), "依赖地址/凭据泄漏: {msg}");
+    }
+
+    #[test]
+    fn map_service_error_passes_through_business_errors() {
+        // 业务错误的说明应原样回传 —— aux-03 §B 要求 VALIDATION_ERROR 的
+        // 响应含字段级原因供客户端展示。
+        let (code, msg) = map_service_error(&AppError::Validation("kind must not be empty".into()));
+        assert_eq!(code, im_common::ErrorCode::ValidationError);
+        assert!(
+            msg.contains("kind must not be empty"),
+            "业务原因应回传: {msg}"
+        );
+
+        let (code, _) = map_service_error(&AppError::Forbidden("not a member".into()));
+        assert_eq!(code, im_common::ErrorCode::Forbidden);
+    }
+
+    #[test]
+    fn map_service_error_covers_every_registered_app_error_variant() {
+        // 穷尽性回归: 逐一构造各变体, 断言映射出的码都**已注册**
+        // (即 `map_service_error` 用的 `AppError::code()` 不会自造新码)。
+        let variants = vec![
+            AppError::Unauthorized("a".into()),
+            AppError::Forbidden("b".into()),
+            AppError::NotFound("c".into()),
+            AppError::RateLimited(1),
+            AppError::Validation("d".into()),
+            AppError::IdempotencyConflict(Uuid::new_v4()),
+            AppError::InvalidStateTransition {
+                from: "a".into(),
+                to: "b".into(),
+            },
+            AppError::RecallWindowExpired(chrono::Utc::now()),
+            AppError::AccountBanned,
+            AppError::AccountSuspended,
+            AppError::AccountMergeConflict,
+            AppError::FriendRequestExists,
+            AppError::FriendRequestNotFound(Uuid::new_v4()),
+            AppError::UserBlocked,
+            AppError::ConversationNotFound(Uuid::new_v4()),
+            AppError::MessageNotFound(Uuid::new_v4()),
+            AppError::MessageTooLarge(10, 5),
+            AppError::InvalidIdempotencyKey("e".into()),
+            AppError::EnvironmentDisabled(Uuid::new_v4()),
+            AppError::Internal(anyhow::anyhow!("f")),
+            AppError::ServiceUnavailable("g".into()),
+        ];
+        for v in variants {
+            let (code, _) = map_service_error(&v);
+            // `as_str()` 必须落在 aux-03 §B 的注册集合内(由 check-error-codes.ps1 兜底)
+            let wire = code.as_str();
+            assert!(
+                wire.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "{v:?} 映射出非错误码形状的串: {wire}"
+            );
+        }
+    }
+
+    #[test]
     fn business_frame_error_frame_carries_req_id() {
         // aux-13 §1.2.4: 失败响应带 req_id, 客户端据此关联回自己的请求。
         // 此前业务帧分支传 `None`, 客户端拿到「无主」错误帧。
         let req_id = Uuid::new_v4();
         let s = serde_json::to_string(&error_ack_frame(
             im_common::ErrorCode::ValidationError,
-            "business frame handler not implemented in MVP (per 138 §C-9)",
+            "frame handler not implemented in MVP (per 138 §C-9)",
             Some(req_id),
         ))
         .unwrap();

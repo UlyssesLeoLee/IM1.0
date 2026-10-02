@@ -256,6 +256,28 @@ impl MessageService {
         )))
     }
 
+    /// 按幂等键预查既有消息 (2026-10-03 新增, 供 WS ack 判定 `idempotent_replay`)
+    ///
+    /// `send_message` 内部遇到重放会返回既有 message, 但**不告诉调用方这是重放**。
+    /// REST 路径不关心(REST 的 `IDEMPOTENCY_CONFLICT` 语义是 HTTP 200 返回原
+    /// message_id), 而 WS 路径必须回填 `AckData.idempotent_replay`(per
+    /// aux-13 §1.2.2 / §1.2.3), 否则客户端无法区分「新消息」与「重放」。
+    ///
+    /// 注意: 这只是**预判**, 不替代 `send_message` 内部的检查 —— 并发下仍可能
+    /// 两边都查不到, 由 `send_message` 内部 + 唯一索引兜底。此时本方法返回
+    /// `None` 而实际发生了重放, `idempotent_replay` 会报 false。这是已知的
+    /// 保守偏差(把重放报成新消息, 好过把新消息报成重放), 未实装更精确的方案。
+    pub async fn find_by_idempotency_key(
+        &self,
+        conversation_id: ConversationId,
+        sender_id: UserId,
+        idempotency_key: &str,
+    ) -> Result<Option<Message>, AppError> {
+        self.repo
+            .find_by_idempotency_key(conversation_id, sender_id, idempotency_key)
+            .await
+    }
+
     pub async fn list_messages(
         &self,
         conversation_id: ConversationId,
