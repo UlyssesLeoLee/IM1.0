@@ -12,10 +12,14 @@ pub mod auth;
 pub mod auth_handlers;
 pub mod conversations;
 pub mod error_response;
+pub mod friends;
+pub mod me;
 pub mod members;
 pub mod message_actions;
 pub mod messages;
 pub mod state;
+#[cfg(test)]
+pub mod test_support;
 
 use actix_web::web;
 
@@ -92,6 +96,44 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
                 actix_web::web::post().to(message_actions::mark_read),
             )
             .route("/{id}/members", actix_web::web::get().to(members::list)),
+    );
+
+    // 好友关系 (IM-REL-001 / MOD-FR-001) — 2026-10-03 实装
+    //
+    // 三个端点的成功响应**一律 204**: 已是好友与新建申请返回同一个东西
+    // (proto 三个 RPC 全返 google.protobuf.Empty), 若给新建返 201+body,
+    // 客户端就无法区分「首次创建」与「幂等重发」。依据见 friends.rs 模块文档。
+    //
+    // 注: `GET /v1/friends`(好友列表)**未**注册 —— aux-13 说返回
+    // `repeated Friend`、proto 说 `repeated User`, 两者矛盾且仓储层没有
+    // cursor 支持(只返回 friend_id)。凭空选一个就是发明 wire 形状。
+    // 记在 docs/gap-ledger.md §1.16, 待规范所有者裁决。
+    cfg.service(
+        actix_web::web::scope("/friends")
+            .route(
+                "/requests",
+                actix_web::web::post().to(friends::send_request),
+            )
+            .route(
+                "/requests/{id}/respond",
+                actix_web::web::post().to(friends::respond_request),
+            )
+            .route("/{id}/block", actix_web::web::post().to(friends::block)),
+    );
+
+    // 用户资料 (IM-ID-001) — 2026-10-03 实装
+    //
+    // 走 `MeResponse` 而非直接序列化 `im_core::User`: 后者派生了 Serialize
+    // 且带 `password_hash`(argon2id), 直接 json() 会把哈希发给客户端。
+    // 见 me.rs 模块文档的字段对照表。
+    //
+    // 注: `POST /v1/media/presign` 与 `GET /v1/media/{id}` **未**注册 ——
+    // 二者需要对象存储(MinIO/S3)做预签名, 该基础设施尚未落地, 仓里没有
+    // media 模块。记在 docs/gap-ledger.md §1.16。
+    cfg.service(
+        actix_web::web::scope("/me")
+            .route("", actix_web::web::get().to(me::get_me))
+            .route("", actix_web::web::patch().to(me::update_me)),
     );
 
     // WebSocket (C-11 driver) — MVP Day 4 实装

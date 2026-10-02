@@ -85,10 +85,22 @@ impl FriendshipRepository for PgFriendshipRepository {
             ))
         })?;
 
-        // 已在 pending 视为幂等成功;非 pending 报错(per 2026-08-23 P2-1 限制)
+        // UNIQUE(env, sender, recipient) 跨 state 阻断(migrations/0003 第 21 行,
+        // WBS B-3 已知限制)。冲突后的错误码按 aux-11 §4 时序图 line 337-344 区分:
+        //
+        //   existing.state = pending                        → 409 FRIEND_REQUEST_EXISTS
+        //   existing.state = accepted/rejected/expired      → 409 INVALID_STATE_TRANSITION
+        //
+        // 2026-10-03 修正: 原实现把 pending 当作「幂等成功」返 204, 与 aux-11
+        // line 338-339 明确写的 `FRIEND_REQUEST_EXISTS` 相反; 而终态返的又是
+        // `FriendRequestExists` 而非 `InvalidStateTransition`。两条都与规范不符。
+        // 端到端用例 `duplicate_request_returns_409_friend_request_exists` 锁住前者。
         match existing.state.as_str() {
-            "pending" => Ok(existing.into_request()),
-            _ => Err(AppError::FriendRequestExists),
+            "pending" => Err(AppError::FriendRequestExists),
+            other => Err(AppError::InvalidStateTransition {
+                from: other.to_string(),
+                to: "pending".into(),
+            }),
         }
     }
 

@@ -771,6 +771,13 @@ mod tests {
                 Arc::new(im_core::message::pg::PgMessageRepository::new(p.clone())),
                 Arc::new(PgConversationRepository::new(p.clone())),
             )),
+            // 同理: 真 pool 的 RelationshipService(好友端点 2026-10-03 接线后
+            // 需要它)。本文件用例走 auth 端点用不到, 但传真 service 与生产同构。
+            Arc::new(im_core::relationship::service::RelationshipService::new(
+                Arc::new(im_core::relationship::pg::PgFriendshipRepository::new(
+                    p.clone(),
+                )),
+            )),
         ))
     }
 

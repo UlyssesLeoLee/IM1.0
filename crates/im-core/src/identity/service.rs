@@ -439,4 +439,30 @@ where
             .await?
             .ok_or(AppError::NotFound("user".into()))
     }
+
+    /// 改自己的资料 (per proto `UpdateMeRequest { user_id, display_name? }`)
+    ///
+    /// 2026-10-03 新增, 为 `PATCH /v1/me` 服务。
+    ///
+    /// ## 为什么 `display_name` 是 `Option<&str>` 而不是 `String`
+    ///
+    /// proto 里 `optional string display_name = 2`, 即**字段可缺省**。缺省
+    /// (`None`) 表示「本次不改动」, 而不是「清空为 NULL」—— 这两者在
+    /// `Option<String>` 上是同一个值, 分不开。区分它们需要 PATCH 语义
+    /// (JSON Merge Patch 的显式 null), 而 `aux-13` 没给 `/v1/me` 的
+    /// REST 样例, 无从判断该端点要哪种。
+    ///
+    /// 故本方法按**「缺省 = 不改动」**实装, 并在此写明: 若规范所有者要的是
+    /// 显式 null 清空, 需改用 `Option<Option<String>>` 并在 handler 层区分
+    /// 「字段缺失」与「字段为 null」两种输入 —— 那是 wire 形状变更, 不由
+    /// 实现方拍板。见 `docs/gap-ledger.md` §1.16。
+    pub async fn update_me(
+        &self,
+        user_id: UserId,
+        display_name: Option<&str>,
+    ) -> Result<User, AppError> {
+        self.user_repo
+            .update_display_name(user_id, display_name)
+            .await
+    }
 }

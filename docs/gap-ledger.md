@@ -1070,7 +1070,121 @@ sender」这个用例实际测的仍是「非成员」。
 | aux-13 只给**样例 JSON**, 不给**结构定义** | 连续三次撞到「样例里没写的字段, 实现方无权补」: `UNSUPPORTED_OPERATION`(§1.6) / `auth_ok`(§1.8.2) / 上面两个帧的 `conversation_id` | 建议规范改为给**字段表 + 可空性 + 取值域**, 而非单条样例。这是从根上消除此类缺口的唯一办法 |
 | `ws/hub.rs` 成员关系**鉴权时快照一次** | 会话期间被移出会话, 仍会收到该会话广播, 直到该连接重连 | 需基于事件的成员变更通知, 随 **G-1 presence** 落地 |
 | `ws/handler.rs` 鉴权成功回 **`{"type":"auth_ok"}`** | **`auth_ok` 不是 aux-13 §1.2 定义的任何帧类型**(§1.2.1 定义的是 `connected { session_id }`)。继 §1.6 的 `UNSUPPORTED_OPERATION` 之后**第二处凭空发明的 wire 帧** | **只记录不擅改**(见 §1.8.2): 改它变动客户端可见的 wire 形状, 且**无证据表明 `connected` 就是原意** —— 与 §1.7.3 的 `ack` 形状不同(那次有 testkit 证据, 方向无歧义)。需规范所有者确认该帧形状 |
-| im-gateway 13 个 e2e 用例**连不上 PG 就静默通过** | 沿用 `auth_handlers` 约定 `let Some(p) = .. else { return }`。CI 若无 `DATABASE_URL`, 全部「跑过」与「没跑」**无法区分** —— 假绿灯向量 | 需 D-4 后在 CI 挂 PG service container; 或改「连不上即 fail」(会让无 PG 的本地全红, 属取舍, 未擅自改)。见 §1.15 |
+| im-gateway 26 个 e2e 用例**连不上 PG 就静默通过** | 沿用 `auth_handlers` 约定 `let Some(p) = .. else { return }`。CI 若无 `DATABASE_URL`, 全部「跑过」与「没跑」**无法区分** —— 假绿灯向量 | 需 D-4 后在 CI 挂 PG service container; 或改「连不上即 fail」(会让无 PG 的本地全红, 属取舍, 未擅自改)。见 §1.15 |
+| `GET /v1/friends` **aux-13 与 proto 互相矛盾** | aux-13 说 `repeated Friend {user_id, display_name, state, since}`, proto 说 `repeated User`(带 `external_identity_json` / `environment_id`)。按 `User` 实装 = 把**每个人的外部身份**发给所有能列好友的人; 按 `Friend` 实装 = 要新增类型并改 proto。仓储层另缺 cursor 支持 | **需规范所有者裁决**。不擅自选边。见 §1.16 |
+| `POST /v1/media/presign` / `GET /v1/media/{id}` **无对象存储** | aux-13 §3.6 请求/响应样例齐全、proto 也有 message, 但预签名 URL 只能由真实 MinIO/S3 签发; 仓库无 media 模块、无 media 表、无对象存储配置。aux-06 line 442 亦写明「V1+ 实装」 | 依赖对象存储基础设施落地。返 mock URL 比不实现**更糟**(客户端拿着签不出东西的 URL 去 PUT, 失败难以诊断), 故不实装。见 §1.16 |
+
+### 1.16 friends / media / me 共 8 个端点: 5 个已实装, 3 个卡在规范矛盾或缺基础设施 (2026-10-03)
+
+`DetailedDesign §5` 列了 8 个端点, 但 §1.14 交付时它们一个都没有 REST 出口。
+逐个核对规范后发现**它们的可实装程度差别很大** —— 差别不在难度, 在规范给了
+多少形状:
+
+| 端点 | 规范给了什么 | 结果 |
+|---|---|---|
+| `POST /v1/friends/requests` | body `{recipient_id}` + 全部分支状态码(aux-11 §4) | ✅ 实装 |
+| `POST /v1/friends/requests/{id}/respond` | body `{accept}` + 204 + 三种错误码(aux-13 §3.7, `[PROTOCOL-FROZEN-PATCH]`) | ✅ 实装 |
+| `POST /v1/friends/{id}/block` | 204(aux-08) | ✅ 实装 |
+| `GET /v1/me` | proto `GetMe` 返回 `User` message | ✅ 实装 |
+| `PATCH /v1/me` | proto `UpdateMeRequest` | ✅ 实装 |
+| `GET /v1/friends` | **aux-13 与 proto 互相矛盾** | ❌ 未实装 |
+| `POST /v1/media/presign` | 请求/响应样例齐全, 但**无对象存储** | ❌ 未实装 |
+| `GET /v1/media/{id}` | 仅一行路径说明 | ❌ 未实装 |
+
+#### 抓到两个**已实装 service 里的真 bug**
+
+`RelationshipService` 早在 2026-08-23 就实装完毕, 但因为没有端点调用它,
+**从未被任何测试跑过**。接上 e2e 后立刻暴露两处, 两处都与规范明确相反:
+
+1. **`is_blocked` 的参数传反了**。仓储语义是 `is_blocked(user, target)` =
+   「**user 被 target 屏蔽**」(SQL `WHERE user_id = target AND friend_id = user`,
+   屏蔽者存在 `user_id` 列)。service 写的是 `is_blocked(recipient, sender)`,
+   等于在问「recipient 被 sender 屏蔽」—— 方向正好反了。后果:
+   **我拉黑的人照样能给我发好友申请**(该拒的没拒), 而我拉黑过的人我反而
+   发不出申请(不该拒的拒了)。
+2. **重复申请的错误码与 aux-11 §4 line 337-344 明确相反**。规范写
+   「已有 pending → 409 `FRIEND_REQUEST_EXISTS`; 已有终态 → 409
+   `INVALID_STATE_TRANSITION`」, 实现却是 pending 返 204 幂等成功、终态返
+   `FRIEND_REQUEST_EXISTS`。两者状态码都是 409 所以**手测完全看不出问题**,
+   只有断言到错误**码**才暴露。
+
+> 教训与 §1.15 同源, 但多一层: **状态码对不等于实现对**。两个 bug 的
+> HTTP 状态码恰好都是「看起来合理」的值(204 / 409), 只有比到 wire 码才发现
+> 与规范相反。凡是规范点名了错误码的地方, 测试就必须断言码而不只是状态码。
+
+##### ⚠️ 一处**客户端可见的行为变更**(需要下游知晓)
+
+修正 #2 意味着 `POST /v1/friends/requests` 对**重复申请**的响应从 **204**
+变成 **409 `FRIEND_REQUEST_EXISTS`**。任何依赖「重复申请返 204」的客户端
+(把它当幂等重试用)会开始收到 409。
+
+**为什么以规范为准**: 旧行为来自 2026-08-23 的一次实现决定(代码注释
+「per 2026-08-23 P2-1 已知限制」), 而规定 409 的 aux-11 版本是 **v1.1.0,
+日期 2026-09-01** —— 规范**更新**, 实现是过时的那一方。
+
+**顺带暴露一个未解的产品问题**: `UNIQUE(env, sender, recipient)` **跨 state
+阻断**(WBS B-3), 所以一旦被拒绝, 对方**永远无法重发**。aux-11 line 341 也
+标注「被拒后无法重发, 待 PM 拍板」。本实现未擅自改动这个约束 —— 要放开得改
+migration(部分唯一索引或引入 `superseded_by`)。若要维持 204 幂等, 同样得改
+规范。**两条路都需要规范所有者决定, 未选边。**
+
+#### `GET /v1/friends`: 两份规范互相矛盾, 故未实装
+
+| 来源 | 说的是 |
+|---|---|
+| `aux-13 §2.5` | `ListFriendsResponse.friends` 是 `repeated **Friend**`, 而 `Friend { user_id, display_name, state, since }` |
+| `crates/im-proto/proto/core.proto` | `ListFriendsResponse.friends` 是 `repeated **User**` |
+
+两者**不可调和**: `User` 带 `external_identity_json` / `environment_id`, `Friend`
+不带。这不是排版差异 —— 若按 `User` 实装, 好友列表会把**每个人的外部身份**
+(provider + external_uid) 发给所有能列好友的人; 若按 `Friend` 实装, 就要
+新增一个 `Friend` 类型并重写 proto。
+
+另有第三处不齐: `PgFriendshipRepository::list_friends` 的 SQL 是
+`SELECT friend_id FROM friendships ... LIMIT $2`, **cursor 形参根本没用上**
+(注释自认「MVP: 未实现 cursor」), 既返回不了 `display_name`/`since`, 也产生
+不了 `next_cursor`。所以即便矛盾解开, 仓储层也要重写。
+
+**不擅自选边**: 选 `User` 就有跨用户身份泄漏, 选 `Friend` 就要动 proto。留待
+规范所有者裁决。
+
+#### media 两个端点: 缺的是基础设施, 不是代码
+
+`aux-13 §3.6` 把 `POST /v1/media/presign` 的请求(`content_type` / `size_hint`)
+与响应(`upload_url` / `media_id` / `expires_at`)样例给得很全, proto 也有
+`PresignMediaRequest` / `PresignMediaResponse`。但**预签名 URL 只能由真实的
+对象存储(MinIO/S3)签发**, 而仓库里没有 media 模块、没有 media 表、没有对象
+存储配置。aux-06 line 442 也写明「V1+ 实装; MVP 返回 mock URL」。
+
+返 mock URL 比不实现**更糟**: 客户端会拿着一个签不出东西的 URL 去 PUT, 得到
+一个难以诊断的失败。故不实装, 记为依赖项。
+
+#### `/me` 的一个必须显式拆开的陷阱
+
+`im_core::identity::repository::User` **派生了 `Serialize`**, 且带有
+`username` 与 `password_hash`(argon2id PHC 格式)。handler 里一句
+`HttpResponse::Ok().json(user)` 就会把**密码哈希**发给客户端。
+根因是 `User` 同时扮演「数据库行」与「对外表示」两个角色。
+
+`MeResponse` 把两者拆开, 字段集取自 proto `User` message(规范自己给出的
+「对外用户表示」定义), 并**排除** `password_hash` 与 `username`(后者 proto
+也没有 —— 规范本身就把它排除在对外表示之外)。
+`me_response_field_set_is_an_explicit_allowlist` 断言的是**整个键集合相等**,
+所以「往 `User` 上加一个新列」不会静默泄漏, 但「往 `MeResponse` 上加一个字段」
+必须同时改这个断言 —— 加字段是一个显式的、被审的动作。
+
+变异验证: 把 `get_me` 改回 `.json(&user)`, 该用例立刻变红, 失败信息里直接
+打印出泄漏的 `$argon2id$...` 与登录名。
+
+#### 一处未裁决的 PATCH 语义
+
+proto `UpdateMeRequest.display_name` 是 `optional`。缺省与「显式清空」在
+`Option<String>` 上是同一个值, 分不开; 要区分需 JSON Merge Patch 的显式
+`null`, 而 `aux-13` **没给 `/v1/me` 的 REST 样例**, 无从判断该端点要哪种。
+本实现按「缺省 = 不改动」实装并写明。若规范所有者要显式 null 清空, 需改成
+`Option<Option<String>>` 并在 handler 层区分两种输入 —— 那是 wire 变更。
+
+---
 
 ---
 

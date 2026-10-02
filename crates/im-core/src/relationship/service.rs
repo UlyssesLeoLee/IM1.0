@@ -31,20 +31,28 @@ impl RelationshipService {
                 "cannot send friend request to self".into(),
             ));
         }
-        // 检查是否已被对方屏蔽
-        if self.repo.is_blocked(recipient, sender).await? {
+        // 检查是否**被对方**屏蔽
+        //
+        // 2026-10-03 修正:原先写的是 `is_blocked(recipient, sender)`。而
+        // `FriendshipRepository::is_blocked(user, target)` 的语义是
+        // 「**user 被 target 屏蔽**」(SQL: `user_id = target AND
+        // friend_id = user`, 屏蔽者存在 user_id 列)。所以原写法问的其实是
+        // 「recipient 被 sender 屏蔽」—— **方向正好反了**:
+        //   - 我拉黑的人照样能给我发好友申请(应该被拒的没被拒)
+        //   - 我拉黑过的人我反而发不出申请(不该被拒的被拒)
+        //
+        // 要问的是「sender 被 recipient 屏蔽」, 故传 `(sender, recipient)`。
+        // 端到端用例 `blocked_user_cannot_send_friend_request` 锁住这条。
+        if self.repo.is_blocked(sender, recipient).await? {
             return Err(AppError::UserBlocked);
         }
-        // 幂等:已存在同 (env, sender, recipient) 的 pending 请求 → 视为成功
-        // 由 UNIQUE(env, sender, recipient) 触发,捕获错误转 FriendRequestExists
+        // 重复申请的错误码由仓储层按 aux-11 §4 区分:
+        // 已有 pending → FriendRequestExists;已有终态 → InvalidStateTransition。
+        // 两者都是 409, 但**码不同**, 客户端据此决定能否重试。
         self.repo
             .create_request(env, sender, recipient)
             .await
             .map(|_| ())
-            .map_err(|e| match e {
-                AppError::Internal(_) => AppError::FriendRequestExists,
-                other => other,
-            })
     }
 
     pub async fn respond_request(

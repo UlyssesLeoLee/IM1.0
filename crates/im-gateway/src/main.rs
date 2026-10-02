@@ -200,6 +200,12 @@ async fn main() -> std::io::Result<()> {
         conversation_repo_for_reaction,
     ));
 
+    let relationship_service = Arc::new(im_core::relationship::service::RelationshipService::new(
+        Arc::new(im_core::relationship::pg::PgFriendshipRepository::new(
+            pg_pool.clone(),
+        )),
+    ));
+
     let app_state = AppState::new(
         conversation_service,
         message_service,
@@ -207,6 +213,7 @@ async fn main() -> std::io::Result<()> {
         identity_service,
         settings_service,
         reaction_service,
+        relationship_service,
     );
 
     // 9b. WS 广播中枢 —— 进程内单例。

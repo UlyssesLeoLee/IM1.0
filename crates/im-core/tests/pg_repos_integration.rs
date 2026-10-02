@@ -233,21 +233,68 @@ async fn device_session_create_find_revoke() {
 // PgFriendshipRepository 测试
 // ============================================================================
 
+/// 重复申请**不是**幂等成功, 而是 409 —— per aux-11 §4 时序图 line 337-339:
+/// `UNIQUE(env, sender, recipient)` 冲突且 `existing.state = pending` 时,
+/// 返回 `FRIEND_REQUEST_EXISTS`。
+///
+/// 2026-10-03 **行为变更**。本用例此前断言「重复 create_request 返回同一行
+/// 且 state=Pending」(即 204 幂等成功), 那来自 2026-08-23 的一次实现决定。
+/// 但 aux-11 v1.1.0 的日期是 **2026-09-01**, 晚于该决定, 且明确把「已有
+/// pending → 409」写进了时序图主线。规范较新, 故对齐规范。
+///
+/// 这条是**客户端可见的行为变更**: 依赖「重复申请返 204」的客户端会开始收到
+/// 409。同时, 「已存在申请」不再是可重试的幂等操作 —— 若要重发, 客户端须先
+/// 走 respond 把旧申请落到终态(但 UNIQUE 跨 state 阻断, 见 aux-04 GAP / WBS B-3)。
 #[tokio::test]
-async fn friendship_request_idempotent() {
+async fn friendship_request_duplicate_is_friend_request_exists() {
     let (env_id, alice, bob) = make_env().await;
     let repo = PgFriendshipRepository::new(pool().await);
 
-    let r1 = repo
-        .create_request(env_id, alice, bob)
+    repo.create_request(env_id, alice, bob)
         .await
         .expect("1st failed");
-    let r2 = repo
+
+    let dup = repo.create_request(env_id, alice, bob).await;
+    assert!(
+        matches!(dup, Err(im_common::AppError::FriendRequestExists)),
+        "重复申请必须是 FriendRequestExists(aux-11 §4 line 338), 实际: {dup:?}"
+    );
+
+    // 且确实**没有**插入第二行
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM friend_requests \
+         WHERE environment_id = $1 AND sender_id = $2 AND recipient_id = $3",
+    )
+    .bind(env_id.0)
+    .bind(alice.0)
+    .bind(bob.0)
+    .fetch_one(&pool().await)
+    .await
+    .expect("count");
+    assert_eq!(rows, 1, "冲突不得留下第二行");
+}
+
+/// 已有**终态**的申请再发一次 → 409 但错误码是 `INVALID_STATE_TRANSITION`
+/// (aux-11 §4 line 340-343), 与 pending 情形的 `FRIEND_REQUEST_EXISTS` **不同码**。
+///
+/// 两者 HTTP 状态码都是 409, 只有比到 wire 码才区分得开 —— 这正是必须断言
+/// 错误码而不只是状态码的原因。
+#[tokio::test]
+async fn friendship_request_after_terminal_state_is_invalid_state_transition() {
+    let (env_id, alice, bob) = make_env().await;
+    let repo = PgFriendshipRepository::new(pool().await);
+
+    let req = repo
         .create_request(env_id, alice, bob)
         .await
-        .expect("2nd (idempotent) failed");
-    assert_eq!(r1.id, r2.id, "idempotent: same row");
-    assert_eq!(r1.state, FriendRequestState::Pending);
+        .expect("create failed");
+    repo.respond_request(req.id, true).await.expect("accept failed");
+
+    let dup = repo.create_request(env_id, alice, bob).await;
+    assert!(
+        matches!(dup, Err(im_common::AppError::InvalidStateTransition { .. })),
+        "终态后重发必须是 InvalidStateTransition(aux-11 §4 line 342), 实际: {dup:?}"
+    );
 }
 
 #[tokio::test]

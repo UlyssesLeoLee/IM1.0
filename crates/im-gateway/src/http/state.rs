@@ -25,6 +25,7 @@ use im_core::identity::service::IdentityService;
 use im_core::identity::token::TokenService;
 use im_core::message::service::MessageService;
 use im_core::reaction::service::ReactionService;
+use im_core::relationship::service::RelationshipService;
 use im_core::settings::service::SettingsService;
 
 /// im-gateway 共享 handler 状态(用 `web::Data<AppState>` 注入)
@@ -62,6 +63,16 @@ pub struct AppState {
     /// `ReactionRepository` 自身只做 PK 幂等插入, 不做任何校验, 所以它绝不能
     /// 被直接暴露给 handler。
     pub reaction_service: Arc<ReactionService>,
+
+    /// Relationship 服务 (IM-REL-001 —— 好友申请/接受/拉黑/好友列表)
+    ///
+    /// 2026-10-03 新增, 为 `POST /v1/friends/requests` /
+    /// `POST /v1/friends/requests/{id}/respond` /
+    /// `POST /v1/friends/{id}/block` 三个端点服务。
+    ///
+    /// 此前该 service 已实装且无任何调用方 —— 又一个「能做的功能没有任何出口」
+    /// (与 §1.14 记的消息动作同一形态)。
+    pub relationship_service: Arc<RelationshipService>,
 }
 
 impl AppState {
@@ -73,6 +84,7 @@ impl AppState {
         identity_service: Arc<IdentityService<PgUserRepository, PgDeviceSessionRepository>>,
         settings_service: Arc<SettingsService>,
         reaction_service: Arc<ReactionService>,
+        relationship_service: Arc<RelationshipService>,
     ) -> Self {
         Self {
             conversation_service,
@@ -81,6 +93,7 @@ impl AppState {
             identity_service,
             settings_service,
             reaction_service,
+            relationship_service,
         }
     }
 }
