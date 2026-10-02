@@ -27,12 +27,17 @@
 //! - ForceDisconnect hook stub (后续 G-1 presence 集成)
 //!
 //! ### 已知缺口 (per 守门 #1 缺标比错标)
-//! 1. **业务帧处理** —— **2026-10-03 已实装 1/6**:
-//!    `SendMessage` 走完整 `MessageService::send_message` 校验链(幂等 / content
-//!    schema / conversation member / 大小上限), 回 aux-13 §1.2.2 的 `ack`。
-//!    仍**未实装 5 类**: `EditMessage` / `RecallMessage` / `React` / `MarkRead` /
-//!    `Typing` —— 收到即回 `VALIDATION_ERROR`(带 req_id), 错误码语义不理想
-//!    (帧格式合法, 缺的是服务端处理器), 但**不新造错误码**, 理由见下。
+//! 1. **业务帧处理** —— **2026-10-03 已实装 2/6**:
+//!    - `SendMessage`: 走完整 `MessageService::send_message` 校验链
+//!      (幂等 / content schema / conversation member / 大小上限),
+//!      回 aux-13 §1.2.2 的 `ack`。
+//!    - `EditMessage`: 走 `MessageService::edit_message`
+//!      (仅原 sender / 撤回与删除态不可编辑 / 大小 / content schema)。
+//!
+//!    仍**未实装 4 类**: `RecallMessage` / `React` / `MarkRead` / `Typing` ——
+//!    收到即回 `VALIDATION_ERROR`(带 req_id)。错误码语义不理想(帧格式合法,
+//!    缺的是服务端处理器), 但**不新造错误码**, 理由见下。
+
 //!
 //!    **2026-10-03 更正 —— 以下说明本条原注释为何不可照抄**:
 //!    - 原写「返 `UNSUPPORTED_OPERATION` (501, per aux-13 §4)」。**该错误码不存在**:
@@ -368,7 +373,20 @@ async fn run_ws_loop(
                             }
                         }
                     }
-                    // 其余 5 类业务帧仍逐一显式列出, 不用 `Ok(_)` 兜底。两个理由:
+                    // C-9 已实装: edit_message
+                    Ok(frame @ ClientFrame::EditMessage { .. }) => match state.user_id() {
+                        Some(uid) => handle_edit_message(ws_session, app, uid, frame).await,
+                        None => {
+                            send_error(
+                                ws_session,
+                                im_common::ErrorCode::Unauthorized,
+                                "not authenticated",
+                                None,
+                            )
+                            .await
+                        }
+                    },
+                    // 其余 4 类业务帧仍逐一显式列出, 不用 `Ok(_)` 兜底。两个理由:
                     //
                     // (1) req_id 必须回传。aux-13 §1.2.4 规定 error 帧带 req_id,
                     //     客户端据此把失败响应关联回自己的请求。此前这里传 `None`,
@@ -380,8 +398,7 @@ async fn run_ws_loop(
                     //     静默吞掉。ping 漏洞(gap-ledger §1.2)就是这么藏的 ——
                     //     `ClientFrame::Ping` 解析成功, 却落进了 `Ok(_)`。
                     Ok(
-                        ClientFrame::EditMessage { req_id, .. }
-                        | ClientFrame::RecallMessage { req_id, .. }
+                        ClientFrame::RecallMessage { req_id, .. }
                         | ClientFrame::React { req_id, .. }
                         | ClientFrame::MarkRead { req_id, .. }
                         | ClientFrame::Typing { req_id, .. },
@@ -594,6 +611,71 @@ async fn handle_send_message(
                 ws_session,
                 code,
                 &format!("{}: {detail}", "send_message failed"),
+                Some(req_id),
+            )
+            .await;
+        }
+    }
+}
+
+/// C-9 业务帧: `edit_message` (per aux-13 §1.1.3)
+///
+/// 2026-10-03 实装。此前本帧落进 `Ok(_)` 兜底回「未实装」, 而 service 层的
+/// `MessageService::edit_message` 更是做完 4 步校验后**无条件**返
+/// `InternalError`(见 gap-ledger §1.9)—— 两端都没通。
+///
+/// sender 同样取自已鉴权的会话状态; service 内部会再校验「仅原 sender 可编辑」
+/// 与「已撤回/已删除不可编辑」。
+async fn handle_edit_message(
+    ws_session: &mut actix_ws::Session,
+    app: &web::Data<AppState>,
+    sender_id: UserId,
+    frame: ClientFrame,
+) {
+    let ClientFrame::EditMessage {
+        req_id,
+        message_id,
+        content,
+    } = frame
+    else {
+        unreachable!("调用方保证传入 EditMessage 变体");
+    };
+
+    let new_content = match serde_json::to_value(&content) {
+        Ok(v) => v,
+        Err(e) => {
+            send_error(
+                ws_session,
+                im_common::ErrorCode::ValidationError,
+                &format!("content serialize failed: {e}"),
+                Some(req_id),
+            )
+            .await;
+            return;
+        }
+    };
+
+    match app
+        .message_service
+        .edit_message(MessageId(message_id), sender_id, new_content, 65_536)
+        .await
+    {
+        Ok(msg) => {
+            send_ack(
+                ws_session,
+                req_id,
+                Some(msg.id.0),
+                Some(msg.sequence),
+                false,
+            )
+            .await;
+        }
+        Err(e) => {
+            let (code, detail) = map_service_error(&e);
+            send_error(
+                ws_session,
+                code,
+                &format!("edit_message failed: {detail}"),
                 Some(req_id),
             )
             .await;
@@ -1104,9 +1186,18 @@ mod tests {
 
     #[test]
     fn every_client_frame_variant_is_routed_to_an_explicit_arm() {
-        // 锁住「没有 `Ok(_)` 兜底」这一事实: 8 个客户端帧变体必须各有归属,
-        // 而不是全部落进 catch-all。ping 漏洞(gap-ledger §1.2)就是这么藏的 ——
-        // `ClientFrame::Ping` 解析完全成功却落进 `Ok(_)`, 客户端永远收不到 pong。
+        // **这条测试断言的边界要说清**: 它验证「8 个客户端帧变体全部可解析、
+        // 且每个都能被归入某个显式分类」, 分类逻辑写在测试里(与 handler 的
+        // match 同形但**不是同一份代码**)。
+        //
+        // 「handler 真的没有 `Ok(_)` 兜底」这一点**不是测试保证的**, 而是
+        // **编译期保证** —— handler 里的 match 是穷尽的(8 个变体各有分支),
+        // 未来新增变体会在那里编译报错。测试若照抄一份 match, 反而会在
+        // handler 改动时静默漂移, 给人虚假的安全感。
+        //
+        // 那为什么还要这条? 因为它能锁住另一件事: **每个变体的 wire 形状
+        // 都真的可解析**。若某个变体因为 serde tag 写错而永远匹配不上,
+        // handler 里那条分支就是死代码 —— 而这正是 ping 漏洞的形态。
         let samples: Vec<(&str, serde_json::Value)> = vec![
             (
                 // 注意: 首帧走 handler 自己的 `AuthFrame`(req_id 可选), 后续帧走

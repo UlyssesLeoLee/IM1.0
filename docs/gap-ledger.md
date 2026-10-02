@@ -486,8 +486,8 @@ REST 返 201 + body, WS 返 `ServerFrame::Ack { ok: true, data }`。
   只回通用文案(原因可能含 SQL / 连接串 / 凭据), 业务码原样回传
   (aux-03 §B 要求 `VALIDATION_ERROR` 供客户端展示字段级原因)
 
-**仍未实装 5 类**: `EditMessage` / `RecallMessage` / `React` / `MarkRead` /
-`Typing`。
+**仍未实装 4 类**: `RecallMessage` / `React` / `MarkRead` / `Typing`。
+`EditMessage` 同日实装(见 §1.9)。
 
 #### 1.8.2 顺带发现: `auth_ok` 是 aux-13 里不存在的帧
 
@@ -510,6 +510,71 @@ wire 形状), 已记入 §2。
 规范与实现的偏离在**两个方向**都发生过: 规范有而实现没有(§1.3 C-3 验签)、
 实现有而规范没有(本条 `auth_ok`、§1.6 的 `UNSUPPORTED_OPERATION`)。
 **双向都需要有人守** —— 只查「代码缺什么」会漏掉「代码多出什么」。
+
+### 1.9 `edit_message`: 做完 4 步校验后无条件返 `InternalError` (2026-10-03 已修)
+
+#### 缺陷
+
+```rust
+// 1. 查原 message   ✓
+// 2. 仅 sender      ✓
+// 3. 大小校验        ✓
+// 4. content schema ✓
+// 5. 更新(留待 C-9 完整实装)
+Err(AppError::Internal(anyhow::anyhow!("edit_message UPDATE not yet implemented in MVP")))
+```
+
+**无任何成功路径**, 且返回 `INTERNAL_ERROR` —— 客户端开发者看到 500 会以为服务端
+坏了, 而不是「这个功能还没做」。
+
+**这是本文件迄今最隐蔽的一处伪装**: 代码**读起来像只差最后一步 UPDATE**,
+而那一步根本不存在。四步完整校验会让人下意识认为「差不多了」—— 相比之下,
+`Ok(_)` 兜底(§1.7.1)反倒一眼能看出是没实现的。
+
+#### 三层同时未实装
+
+| 层 | 此前状态 |
+|---|---|
+| WS handler | `EditMessage` 落进 `Ok(_)` 兜底 -> 回「未实装」 |
+| service | 4 步校验后无条件 `InternalError` |
+| repository | **根本没有改 content 的方法**(只有 `update_state`) |
+
+而 **schema 一直是齐的**(`messages.content JSONB` + `messages.edited_at
+TIMESTAMPTZ`, 见 `0005_create_messages_reactions.sql`)。缺的只是这一条 SQL。
+
+#### 修法
+
+1. `MessageRepository::update_content` —— `UPDATE ... RETURNING` 一次往返拿到
+   更新后的行, 免掉「UPDATE 再 SELECT」的第二趟, 也避免返回值与并发写不一致
+2. `MessageService::edit_message` 第 5 步真正落库
+3. **补状态机守卫(此前完全没有)**: 已 `recalled` / `deleted` 的消息不可编辑。
+   此前只看 sender, **撤回的消息仍能被编辑出内容** —— 与「撤回后应只剩墓碑」
+   的语义直接冲突。用已注册码 `INVALID_STATE_TRANSITION`(per aux-03 §B, 409),
+   不新造码
+4. `MessageState::as_str()` 提到枚举自身(原先是 pg.rs 里的私有函数, service
+   层拿不到, 只能在错误信息里拼字面量)—— 消除重复映射
+5. WS handler 侧接线 `EditMessage`(§1.8.1 的 `2/6`)
+
+仓储层**故意不加** `WHERE state NOT IN ('recalled','deleted')`: 状态机判定是
+service 层职责(它已持有旧行、知道状态), 两处都判会重复, 且仓储层无权决定
+业务规则。
+
+#### 测试(4 个, 真 PG) + 变异
+
+`edit_updates_content_and_stamps_edited_at`(成功后**直接查库**确认 content 与
+edited_at 真落盘, 不只信返回值) / `edit_rejected_for_non_sender` /
+`edit_rejected_for_recalled_message`(并断言**被拒的编辑没改动内容**) /
+`edit_missing_message_returns_not_found`。
+
+**变异测试**: 把第 5 步退回旧的无条件 `InternalError` -> 成功路径那条
+**FAILED**; 而 3 条**负向**用例仍通过 —— 因为它们本来就期望错误。
+**绿灯和红灯都要看是哪一条**, 只看总数会误判: 「3 passed / 1 failed」里的
+那 3 个并非「不受影响」, 而是「本来就该红」。
+
+**共性补充**: §1.7.1 的伪装是「返回看似合理的假值」, 本条是「**做完所有前置
+工作再失败**」。共同点: 两者都让人**高估完成度**。排查此类代码时, 该看的是
+「最后一步是不是真的存在」, 而不是「前面几步做得像不像」。
+
 
 
 
