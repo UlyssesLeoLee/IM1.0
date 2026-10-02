@@ -15,10 +15,10 @@
 //!   - 其他业务帧 (SendMessage / Edit / Recall / React / MarkRead / Typing) → 列已知缺口 (C-9 messages handler 还没做)
 //! - 30s background task 调 `HeartbeatState::tick()` 检测无帧
 //!   ⚠️ **2026-10-03 复核: 超时当前只会打日志, 不会真的关闭连接** —— 后台任务
-//!      拿不到 `actix_ws::Session`, 主循环 `run_ws_loop` 也只 `await
-//!      msg_stream.next()` 而无 `select!` 超时分支, 故 60s 无帧超时**当前不生效**
-//!      (半开连接会一直堆积到 TCP 超时)。修复需 C-11 driver 重构把超时信号送达
-//!      持有 Session 的主循环, 详见 `docs/gap-ledger.md` §1.1 缺口 #H。
+//!   拿不到 `actix_ws::Session`, 主循环 `run_ws_loop` 也只 `await
+//!   msg_stream.next()` 而无 `select!` 超时分支, 故 60s 无帧超时**当前不生效**
+//!   (半开连接会一直堆积到 TCP 超时)。修复需 C-11 driver 重构把超时信号送达
+//!   持有 Session 的主循环, 详见 `docs/gap-ledger.md` §1.1 缺口 #H。
 //! - ForceDisconnect hook stub (后续 G-1 presence 集成)
 //!
 //! ### 已知缺口 (per 守门 #1 缺标比错标)

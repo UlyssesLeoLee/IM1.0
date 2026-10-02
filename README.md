@@ -93,6 +93,10 @@ cargo test -p im-gateway --test migration_smoke_pg    -j 1
 # 格式与静态检查（与 CI 门禁一致）
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
+# 内存紧张时限并行度: -j N 必须放在 -- 之前
+# 写成 `-- -D warnings -j 1` 会被当作 clippy-driver 的参数, 报
+# `error: Unrecognized option: 'j'`(exit 101), 看着像代码坏了其实是命令行错
+# cargo clippy --workspace --all-targets --locked -j 1 -- -D warnings
 
 # 诊断脚本（Docker 故障时用，有超时保护，不会自己卡死）
 pwsh scripts/diag-docker-bridge.ps1
