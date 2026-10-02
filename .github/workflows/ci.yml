@@ -124,3 +124,9 @@ jobs:
             p/security-audit
             p/secrets
             p/owasp-top-ten
+      - name: ps1 encoding lint (Windows PowerShell 5.1 兼容)
+        # 仓库内 .ps1 在 Windows PowerShell 5.1 下按系统 ANSI(GBK) 解码无 BOM 文件,
+        # 中文后的引号会被 GBK 双字节规则吞掉, 脚本直接 ParserError 崩。
+        # 本检查为纯字节操作, 无需 Windows runner, ubuntu 上行为一致。
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/lint-ps1-encoding.ps1

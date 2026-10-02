@@ -1,4 +1,4 @@
-# ============================================================================
+﻿# ============================================================================
 # start_im_gateway_mock.ps1
 # Purpose: Start the local im-gateway binary against the per-developer test
 #          DB. Used for end-to-end WS / REST / gRPC exercising.

@@ -1,4 +1,4 @@
-# ============================================================================
+﻿# ============================================================================
 # teardown_test_db.ps1
 # Purpose: Drop the per-developer test database created by setup_test_db.ps1.
 # Scope:   Windows PowerShell 5.1+ / PowerShell 7+

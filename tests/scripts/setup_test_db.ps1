@@ -1,4 +1,4 @@
-# ============================================================================
+﻿# ============================================================================
 # setup_test_db.ps1
 # Purpose: Create a per-developer test PG database, apply migrations, and
 #          load fixture rows. Idempotent — safe to re-run.

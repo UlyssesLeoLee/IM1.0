@@ -21,6 +21,7 @@
 | 1.2.0 | 2026-10-02 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 §1.1.2 CI 三闸门实测基线(fmt / clippy / test 全部 exit 0)+ CI 分支触发修复记录 + 本机 toolchain 缺陷记录;新增 `dangling-references.md` 关联 |
 | 1.3.0 | 2026-10-03 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 §1.1.3 B-1 结清(7/7 migration + 14 表 + 22 个真 PG 集成测试 + 6 个新 schema 约束测试)。**更正 1.2.0 暗示的"F-1 已解除"**:同夜 Docker daemon 消失,F-1 定性为 Blocked-Intermittent,Blocker 仍成立 |
 | 1.4.0 | 2026-10-03 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 §1.1.4 移除 17 处 blanket lint 压制(修 30 个真实 error, clippy 改为真干净)、§1.1.5 补 `gap-ledger.md` 缺口台账文档 |
+| 1.5.0 | 2026-10-03 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 §1.1.6 WS 心跳超时**实际不生效**(功能缺陷, 文档与实现不符)+ ps1 编码修复(10 个 .ps1 在 Windows PowerShell 5.1 下 ParserError)。新增 `scripts/lint-ps1-encoding.ps1` 并挂进 CI `sast` job |
 
 ---
 
@@ -240,6 +241,48 @@ unused_variables)]`"通过。审计发现**全仓共 17 处这种 blanket 压制
 没有对应 `#[allow]` 或注释的 `Todo` 项。
 
 **引用链**: 代码注释 → 本文档 §1.1.1(占位符保留约定) → `gap-ledger.md`。
+
+### 1.1.6 两个新发现: WS 心跳超时失效 + ps1 编码缺陷 (2026-10-03)
+
+#### (a) WS 60s 无帧超时**当前不生效**(功能缺陷, 非文档问题)
+
+复核 `im-gateway` WS 心跳时发现, `ws/handler.rs` 模块文档写「30s tick + 60s
+无帧超时关闭」, 但实现是:
+
+- 后台 task 在心跳超时时**只** `tracing::info!` + `break`
+- 主循环 `run_ws_loop` 只 `await msg_stream.next()`, **无 `select!` 超时分支**
+- 而 `actix_ws::Session` 归主循环所有, 后台 task 拿不到
+
+**结果: 60s 无帧超时永远不会关闭连接, 半开连接堆积到 TCP 超时才回收。**
+这是一处「文档声称的行为根本没实现」的功能缺陷, 已把 `ws/handler.rs` 模块文档
+改为如实描述, 并在 `gap-ledger.md` 把 #H 由「文档不准确」升级为「功能未生效」。
+
+修复需 C-11 (`WsSession` driver) 重构: 用 oneshot/mpsc 把超时信号送给持有
+`Session` 的主循环, 或把 `interval` 搬进 `run_ws_loop` 用 `select!`。
+**端到端验证依赖 Docker(F-1)**, 当前无法验证。
+
+#### (b) 10 个 .ps1 中 3 个在 Windows PowerShell 5.1 下**直接 ParserError 崩掉**
+
+`scripts/diag-docker-bridge.ps1` 等 3 个含中文的脚本, 开发者随手敲
+`powershell scripts\diag-docker-bridge.ps1` 必然崩, 且报错信息
+(`MissingEndCurlyBrace` / 「字符串缺少终止符」)完全指不到真实原因。
+
+**根因**: 这些 .ps1 是 UTF-8 **无 BOM**。Windows PowerShell 5.1 读取无 BOM 文件时
+按系统 ANSI 代码页(简体中文 Windows = GBK/CP936)解码, 而 **GBK 双字节的第二字节
+合法范围含 ASCII 符号位(0x40-0x7E)**, 于是中文字符的字节被误判为 GBK 前导字节,
+**吞掉紧随其后的引号**, 字符串提前终止。PowerShell 7 默认按 UTF-8 读, 所以 7 正常。
+
+**修法**: 字节级插入 UTF-8 BOM(EF BB BF), 10/10 文件已修, 5.1 解析错误全部归零。
+刻意**不**把中文注释改英文 —— 那会破坏团队可读性, 且 Windows 生态读取
+UTF-8 脚本的官方要求本就是带 BOM。
+
+**方法论教训(与 §1.1.4 同源)**: 我最初用「5.1 解析器逐文件扫, err=0 就算好」判定,
+结果只抓到 3 个崩的, **漏掉另外 7 个同样是 GBK 隐患的文件** —— 它们只是**碰巧**没踩到
+GBK 边界没解析错。所以新增的 lint 检测的是**根因**(含非 ASCII 却无 BOM)而非症状。
+症状检测会低估债务, 这与 §1.1.4 里 clippy「逐轮停」导致低估值是同一类陷阱。
+
+**防回归**: 新增 `scripts/lint-ps1-encoding.ps1`(纯字节检查, 跨平台一致, 无需
+Windows runner), 挂进 CI `sast` job。实测该 lint 在 pwsh 7 与 5.1 下均 exit 0。
 
 ### 1.2 第一个产品线:IM Core (消息为主)
 

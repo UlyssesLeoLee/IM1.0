@@ -1,4 +1,4 @@
-# ============================================================================
+﻿# ============================================================================
 # stop_im_gateway.ps1
 # Purpose: Stop the im-gateway process started by start_im_gateway_mock.ps1
 #          (or any cargo-launched im-gateway instance on this host).
