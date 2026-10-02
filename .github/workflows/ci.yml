@@ -25,6 +25,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - name: install protoc
+        # crates/im-proto 的 build.rs 走 tonic-build -> prost-build, 需要 protoc 可执行文件。
+        # GitHub 的 ubuntu-latest runner **不预装 protoc**, 缺失时 im-proto 编译直接失败:
+        #   Could not find `protoc` ... exited with status 1
+        # 该失败会连带击穿本 job 及其余所有编译 workspace 的 job(lint/unit/integration/sast),
+        # 但本机有 C:\protoc\bin\protoc.exe, 所以本地全绿完全掩盖了它。
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: fmt check
         run: cargo fmt --all -- --check
@@ -58,6 +65,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: install protoc
+        # 见 lint job 内的同名校验说明: ubuntu runner 不预装 protoc,
+        # 缺失会让 im-proto 的 build.rs 失败并击穿所有编译 workspace 的 job。
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: cargo test (unit)
         run: cargo test --workspace --lib --no-fail-fast
@@ -83,6 +94,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: install protoc
+        # 见 lint job 内的同名校验说明: ubuntu runner 不预装 protoc,
+        # 缺失会让 im-proto 的 build.rs 失败并击穿所有编译 workspace 的 job。
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: install sqlx-cli
         # 2026-10-02 修:版本对齐 workspace 依赖 sqlx = "0.9"(Cargo.lock 解析 0.9.0)。
@@ -105,6 +120,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: install protoc
+        # 见 lint job 内的同名校验说明: ubuntu runner 不预装 protoc,
+        # 缺失会让 im-proto 的 build.rs 失败并击穿所有编译 workspace 的 job
+        # (sast job 跑 cargo audit 前会先构建依赖图, 同样踩到)。
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: cargo audit
         run: |

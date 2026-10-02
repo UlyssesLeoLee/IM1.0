@@ -4,7 +4,11 @@
 
 FROM rust:1-slim AS builder
 WORKDIR /build
-RUN cargo install sqlx-cli --version '^0.8' --no-default-features --features rustls,postgres --locked
+# 2026-10-03 修: 原为 '^0.8',是 sqlx 0.8.6 -> 0.9.0 升级的漏网之鱼 ——
+# lane 2 只把 .github/workflows/ci.yml 对齐成 ^0.9, 这里没跟着改, 导致
+# CI 用 sqlx 0.9 验证的 migration, 到 K3s 上却由 sqlx 0.8 执行, 两边行为不一致。
+# 必须与 ci.yml "install sqlx-cli" 和 workspace 的 sqlx = "0.9" 三处对齐。
+RUN cargo install sqlx-cli --version '^0.9' --no-default-features --features rustls,postgres --locked
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
