@@ -22,6 +22,7 @@
 | 1.3.0 | 2026-10-03 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 §1.1.3 B-1 结清(7/7 migration + 14 表 + 22 个真 PG 集成测试 + 6 个新 schema 约束测试)。**更正 1.2.0 暗示的"F-1 已解除"**:同夜 Docker daemon 消失,F-1 定性为 Blocked-Intermittent,Blocker 仍成立 |
 | 1.4.0 | 2026-10-03 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 §1.1.4 移除 17 处 blanket lint 压制(修 30 个真实 error, clippy 改为真干净)、§1.1.5 补 `gap-ledger.md` 缺口台账文档 |
 | 1.5.0 | 2026-10-03 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 §1.1.6 WS 心跳超时**实际不生效**(功能缺陷, 文档与实现不符)+ ps1 编码修复(10 个 .ps1 在 Windows PowerShell 5.1 下 ParserError)。新增 `scripts/lint-ps1-encoding.ps1` 并挂进 CI `sast` job |
+| 1.6.0 | 2026-10-03 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 §1.1.7 **CI 4 个 job 全红**(ubuntu runner 缺 protoc, 致 im-proto 编译失败, 已修)。**更正 §1.1.2**: 该节标题原标 `[GATES-GREEN]`, 实为本机全绿而 CI 一直红, 标题改为 `[LOCAL-GREEN / CI-RED-已修]`; 同时更正其"deploy-dev job 名未确认未修"一条(已于 `56eef9c` 修复) |
 
 ---
 
@@ -47,7 +48,15 @@
   - im-core 各 service / repository **未直接引用** aux-02 §F 字段定义(只有 `im-common/src/ids.rs:3` 1 处 + 6 个 migration 注释引用;ImSpec §12.3 要求"im-core 各 service / repository 至少 3 处引用 aux-02",未达成)。
   - 6 份 SQL migration 未在真 PG 实例上跑过(2026-08-26 沙箱 Docker Desktop 启了但 Windows↔WSL2 daemon bridge 未就绪,`docker ps` 2 分钟超时;`postgres:18.6` image 锁 tag 已 commit,K3s dev 部署 / 桌面端 daemon bridge 就绪后立即可验证)。
 
-### 1.1.2 CI 三闸门实测基线 (2026-10-02) [GATES-GREEN]
+### 1.1.2 CI 三闸门实测基线 (2026-10-02) [LOCAL-GREEN / CI-RED-已修 2026-10-03]
+
+> **⚠️ 2026-10-03 更正 —— 本节标题原为 `[GATES-GREEN]`,该结论是错的。**
+>
+> 本节记录的全部数据都是**本机实测**, 属实; 但我把它当成了"CI 也是绿的"并
+> 写进了本节标题, 这是错的。dev 上多次 push 的 CI 实为 **4 个 job 全部 failure**,
+> 从未被真正验证过。根因是 ubuntu runner 缺 `protoc`(见 §1.1.7),已修。
+> **教训: 本机全绿 ≠ CI 全绿** —— 本机有 `C:\protoc\bin\protoc.exe`, 环境差异
+> 恰好掩盖了 CI 的失败, 只有 CI 记录本身才是真相。
 
 本节记录 2026-10-02 在 `dev` 分支实测的三道 CI 闸门结果。此前 dev 长期处于
 **两道闸门红**的状态(fmt 46 文件违规、clippy 29 errors),无法通过 CI。
@@ -82,9 +91,10 @@ extension_runtime / im_media / im_presence / im_proto 的 lib tests 为 0。
   `concurrency.cancel-in-progress: false` 会让突发合并的部署排队而非取消,
   重叠的迁移 Job 不可重入,存在把共享 dev 环境搞脏的风险。dev 部署保持走
   `workflow_dispatch` 手动触发。
-- `deploy-dev.yml` 的 "Run migrations" 疑似 job 名与 `needs` 依赖不一致
-  (建 job `im-migrate-manual` 但等 `job/im-migrate`),**未确认,未修**。
-  在确认前不要开启 dev 自动部署。
+- `deploy-dev.yml` 的 "Run migrations" job 名与 `needs` 依赖不一致
+  (建 job `im-migrate-manual` 却固定等 `job/im-migrate`,导致每次 dev 部署必然
+  2 分钟超时失败)。**已于 `56eef9c` 修复并用 `bash -n` 校验 exit 0**;
+  本条为历史记录,原写于修复前。
 
 **本机 toolchain 缺陷(不影响 CI,属开发者体验问题)**:
 
@@ -283,6 +293,76 @@ GBK 边界没解析错。所以新增的 lint 检测的是**根因**(含非 ASCI
 
 **防回归**: 新增 `scripts/lint-ps1-encoding.ps1`(纯字节检查, 跨平台一致, 无需
 Windows runner), 挂进 CI `sast` job。实测该 lint 在 pwsh 7 与 5.1 下均 exit 0。
+
+### 1.1.7 CI 4 个 job 全红:ubuntu runner 缺 protoc (2026-10-03) [CI-RED-FIXED]
+
+**这是本项目迄今最严重的一次"绿灯假象", 且由我自己制造。**
+
+#### 事件
+
+查 `gh run list` 发现 dev 上最近多次 push 的 CI 结论是 **failure**, 且
+`lint` / `Unit Tests` / `Integration Tests` / `Static Analysis` **四个 job 齐红** ——
+而我此前一直汇报"三闸门全绿"。两者并不矛盾: 我的"全绿"是**本机实测**(确实全绿),
+但被我当成了 CI 的结论。CI 从未被验证过。
+
+#### 根因
+
+`crates/im-proto` 的 `build.rs` 走 `tonic-build` → `prost-build`, 需要 `protoc`:
+
+```
+Error: Custom { kind: NotFound, error: "Could not find `protoc` ..." }
+process didn't exit successfully: .../im-proto-.../build-script-build (exit status: 1)
+```
+
+GitHub 的 `ubuntu-latest` runner **不预装 protoc**。任何编译 workspace 的 job 都会
+经过 im-proto, 故四个 job 全军覆没。
+
+**为什么本机完全掩盖了它**: 本机 `C:\protoc\bin\protoc.exe` (libprotoc 33.4) 存在,
+`prost-build` 直接命中。本地 fmt/clippy/test 永远走不到这个失败分支。
+**环境差异恰好精确抵消了缺陷** —— 这是"本机全绿"最危险的一种失效模式。
+
+#### 佐证: 团队在别处已经踩过同一个坑
+
+`docker/im-core.Dockerfile` 与 `docker/im-gateway.Dockerfile` 的 builder 阶段
+**都已经装了 `protobuf-compiler`** —— 说明"编译 proto 需要 protoc"这件事团队
+早就知道并在容器里解决过, 只是**没人把它加进 CI workflow**。缺口只存在于
+workflow 这一层, 这反过来印证了根因判断正确。
+
+#### 修法与范围
+
+- `ci.yml` 的 4 个 job 各加一步(装在 cargo 步骤之前):
+  `sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler`
+- 选 apt 而非第三方 `arduino/setup-protoc` action: 零第三方依赖, 信任面最小
+- **`release.yml` 无需改**: 它走 docker build, Rust 编译在容器内完成,
+  protoc 已由 Dockerfile 提供; `im-migrate` 只 COPY `sqlx-cli` 二进制, 不编译 Rust
+
+#### 顺带修: `im-migrate.Dockerfile` 的 sqlx 版本不一致
+
+该文件仍是 `sqlx-cli --version '^0.8'`。§1.1.2 记录的 lane 2 修复只把 `ci.yml`
+对齐成 `^0.9`, 这里漏了 —— 于是**CI 用 sqlx 0.9 验证过的 migration, 到 K3s 上却由
+sqlx 0.8 执行**。现已与 `ci.yml` 及 workspace 的 `sqlx = "0.9"` 三处对齐。
+
+#### 方法论: "本机全绿"不是证据, CI 记录才是
+
+本项目已第三次在**测量/验证方法**上栽跟头, 每次形态不同:
+
+| 次数 | 陷阱 | 低估了什么 |
+|---|---|---|
+| §1.1.4 | clippy 遇首个编译失败 crate 即停 | 真实 lint 债务 30 个被报成 16 个 |
+| §1.1.6(b) | 用「解析器 err=0」代替「检测根因」 | 10 个 GBK 隐患只抓到 3 个崩的 |
+| §1.1.7 | 用「本机 exit 0」代替「CI 结论」 | 4 个 job 全红被当成全绿 |
+
+**共同形状**: 拿一个**更窄的**代理指标(能编译 / 能解析 / 本机能过)当结论,
+而真正要回答的问题(债务总量 / 是否隐患 / 换台机器还成立)从没被直接测量。
+**对策**: 结论必须由**与结论同环境**的证据支撑 —— 债务要逐轮测干净,
+编码要测根因, 门禁要看 CI 记录本身。
+
+#### 待评估(未做): vendored protoc
+
+根治方案是让 `im-proto` 用 `protoc-bin-vendored` 内联 protoc, 一处修复同时覆盖
+CI / 本机 / 任意开发者环境 / Dockerfile, 达成可复现构建。**本次未做**, 因为它要改
+`build.rs` + `Cargo.toml` + `Cargo.lock`(CI 用 `--locked`), 触及构建链路, 而当前
+F-1(Docker 死)导致无法完整验证回归。属需要 lead 拍板的选型, 记录待办。
 
 ### 1.2 第一个产品线:IM Core (消息为主)
 
