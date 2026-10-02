@@ -20,6 +20,7 @@
 | 1.1.0 | 2026-09-01 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 132-wbs.md 关联;决策待办 7 项 (§2.2) 仍空缺,卡 H-1 截止日 |
 | 1.2.0 | 2026-10-02 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 §1.1.2 CI 三闸门实测基线(fmt / clippy / test 全部 exit 0)+ CI 分支触发修复记录 + 本机 toolchain 缺陷记录;新增 `dangling-references.md` 关联 |
 | 1.3.0 | 2026-10-03 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 §1.1.3 B-1 结清(7/7 migration + 14 表 + 22 个真 PG 集成测试 + 6 个新 schema 约束测试)。**更正 1.2.0 暗示的"F-1 已解除"**:同夜 Docker daemon 消失,F-1 定性为 Blocked-Intermittent,Blocker 仍成立 |
+| 1.4.0 | 2026-10-03 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 §1.1.4 移除 17 处 blanket lint 压制(修 30 个真实 error, clippy 改为真干净)、§1.1.5 补 `gap-ledger.md` 缺口台账文档 |
 
 ---
 
@@ -219,6 +220,26 @@ unused_variables)]`"通过。审计发现**全仓共 17 处这种 blanket 压制
 `.map_err(|_| AppError::MessageTooLarge(0, max_bytes))` 把真实 size 丢了
 (传的是硬编码 0), 调用方无法知道实际大小。本次只做最小化(消除 unused 变量),
 改行为属另一议题。
+
+### 1.1.5 补上「缺口台账」文档 (2026-10-03)
+
+代码里有 26 处注释写「守门 #1 缺口台账: 缺口 #X」, 但 `docs/` 下**从未存在**
+这份台账 —— 又一处悬空引用(与 `migration_smoke_docker.rs` 幻影文件、
+`AGENTS.md` 缺失同类)。已补 `docs/gap-ledger.md`。
+
+该台账**只汇总代码注释里已有的声明**(缺口 #A..#I + 4 项后续新增), 逐条附
+源码位置、注释原文与接线条件, 并画出依赖链:
+
+- **#D/#E/#F/#G/#H/#I 六个全部阻塞在 C-11 (WsSession driver 实装)**, 接线
+  C-11 可一次性清掉 —— 这不是六个独立任务, 排期时应按一项算
+- `IdentityService::server_secrets` 等 C-3; `readyz` 等 F-2/F-3 → F-1;
+  `AuthedUser.tenant_id` 等 G-1/V1
+
+**明确不做的**: 台账**不定义** `守门 #1` 的含义(该编号在本仓库仍无定义文档,
+见 `dangling-references.md`), 也**不代替 WBS 排期**, 也**不覆盖** WBS 里那些
+没有对应 `#[allow]` 或注释的 `Todo` 项。
+
+**引用链**: 代码注释 → 本文档 §1.1.1(占位符保留约定) → `gap-ledger.md`。
 
 ### 1.2 第一个产品线:IM Core (消息为主)
 
