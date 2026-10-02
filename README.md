@@ -23,6 +23,81 @@ IM 通信软件，适合 AI 和工作场景，便于集成进游戏的通信软�
   - [aux-13 协议帧样例](docs/templates/04-detailed-design/auxiliary/aux-13-protocol-frame-samples.md) —— WS 12 类帧双向、gRPC 4 个核心 RPC、REST 7 个端点、JSON Schema 6 种 kind、wscat/grpcurl/curl 调试命令
   - 其余 9 份（aux-04 状态机、aux-05 CRC、aux-06 算法性能、aux-07 SQL 优化、aux-08 批处理重试 DLQ、aux-09 日志 Cookbook、aux-10 DD Review Checklist、aux-11 时序图、aux-12 配置项）保持模板形态，编码阶段按需填实。生成脚本：`scripts/gen_dd_aux.py`。
 
+## 本地开发环境
+
+> 下列三项是**实际踩过的坑**，不是预防性建议。详细排查记录见
+> [Project-Status](docs/Project-Status.md) §1.1.6 / §1.1.7 与
+> [F-1 已知问题](docs/deployment-bridge-known-issue.md)。
+
+### 1. `protoc` 是必需的
+
+`crates/im-proto` 的 `build.rs` 走 `tonic-build` → `prost-build`，需要 `protoc`
+可执行文件。**缺了它，任何编译 workspace 的命令都会失败**：
+
+```
+Error: Custom { kind: NotFound, error: "Could not find `protoc` ..." }
+```
+
+Linux：`apt-get install -y protobuf-compiler`（CI workflow 里已装）。
+Windows：装好后确保 `protoc` 在 `PATH`，或设 `PROTOC` 环境变量指向它。
+
+> 常见误判：本地装了 protoc 所以一切正常，CI 却红。**换机器就是换环境**，
+> 判断"能不能过"要看目标环境的记录，不能看本机。
+
+### 2. 内存受限，限制并行度
+
+全 workspace 构建 / 测试在 8–16 GB 内存的机器上**必须限并行度**，否则会在链接
+阶段被系统杀掉（表现为无明确报错的失败）：
+
+```powershell
+cargo test --workspace --lib --no-fail-fast -j 1
+```
+
+OOM 后的报错具有**极强误导性**——`ring` 版本冲突、`rlib format not found`
+之类都只是内存耗尽的连锁症状，**不要因此去改 `Cargo.toml` 的依赖版本**。
+清残留进程后重跑通常自愈：
+
+```powershell
+Get-Process | Where-Object { $_.ProcessName -match '^(cargo|rustc|cargo-clippy|clippy-driver)$' } |
+  ForEach-Object { try { Stop-Process -Id $_.Id -Force -ErrorAction Stop } catch {} }
+```
+
+### 3. Windows 下 `.ps1` 必须是 UTF-8 with BOM
+
+Windows PowerShell 5.1 读取**无 BOM** 的 `.ps1` 时按系统 ANSI 代码页
+（简体中文 Windows = GBK/CP936）解码。GBK 双字节的第二字节合法范围含 ASCII
+符号位（`0x40-0x7E`），于是中文字符的字节被误判为前导字节，**吞掉紧随其后的
+引号**，脚本直接 ParserError 崩，且报错（`MissingEndCurlyBrace`、「字符串缺少
+终止符」）完全指不到真实原因。PowerShell 7 默认按 UTF-8 读，所以 7 下正常。
+
+**新增或修改任何 `.ps1` 时保存为 UTF-8 with BOM。** 仓库有 lint 兜底（CI
+`sast` job），会拒绝「含非 ASCII 字节却缺 BOM」的文件：
+
+```powershell
+pwsh scripts/lint-ps1-encoding.ps1
+```
+
+### 常用命令
+
+```powershell
+# 单元测试（不依赖 PG）
+cargo test --workspace --lib -j 1
+
+# 需要 PostgreSQL 的集成测试：设 DATABASE_URL 后跑
+$env:DATABASE_URL = "postgres://im:im@localhost:5432/im_test"
+cargo test -p im-core --test pg_repos_integration -j 1
+cargo test -p im-core --test message_service_test    -j 1
+cargo test -p im-gateway --test migration_smoke_pg    -j 1
+# 未设 DATABASE_URL 时上述 PG 用例会自动跳过，不是失败
+
+# 格式与静态检查（与 CI 门禁一致）
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+
+# 诊断脚本（Docker 故障时用，有超时保护，不会自己卡死）
+pwsh scripts/diag-docker-bridge.ps1
+```
+
 ## Day 1 启动包（2026-08-20 Kickoff 决议）
 
 > 4 个核心决策已落库：(1) MVP 第一个 PR = 消息收发最小闭环 (2) 产品线 = IM Core (3) 平台 = GitHub + GitHub Actions (4) 团队 = 2-3 人极简。等待填：**关键里程碑日期**。
