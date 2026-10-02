@@ -1,4 +1,4 @@
-# IM1.0 重复内容清理脚本 (per 138-dev-plan.md + Ulysses 2026-09-12 06:13 JST 拍板)
+﻿# IM1.0 重复内容清理脚本 (per 138-dev-plan.md + Ulysses 2026-09-12 06:13 JST 拍板)
 #
 # 删除目标 (8.5 GB 重复内容):
 #   1. D:\IM1.0-target-merge         (3.57 GB, cargo target 副本)

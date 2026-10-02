@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # ============================================================================
 # diag-docker-bridge.ps1
 # 用途:F-1 已知问题诊断。检查 Docker Desktop (WSL2 后端) daemon 状态,
