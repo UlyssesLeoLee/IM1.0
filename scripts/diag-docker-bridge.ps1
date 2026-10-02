@@ -108,11 +108,17 @@ $p2 = Test-PipeAvailable "\\.\pipe\docker_engine"
 Write-Host "  docker_engine: $p2"
 
 Write-Section "6) docker info (8s timeout)"
-$job = Start-Job -ScriptBlock { & $using:dockerExe info 2>&1 | Select-Object -First 15 }
+# 2026-10-02 修(两处叠加导致本脚本从不可能报 OK,daemon 正常也报 [BLOCKED] 假警报):
+#   (a) 原 `| Select-Object -First 15` 把 `docker info` 截断在前 15 行,而
+#       "Server Version:" 在第 ~62 行(Client 段就有十几行),Server 段根本没进来。
+#   (b) 原判据 `Server:\s*Version` 匹配不到 "Server:" 与 "Server Version:" 之间
+#       隔着的若干非空白行。
+# 修法:不截断(靠 Wait-Job -Timeout 8 兜住卡死),并按行首缩进匹配 "Server Version:"。
+$job = Start-Job -ScriptBlock { & $using:dockerExe info 2>&1 }
 $infoResult = if (Wait-Job $job -Timeout 8) { Receive-Job $job } else { Stop-Job $job; "TIMEOUT 8s" }
 Remove-Job $job -Force -ErrorAction SilentlyContinue
 $infoResult | Out-String | Write-Host
-$serverUp = $infoResult -match "Server:\s*Version"
+$serverUp = $infoResult -match "(?m)^\s*Server Version:\s*\S+"
 
 Write-Section "7) 结论"
 if ($serverUp) {

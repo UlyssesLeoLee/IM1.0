@@ -19,6 +19,7 @@
 | 1.0.0 | 2026-08-20 | (Mavis 辅助) | Day 1 Kickoff 决议 |
 | 1.1.0 | 2026-09-01 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 132-wbs.md 关联;决策待办 7 项 (§2.2) 仍空缺,卡 H-1 截止日 |
 | 1.2.0 | 2026-10-02 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 §1.1.2 CI 三闸门实测基线(fmt / clippy / test 全部 exit 0)+ CI 分支触发修复记录 + 本机 toolchain 缺陷记录;新增 `dangling-references.md` 关联 |
+| 1.3.0 | 2026-10-03 | 架构师 (Mavis 接手 agent per DEC-008) | 新增 §1.1.3 B-1 结清(7/7 migration + 14 表 + 22 个真 PG 集成测试 + 6 个新 schema 约束测试)。**更正 1.2.0 暗示的"F-1 已解除"**:同夜 Docker daemon 消失,F-1 定性为 Blocked-Intermittent,Blocker 仍成立 |
 
 ---
 
@@ -98,6 +99,71 @@ CI 不受影响(`dtolnay/rust-toolchain@stable` 自行安装)。**未修改本�
 
 **关联**:`dangling-references.md` —— 代码中 46 处 `守门 #N` 引用无定义文档
 (`AGENTS.md` 不存在),该文只做事实清单,不定义守则含义。
+
+### 1.1.3 B-1 结清:SQL migration 首次在真 PG 上验证 (2026-10-02) [B-1-CLOSED]
+
+§1.1.1 遗留工程债第 2 条("6 份 SQL migration 未在真 PG 实例上跑过")已结清。
+
+**触发**:F-1(Docker daemon bridge Blocker)当晚曾短暂可用。起 `postgres:18.6`
+专用容器(端口 5544,与测试默认值一致)后完成以下验证。
+
+> ⚠️ **2026-10-03 更正**:下表结论在 daemon 正常时**实测成立**,但 F-1 并未
+> 解除 —— 同夜 ~00:45 Docker Desktop 全部进程消失,daemon pipe 丢失,同期
+> `pg_repos_integration` 与 `message_service_test` 批量 `PoolTimedOut`(容器随
+> daemon 一起没了)。F-1 现定性为 **Blocked-Intermittent**,详见
+> `docs/deployment-bridge-known-issue.md` v1.2.0。
+> **下次见到 `PoolTimedOut` 批量失败,先跑 `pwsh scripts/diag-docker-bridge.ps1`
+> 确认 daemon 状态,不要误判成代码缺陷。**
+
+| 验证项 | 结果 |
+|---|---|
+| 7 份 `migrations/*.sql` 全量应用 | ✅ **7 passed / 0 failed** |
+| 建成表数 | ✅ **14 张**(与 ImSpec §1.1 / aux-02 §F.1-F.14 一致) |
+| `crates/im-core/tests/pg_repos_integration.rs` | ✅ **22 passed / 0 failed** |
+| `crates/im-gateway/tests/migration_smoke_pg.rs`(本次新增) | ✅ **6 passed / 0 failed**(真 PG 18.6) |
+
+`pg_repos_integration.rs` 覆盖 6 个 PgRepository + PgSequenceAllocator +
+IdentityService 的 link_account 全流程(6 个 Pg repo:user / device / conversation /
+message / reaction / friendship),这是 im-core 持久化层**第一次**在真数据库上跑通。
+
+**本次新增 `crates/im-gateway/tests/migration_smoke_pg.rs`**,补上
+`migration_smoke.rs` 明确声明的"不覆盖真实 PG 执行"缺口,覆盖:
+14 张表存在性 / 0007 两列存在 / 0007 两条 partial 索引建成 / 0007 的 DB 层
+CHECK 约束**确实生效**(非法 username、超长 password_hash 被拒;合法值放行;
+同 environment 内 username 唯一;NULL username 可重复)。
+**不引入新依赖** —— im-gateway dev-dependencies 已含 `sqlx`(migrate feature)。
+`DATABASE_URL` 未设时自动跳过,保证无 PG 的开发机跑全量测试仍全绿;CI 的
+test-integration job 已注入 `DATABASE_URL` + `sqlx migrate run`,会自动生效。
+
+> **写这类"DB 约束应该拒绝 X"测试时的陷阱(本项目实测踩到)**:
+> `users` 表除 0007 新增的两列外,还有 `kind TEXT NOT NULL` +
+> `users_kind_check (kind = ANY(ARRAY['user','guest']))`。
+> 若 INSERT 漏给 `kind`,插入会**先**因 NOT NULL 失败 —— 于是
+> "非法 username 应被拒""重复 username 应被拒"这类**反向断言会假通过**:
+> 它们被拒的原因根本不是 username 约束。
+> 修法:所有 `users` 插入收敛到 `insert_user()` 单一入口(强制带 `kind`),
+> 并为每条反向断言配一条**正向**断言(合法值必须放行 / 边界值 256 字节
+> password_hash 必须放行)—— 若 INSERT 恒失败,正向断言会立刻红。
+> 同理 `environments.name` 是白名单 CHECK
+> (`name = ANY(ARRAY['production','staging','test'])`),seed 时只能用 `'test'`。
+
+**同时修正的文档缺陷**:
+
+- `migration_smoke.rs` 头部引用 `tests/migration_smoke_docker.rs`
+  (feature-gated),但**该文件从不存在** —— 悬空引用,真 PG 覆盖缺口因此长期
+  无人补。现已指向真实的 `migration_smoke_pg.rs`。
+- `scripts/diag-docker-bridge.ps1` 的 daemon 判据有两处缺陷(① `docker info` 被
+  `Select-Object -First 15` 截断,`Server Version:` 在第 ~62 行从未进入结果;
+  ② 正则 `Server:\s*Version` 匹配不到中间隔着非空白行的 `Server Version:`)。
+  叠加后该脚本**从不可能报出 OK**(daemon 活着也报 `[BLOCKED]`)。两处已修,
+  现经**双向验证**:daemon 活着 → exit 0,daemon 真死 → exit 1。
+  注意:修好判据 ≠ 修好 daemon —— F-1 本身是**间歇性**的(见 v1.2.0),
+  脚本修好后它才第一次能如实反映 daemon 状态。
+
+**仍未验证**:
+
+- `deploy-dev.yml` 的 K3s 实际部署链路从未在真实集群上端到端跑过。F-1 未解除前
+  F-2 / F-3 / F-4 不再受此 Blocker 阻塞,可按 `132-wbs.md` 推进。
 
 ### 1.2 第一个产品线:IM Core (消息为主)
 

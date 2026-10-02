@@ -1,15 +1,20 @@
-//! Day 2 GATE 补签: 7 份 SQL migration 验证 (0007 于 2026-09-21 C-3/C-4 整合新增)
+//! Day 2 GATE 补签: 7 份 SQL migration 静态验证 (0007 于 2026-09-21 C-3/C-4 整合新增)
 //!
 //! **无 docker daemon 环境**: 仅跑 Migrator 解析 + 校验 SQL 文件不崩。
-//! **完整版** (testcontainers::Postgres + sqlx::migrate!): 见
-//! `tests/migration_smoke_docker.rs`(feature-gated, 默认不编)。
+//! **完整版** (真 PG 执行): 见 `tests/migration_smoke_pg.rs` —— 2026-10-02 新增,
+//! 用 `DATABASE_URL` 连真 PG 断言 14 张表 / 0007 两列 / 两条 partial 索引 /
+//! DB 层 CHECK 约束确实生效。设了 `DATABASE_URL` 即自动生效, 未设则跳过。
+//!
+//! (2026-10-02 更正: 本文件此前写着"见 tests/migration_smoke_docker.rs
+//! (feature-gated, 默认不编)",但**该文件从不存在** —— 属悬空引用。真 PG 覆盖
+//! 缺口因此长期没人补。现已由 migration_smoke_pg.rs 补上。)
 //!
 //! 当前测试覆盖:
 //! 1. `sqlx::migrate::Migrator::new` 解析 7 份 SQL 文件不抛错
 //! 2. 列出的迁移名与 `migrations/*.sql` 文件名 1:1 对应
 //! 3. 7 份 SQL 至少能 create 14 张表(SQL 内的 `CREATE TABLE` 计数 = 14; 0007 仅 ALTER users, 不新增表)
 //!
-//! 不覆盖: 真实 PG 执行(需 docker / 真 PG 实例)。
+//! 不覆盖: 真实 PG 执行 —— 移交 `tests/migration_smoke_pg.rs`。
 
 use sqlx::migrate::Migrator;
 use std::fs;

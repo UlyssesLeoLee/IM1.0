@@ -4,18 +4,75 @@ title_zh: WBS F-1 Docker Desktop Daemon Bridge 已知问题
 phase: 15-management
 activity_no: 133
 owners: 架构师 (Mavis 接手 agent per DEC-008)
-status: Blocked
-version: 1.0.0
+status: Blocked-Intermittent
+version: 1.2.0
 ---
 
 # 133-aux-f1. F-1 Docker Desktop Daemon Bridge 已知问题
 
 > 上游: `docs/132-wbs.md` v1.0.0 §5.6 F-1
 > 责任方: 架构师 (Mavis 接手 agent per DEC-008) 代 Ulysses 排查
-> 修复: **Blocker — 需 Ulysses 手动重启 Docker Desktop**
 > 编制日: 2026-09-01 JST
+> **状态更新 2026-10-03: Blocker 仍然成立,但已定性为「间歇性」** —— 见 §0。
+> 下列 §1–§5 保留为 2026-09-01 的原始诊断记录,不代表当前状态。
 
-## 1. 现象
+## 0. 2026-10-02/03 实测:间歇性,非已解除
+
+同一晚内两次观测,结论相反。**此前 v1.1.0 曾据单次观测标为 Resolved,该判断错误,已更正。**
+
+| 时间 (JST) | daemon 状态 | 实证 |
+|---|---|---|
+| 10-02 ~23:50 | ✅ **UP** | `docker version` Server 29.8.1;`docker pull postgres:18.6` 成功;`im10-pg18b1` 容器正常 Up;7 份 migration 全量应用 7 passed / 0 failed,建成 14 张表;`pg_repos_integration.rs` **22 passed / 0 failed**(10.26s);`diag-docker-bridge.ps1` exit 0 |
+| 10-03 ~00:45 | ❌ **DOWN** | Docker Desktop 全部进程消失;`docker` 报 `npipe:////./pipe/dockerDesktopLinuxEngine ... system cannot find the file specified`;`diag-docker-bridge.ps1` exit 1;同期 `pg_repos_integration.rs` 21 failed + `message_service_test.rs` 7 failed,全部 `PoolTimedOut`(容器随 daemon 一起消失) |
+
+### 0.1 定性
+
+F-1 **不是"已修复",而是"时好时坏"**。daemon 会在运行数十分钟后自行消失,
+此时所有依赖 docker 的验证(migration、pg_repos、message_service、
+migration_smoke_pg)会**整体失败**,且失败信息是 `PoolTimedOut` /
+连接被拒 —— 极易被误判成代码缺陷。
+
+排查口诀(下次再见到 `PoolTimedOut` 批量失败,先查这个):
+1. `pwsh scripts/diag-docker-bridge.ps1` —— exit 0 / exit 1;
+2. exit 1 就是 daemon 掉了,先按 §3 重启 Docker Desktop,再重跑测试。
+
+### 0.2 诊断脚本已修,且经双向验证
+
+`scripts/diag-docker-bridge.ps1` 的判据原有两处缺陷,叠加后使该脚本
+**从不可能报出 OK**(`Select-Object -First 15` 把 `Server Version:` 所在的
+第 ~62 行截掉;正则 `Server:\s*Version` 又匹配不到隔着非空白行的
+`Server Version:`)。已于 2026-10-02 修复(不截断 + 匹配
+`^\s*Server Version:\s*\S+`)。
+
+修复后两个方向都验证过:**daemon 活着 → exit 0;daemon 真死 → exit 1**。
+修之前这两种情况都报 `[BLOCKED]`,该脚本在 Blocker 期间实际没有诊断价值。
+
+> 注:§4 曾记录"per 强约束 #5 不再重试 2 次以上"。该约束针对**自动化
+> 重启 daemon**;手工按 §3 重启 Docker Desktop 仍适用。
+
+### 0.3 已解锁的成果(daemon 可用期间取得,结论有效)
+
+以下结论在 daemon 正常时**实测成立**,不因 daemon 再次消失而失效:
+
+- 7 份 `migrations/*.sql` 全量应用 → **7 passed / 0 failed**,建成 **14 张表**
+  (与 ImSpec §1.1 / aux-02 §F.1-F.14 一致)
+- `crates/im-core/tests/pg_repos_integration.rs` → **22 passed / 0 failed**
+  (im-core 持久化层首次在真 PG 上跑通)
+- 新增 `crates/im-gateway/tests/migration_smoke_pg.rs` → **6 passed / 0 failed**
+- F-2 / F-3 / F-4 仍**受本 Blocker 约束**(K3s dev 依赖 docker 部署)
+
+### 0.4 对关键路径的影响(Blocker 仍成立)
+
+```
+H-1 → H-3 → C-1 → C-2 → C-9 → C-11 → D-3 → E-3 → F-2 → F-3
+       ↓
+      B-1 ──────(依赖 F-1)
+```
+
+- **B-1**:已完成(见 §0.3),后续回归验证在 daemon 稳定前需手工重跑
+- **F-2 / F-3 / F-4**:仍被 F-1 阻塞,需 daemon 能稳定保持
+
+## 1. 现象(2026-09-01 记录)
 
 `docker ps` 在 Windows PowerShell 端**2+ 分钟超时**,但 Docker Desktop.exe 进程已启动,WSL `docker-desktop` distro 已 Running。
 
@@ -89,3 +146,5 @@ H-1 → H-3 → C-1 → C-2 → C-9 → C-11 → D-3 → E-3 → F-2 → F-3
 | 版本 | 日期 | 修订人 | 内容 |
 |---|---|---|---|
 | 1.0.0 | 2026-09-01 | 架构师 (Mavis 接手 agent per DEC-008) | 初版:诊断 + 修复路径 + WBS 影响 + B-1 不受影响说明 |
+| 1.1.0 | 2026-10-02 | 架构师 (Mavis 接手 agent per DEC-008) | 曾据单次观测标 Resolved。实测 7/7 migration + 14 表 + pg_repos 22/22;定位并修复 `diag-docker-bridge.ps1` 两处判据缺陷 |
+| 1.2.0 | 2026-10-03 | 架构师 (Mavis 接手 agent per DEC-008) | **更正 1.1.0 的错误结论**:同夜 00:45 Docker Desktop 全部进程消失,诊断 exit 1,同期 pg_repos / message_service 批量 `PoolTimedOut`。F-1 定性为 **Blocked-Intermittent**(非已解除),Blocker 仍成立。补排查口诀,避免再把 daemon 掉线误判成代码缺陷 |
