@@ -65,9 +65,32 @@ function Test-PipeAvailable($pipeName) {
     }
 }
 
+function Invoke-Docker {
+    # 2026-10-03 修:F-1 场景下 docker.exe 本身会**无限挂死** —— bridge 不通时
+    # CLI 阻塞在 named pipe 连接上, 不会自己返回。原先第 1 段是直接
+    # `& $dockerExe version`, 没有超时保护, 结果本诊断脚本自己卡死,
+    # 在最需要它的时候不可用。改为 Start-Job + Wait-Job 兜超时。
+    param(
+        [string[]]$DockerArgs,
+        [int]$TimeoutSec = 8
+    )
+    $job = Start-Job -ScriptBlock {
+        param($exe, $argList)
+        & $exe @argList 2>&1
+    } -ArgumentList $dockerExe, $DockerArgs
+    if (Wait-Job $job -Timeout $TimeoutSec) {
+        $r = Receive-Job $job
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        return $r
+    }
+    Stop-Job $job -ErrorAction SilentlyContinue
+    Remove-Job $job -Force -ErrorAction SilentlyContinue
+    return "TIMEOUT after ${TimeoutSec}s: docker $($DockerArgs -join ' ')"
+}
+
 Write-Section "1) Docker CLI 版本与 Context"
-& $dockerExe version 2>&1 | Select-Object -First 6
-& $dockerExe context ls 2>&1
+Invoke-Docker -DockerArgs @('version') | Select-Object -First 8
+Invoke-Docker -DockerArgs @('context', 'ls')
 
 Write-Section "2) Docker Desktop / Backend 进程"
 $procs = Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -match "docker|Docker" }
@@ -78,10 +101,16 @@ if ($procs) {
 }
 
 Write-Section "3) WSL Distro 状态"
-$wslOut = wsl -l -v 2>&1
-$wslOut | Out-String | Write-Host
+# 2026-10-03 修: `wsl -l -v` 的输出在 Windows 上混有 UTF-16 的 NUL 字节
+# (实测 wsl.exe 走的是 UTF-16LE, 被 PowerShell 当字节流捕获), 于是真实输出
+# "docker-desktop    Running         2" 里, docker-desktop 与 Running 之间
+# 夹着 NUL 而非空格, 正则 \s+ 匹配不上 —— 结果 distro 明明 Running, 脚本报
+# [FAIL] NOT Running, 把 daemon 故障时的判据退化成恒假。
+# 修法: 匹配前先剥掉 NUL 与回车。
+$rawWsl = (wsl -l -v 2>&1 | Out-String) -replace "`0", '' -replace "`r", ''
+$rawWsl.Trim() | Write-Host
 $dockerDesktopRunning = $false
-if ($wslOut -match "docker-desktop\s+Running") {
+if ($rawWsl -match "docker-desktop\s+Running") {
     $dockerDesktopRunning = $true
     Write-Host "  [OK] docker-desktop WSL distro is Running" -ForegroundColor Green
 } else {
@@ -113,10 +142,10 @@ Write-Section "6) docker info (8s timeout)"
 #       "Server Version:" 在第 ~62 行(Client 段就有十几行),Server 段根本没进来。
 #   (b) 原判据 `Server:\s*Version` 匹配不到 "Server:" 与 "Server Version:" 之间
 #       隔着的若干非空白行。
-# 修法:不截断(靠 Wait-Job -Timeout 8 兜住卡死),并按行首缩进匹配 "Server Version:"。
-$job = Start-Job -ScriptBlock { & $using:dockerExe info 2>&1 }
-$infoResult = if (Wait-Job $job -Timeout 8) { Receive-Job $job } else { Stop-Job $job; "TIMEOUT 8s" }
-Remove-Job $job -Force -ErrorAction SilentlyContinue
+# 修法:不截断(靠 Invoke-Docker 的 Wait-Job -Timeout 8 兜住卡死), 并按行首缩进匹配
+# "Server Version:"。2026-10-03: 抽出 Invoke-Docker 与第 1 段共用, 消掉重复的
+# Start-Job/Wait-Job/Remove-Job 三件套。
+$infoResult = Invoke-Docker -DockerArgs @('info') -TimeoutSec 8
 $infoResult | Out-String | Write-Host
 $serverUp = $infoResult -match "(?m)^\s*Server Version:\s*\S+"
 
