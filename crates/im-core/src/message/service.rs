@@ -31,7 +31,7 @@ use super::content::{validate_fields, validate_serialized_size};
 use super::repository::{Message, MessageRepository, MessageState, NewMessage};
 use super::sequence::SequenceAllocator;
 use crate::conversation::repository::ConversationRepository;
-use crate::event::events::MessageCreatedEvent;
+use crate::event::events::{MessageCreatedEvent, MessageRecalledEvent};
 use crate::event::publisher::EventPublisher;
 
 #[derive(Debug, Clone)]
@@ -44,6 +44,35 @@ pub struct SendMessageCommand {
     pub reply_to: Option<MessageId>,
     /// 最大字节数(从 environments.settings 读取,默认 65536)
     pub max_size_bytes: usize,
+}
+
+/// 撤回时间窗判定 (per aux-04 §B.4 转换表: `now - created_at ≤ recall_window` 才允许)
+///
+/// ## 为什么抽成独立的纯函数
+///
+/// 边界语义(`≤` 允许 / 恰好等于上限**仍允许** / 超 1ms 即拒)是这条路径上
+/// 最容易被改坏的一处 —— `>` 写成 `>=` 编译照过、绝大多数测试照过, 只有
+/// 「恰好在边界上」那一条会变红。
+///
+/// 而「恰好在边界」**无法通过真实时钟观测**: 曾试图用
+/// `UPDATE messages SET created_at = now() - interval '120 seconds'` 把消息
+/// 回拨到恰好等于窗口上限, 结果该用例稳定失败 —— 因为 UPDATE 与 service
+/// 调用之间已经过去了几毫秒, `elapsed` 实际是 120.00Xs 而非 120s。
+/// 挂钟回拨只能测「明显在窗内」和「明显超窗」, 中间那一毫秒是测不到的。
+///
+/// 抽成纯函数后可以用**精确构造的入参**测边界本身, 比通过数据库回拨测**更强**:
+/// `within_recall_window(t + 120s, t, 120s)` 恰好验证了 `≤` 这个字符, 而
+/// 不依赖任何时序运气。
+///
+/// `created_at` 晚于 `now`(时钟漂移 / 跨机房写入)时按 `elapsed = 0` 处理,
+/// 即**允许**撤回 —— 拿不到可靠时间差时, 拒绝一次合法撤回比误放更糟。
+pub fn within_recall_window(
+    now: chrono::DateTime<Utc>,
+    created_at: chrono::DateTime<Utc>,
+    window: chrono::Duration,
+) -> bool {
+    let elapsed_ms = now.signed_duration_since(created_at).num_milliseconds();
+    elapsed_ms.max(0) <= window.num_milliseconds()
 }
 
 pub struct MessageService {
@@ -199,7 +228,7 @@ impl MessageService {
             kind: msg.kind.clone(),
             ts: Utc::now(),
         };
-        if let Err(e) = self.events.publish("im.message.created", &event).await {
+        if let Err(e) = self.publish_event("im.message.created", &event).await {
             tracing::error!(error = %e, message_id = %msg.id, "publish im.message.created failed, will be retried by outbox (V1+)");
         }
 
@@ -279,6 +308,117 @@ impl MessageService {
             .await?
             .ok_or(AppError::MessageNotFound(message_id.0))?;
         Ok(updated)
+    }
+
+    /// 撤回消息 (per aux-04 §B.4 转换表 line 241)
+    ///
+    /// | from | event | to | guard | 失败码 |
+    /// |---|---|---|---|---|
+    /// | `sent` / `delivered` / `read` | `recall_message` | `recalled` | actor = sender 且 now - created_at ≤ recall_window | `RECALL_WINDOW_EXPIRED` / `FORBIDDEN` |
+    /// | `recalled` | 任何 | 拒绝(终态) | — | `INVALID_STATE_TRANSITION` |
+    /// | `deleted` | 任何 | 拒绝(终态) | — | `INVALID_STATE_TRANSITION` |
+    ///
+    /// **关于 `read → recalled`**: aux-04 的**转换图** line 225 在这条边上写了
+    /// 「V1+ 评估是否允许」(GAP-3), 而**转换表** line 241 明确把 `read` 列入
+    /// 允许迁移的来源集。此处以转换表为准(它才是规范性的那张表), 且 GAP-3
+    /// 的原文问题其实是**展示**层面 —— 「已读撤回是否还显示"已读"标识?」,
+    /// 不是转移本身是否允许。若 PM 认为应禁止, 改本函数的状态守卫即可, 落库
+    /// 与事件逻辑不受影响。
+    ///
+    /// ## 为什么 `recall_window` 由调用方传入而不自己读
+    ///
+    /// aux-04 不变量要求窗口来自 `env.settings.message.recall_window_seconds`
+    /// 且「不能写死」, 但**读 settings 需要 `EnvironmentId`** —— service 从
+    /// `messages` 行拿不到它(要经 conversation), 而 MessageService 的构造参数里
+    /// 没有 settings 依赖。故与 `edit_message(max_size_bytes)` 同一约定: 参数传入,
+    /// 由 gateway 用 `SettingsService` 解析后传进来。这样 service 可脱离 DB 单测,
+    /// 且「值从哪来」只有一处(见 `im-gateway::ws::handle_recall_message`)。
+    pub async fn recall_message(
+        &self,
+        message_id: MessageId,
+        user_id: UserId,
+        recall_window: chrono::Duration,
+    ) -> Result<Message, AppError> {
+        // 1. 查原 message
+        let existing = self
+            .repo
+            .find_by_id(message_id)
+            .await?
+            .ok_or(AppError::MessageNotFound(message_id.0))?;
+
+        // 2. 仅 sender 可撤回 (per aux-04 §B.4 `actor = sender`)
+        if existing.sender_id != Some(user_id) {
+            return Err(AppError::Forbidden("not the message sender".into()));
+        }
+
+        // 3. 状态机守卫: recalled / deleted 是**终态**(per 转换表 line 243-244)
+        match existing.state {
+            MessageState::Recalled | MessageState::Deleted => {
+                return Err(AppError::InvalidStateTransition {
+                    from: existing.state.as_str().to_string(),
+                    to: "recalled".into(),
+                });
+            }
+            // sent / delivered / read 三态均允许(转换表 line 241)
+            MessageState::Sent | MessageState::Delivered | MessageState::Read => {}
+        }
+
+        // 4. 时间窗: now - created_at ≤ recall_window
+        if !within_recall_window(Utc::now(), existing.created_at, recall_window) {
+            return Err(AppError::RecallWindowExpired(existing.created_at));
+        }
+
+        // 5. 落库 + 发事件 (per aux-04 不变量「转换必须 publish im.message.recalled」)
+        self.repo
+            .update_state(message_id, MessageState::Recalled)
+            .await?;
+        // 重读以返回**更新后**的行 —— `update_state` 只返回 (), 直接把
+        // `existing` 改一下 state 返回会掩盖「库里到底写成没有」, 而那正是
+        // 本轮反复在堵的那类「做完校验就返回假值」。
+        let updated = self
+            .repo
+            .find_by_id(message_id)
+            .await?
+            .ok_or(AppError::MessageNotFound(message_id.0))?;
+
+        let event = MessageRecalledEvent {
+            message_id: updated.id,
+            conversation_id: updated.conversation_id,
+            actor_id: user_id,
+            ts: Utc::now(),
+        };
+        if let Err(e) = self.publish_event("im.message.recalled", &event).await {
+            // 与 send_message 同一约定: 事件失败不阻塞调用方(状态已落库),
+            // 真实重试依赖 V1+ outbox。
+            tracing::error!(
+                error = %e,
+                message_id = %updated.id,
+                "publish im.message.recalled failed, will be retried by outbox (V1+)"
+            );
+        }
+        Ok(updated)
+    }
+
+    /// 序列化 + 发布一个领域事件
+    ///
+    /// ## 为什么序列化失败也要**继续发**
+    ///
+    /// `EventPublisher::publish` 收的是字节, 序列化在调用方做(per DetailedDesign)。
+    /// 本项目的事件 payload 全是 String / i64 / DateTime / Option 的平铺结构,
+    /// 序列化在实践中不会失败。真失败时发空 payload 是**错的**, 但此时
+    /// 「漏发」与「发空」都已是坏状态 —— 故选择「记录 + 照常发」, 让
+    /// 订阅方至少能感知到「有这个 topic 的活动」, 而错误留在服务端日志里。
+    /// 静默 return 会让事件**完全消失**, 那是更坏的失败模式。
+    async fn publish_event<T: serde::Serialize>(
+        &self,
+        topic: &str,
+        event: &T,
+    ) -> Result<(), AppError> {
+        let payload = serde_json::to_vec(event).unwrap_or_else(|e| {
+            tracing::error!(error = %e, topic, "event serialize failed; publishing empty payload");
+            Vec::new()
+        });
+        self.events.publish(topic, &payload).await
     }
 
     /// 按幂等键预查既有消息 (2026-10-03 新增, 供 WS ack 判定 `idempotent_replay`)

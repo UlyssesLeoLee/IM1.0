@@ -27,14 +27,18 @@
 //! - ForceDisconnect hook stub (后续 G-1 presence 集成)
 //!
 //! ### 已知缺口 (per 守门 #1 缺标比错标)
-//! 1. **业务帧处理** —— **2026-10-03 已实装 2/6**:
+//! 1. **业务帧处理** —— **2026-10-03 已实装 3/6**:
 //!    - `SendMessage`: 走完整 `MessageService::send_message` 校验链
 //!      (幂等 / content schema / conversation member / 大小上限),
-//!      回 aux-13 §1.2.2 的 `ack`。
+//!      回 aux-13 §1.2.2 的 `ack`, 并经 `WsHub` 广播 `message_new`。
 //!    - `EditMessage`: 走 `MessageService::edit_message`
 //!      (仅原 sender / 撤回与删除态不可编辑 / 大小 / content schema)。
+//!    - `RecallMessage`: 走 `MessageService::recall_message`
+//!      (per aux-04 §B.4 转换表: 仅原 sender / `sent`·`delivered`·`read`
+//!      三态可撤 / 终态拒绝 / 时间窗 `≤` 判定), 并广播 `message_recalled`
+//!      —— 该帧带 `conversation_id`, 是**当前唯一可安全广播的变更类帧**。
 //!
-//!    仍**未实装 4 类**: `RecallMessage` / `React` / `MarkRead` / `Typing` ——
+//!    仍**未实装 3 类**: `React` / `MarkRead` / `Typing` ——
 //!    收到即回 `VALIDATION_ERROR`(带 req_id)。错误码语义不理想(帧格式合法,
 //!    缺的是服务端处理器), 但**不新造错误码**, 理由见下。
 
@@ -464,7 +468,22 @@ async fn run_ws_loop(
                             .await
                         }
                     },
-                    // 其余 4 类业务帧仍逐一显式列出, 不用 `Ok(_)` 兜底。两个理由:
+                    // C-9 已实装: recall_message (per aux-04 §B.4)
+                    Ok(frame @ ClientFrame::RecallMessage { .. }) => match state.user_id() {
+                        Some(uid) => {
+                            handle_recall_message(ws_session, app, hub, state, uid, frame).await
+                        }
+                        None => {
+                            send_error(
+                                ws_session,
+                                im_common::ErrorCode::Unauthorized,
+                                "not authenticated",
+                                None,
+                            )
+                            .await
+                        }
+                    },
+                    // 其余 3 类业务帧仍逐一显式列出, 不用 `Ok(_)` 兜底。两个理由:
                     //
                     // (1) req_id 必须回传。aux-13 §1.2.4 规定 error 帧带 req_id,
                     //     客户端据此把失败响应关联回自己的请求。此前这里传 `None`,
@@ -476,8 +495,7 @@ async fn run_ws_loop(
                     //     静默吞掉。ping 漏洞(gap-ledger §1.2)就是这么藏的 ——
                     //     `ClientFrame::Ping` 解析成功, 却落进了 `Ok(_)`。
                     Ok(
-                        ClientFrame::RecallMessage { req_id, .. }
-                        | ClientFrame::React { req_id, .. }
+                        ClientFrame::React { req_id, .. }
                         | ClientFrame::MarkRead { req_id, .. }
                         | ClientFrame::Typing { req_id, .. },
                     ) => {
@@ -836,6 +854,102 @@ async fn deliver_broadcast(
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("ws broadcast send: {e}")))?;
     Ok(())
+}
+
+/// C-9 业务帧: `recall_message` (per aux-13 §1.1.5 + aux-04 §B.4)
+///
+/// 2026-10-03 实装。状态机与时间窗全部由 `MessageService::recall_message` 判定,
+/// 本函数只负责: 解析环境 → 读真实时间窗 → 调用 → ack → 广播。
+///
+/// **为什么不把 120 写在这里**: aux-04 §B.4 不变量明写「撤回时间窗由
+/// `environments.settings.message.recall_window_seconds` 控制, **不能写死**」。
+/// 值一律经 `SettingsService` 读 `environments.settings` JSONB 取到; 该列
+/// `DEFAULT '{}'`, 缺失字段由 serde default 补 120 —— 那是**配置默认**, 与
+/// 代码写死是两回事。
+///
+/// **广播**: `MessageRecalled` 带 `conversation_id`(aux-13 §1.2.7), 因此是
+/// **当前唯一可安全广播的变更类帧** —— 广播中枢能判断接收方是否成员。
+/// (`MessageEdited` / `ReactionAdded` 不带, 判为 `Undeliverable`, 见 ws::hub。)
+async fn handle_recall_message(
+    ws_session: &mut actix_ws::Session,
+    app: &web::Data<AppState>,
+    hub: &super::hub::WsHub,
+    state: &WsSession,
+    sender_id: UserId,
+    frame: ClientFrame,
+) {
+    let ClientFrame::RecallMessage { req_id, message_id } = frame else {
+        unreachable!("调用方保证传入 RecallMessage 变体");
+    };
+
+    // 时间窗需要 environment_id —— 它来自 token claims, 记在会话状态里,
+    // 不从帧内容取(客户端没有资格声明自己属于哪个环境)。
+    let Some(env) = state.environment_id() else {
+        send_error(
+            ws_session,
+            im_common::ErrorCode::Unauthorized,
+            "session carries no environment",
+            Some(req_id),
+        )
+        .await;
+        return;
+    };
+
+    let window_secs = match app.settings_service.recall_window_seconds(env).await {
+        Ok(v) => v,
+        Err(e) => {
+            let (code, detail) = map_service_error(&e);
+            send_error(
+                ws_session,
+                code,
+                &format!("recall_window lookup failed: {detail}"),
+                Some(req_id),
+            )
+            .await;
+            return;
+        }
+    };
+
+    match app
+        .message_service
+        .recall_message(
+            MessageId(message_id),
+            sender_id,
+            chrono::Duration::seconds(i64::from(window_secs)),
+        )
+        .await
+    {
+        Ok(msg) => {
+            send_ack(
+                ws_session,
+                req_id,
+                Some(msg.id.0),
+                Some(msg.sequence),
+                false,
+            )
+            .await;
+            let delivered = hub.publish(ServerFrame::MessageRecalled {
+                message_id: msg.id.0,
+                conversation_id: msg.conversation_id.0,
+            });
+            tracing::debug!(
+                delivered,
+                message_id = %msg.id.0,
+                window_secs,
+                "message_recalled"
+            );
+        }
+        Err(e) => {
+            let (code, detail) = map_service_error(&e);
+            send_error(
+                ws_session,
+                code,
+                &format!("recall_message failed: {detail}"),
+                Some(req_id),
+            )
+            .await;
+        }
+    }
 }
 
 /// 发成功 ack (per aux-13 §1.2.2)

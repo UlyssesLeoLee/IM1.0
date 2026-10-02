@@ -121,8 +121,13 @@ impl WsSession {
         self.conversation_ids.len()
     }
 
-    // 守门 #1 缺口台账: 缺口 #G — 同 user_id,多租户路由待 C-11 接线。保留不删。
-    #[allow(dead_code)]
+    /// 鉴权后的 environment_id
+    ///
+    /// 2026-10-03 起**已被生产路径使用**: `ws::handler::handle_recall_message`
+    /// 用它经 `SettingsService` 读 `environments.settings` 的撤回时间窗
+    /// (aux-04 §B.4 不变量要求该值不能写死)。此前它挂着 `#[allow(dead_code)]`
+    /// 且无任何调用方, 现压制已移除 —— 留着会让「没人用」这个事实看起来像
+    /// 「有意保留」。
     pub fn environment_id(&self) -> Option<EnvironmentId> {
         self.environment_id
     }

@@ -24,6 +24,7 @@ use im_core::identity::pg::{PgDeviceSessionRepository, PgUserRepository};
 use im_core::identity::service::IdentityService;
 use im_core::identity::token::TokenService;
 use im_core::message::service::MessageService;
+use im_core::settings::service::SettingsService;
 
 /// im-gateway 共享 handler 状态(用 `web::Data<AppState>` 注入)
 #[derive(Clone)]
@@ -44,6 +45,15 @@ pub struct AppState {
     /// 持有 PgUserRepository + PgDeviceSessionRepository + TokenService + server_secrets HashMap
     /// main.rs 的 wire-up 留给 D-1 PR (D-1 实装 AppConfig::load + 读 PG + 构造 IdentityService)
     pub identity_service: Arc<IdentityService<PgUserRepository, PgDeviceSessionRepository>>,
+
+    /// 环境级配置读取 (C-9 撤回时间窗等「不能写死」的参数来源)
+    ///
+    /// 2026-10-03 新增。此前 `im_core::settings::SettingsService` 存在但
+    /// **从不读库**(`get()` 从空 HashMap 落 `default()`, 恒返回 120s) ——
+    /// 见该文件模块文档。若当时把撤回时间窗接到它上面, 代码读起来是
+    /// 「从 env settings 读」(合规), 实际却恒为写死值。现已改为真读
+    /// `environments.settings` JSONB。
+    pub settings_service: Arc<SettingsService>,
 }
 
 impl AppState {
@@ -53,12 +63,14 @@ impl AppState {
         message_service: Arc<MessageService>,
         token_service: Arc<TokenService>,
         identity_service: Arc<IdentityService<PgUserRepository, PgDeviceSessionRepository>>,
+        settings_service: Arc<SettingsService>,
     ) -> Self {
         Self {
             conversation_service,
             message_service,
             token_service,
             identity_service,
+            settings_service,
         }
     }
 }

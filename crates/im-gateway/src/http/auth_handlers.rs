@@ -759,6 +759,11 @@ mod tests {
             message_service,
             token_service,
             identity_service,
+            // 与生产同构: 同一个 pool, 真读 `environments.settings`。
+            // 本文件这些用例走的是 auth 端点、不碰撤回, 所以具体值无关;
+            // 但**必须传真 service** —— 传一个假 stub 会让「WS 撤回读不到
+            // 真实窗口」这类问题在别的测试里重现时无从分辨。
+            std::sync::Arc::new(im_core::settings::service::SettingsService::new(p.clone())),
         ))
     }
 

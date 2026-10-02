@@ -683,6 +683,116 @@ receiver」做分支(除非 `FuturesUnordered`, 复杂度显著上升)。单通�
 `f42f8e8` 那次「测试注释过度声称」同源: 断言写得比被测对象更强时, 先暴露的
 往往是断言自己的错。
 
+### 1.11 `recall_message` + 沿途挖出的两个「看起来存在、实则空转」的 service (2026-10-03 已修)
+
+WS 6 类业务帧的第 3 类。实装过程中撞上两个**更早的**问题: 撤回所依赖的两处
+基础设施本身是空壳。若不先修, 撤回就会「看起来可配、实则写死」。
+
+#### A. `SettingsService` 从不读库 (危险度最高)
+
+| 方法 | 注释声称 | 实际 |
+|---|---|---|
+| `load_initial()` | 「实际: SELECT id, settings FROM environments」 | 函数体是 `Ok(())` —— 从不读库 |
+| `get(env)` | 「获取 env 配置」 | 从一个**永远为空**的 `HashMap` 取值, 任何 env 都落 `unwrap_or_default()` → **恒返回 120s** |
+| `invalidate(env)` | 「收到 Valkey pub/sub 失效广播后重载」 | 只从一个空 map 里删一个不存在的键, 从不重读 |
+
+与 §1.10 那个「占位 broadcast channel」同族(文档说有、代码没有)。**但危害更大**:
+`SettingsService` 存在、类型正确、方法名规范, 代码读起来完全符合 aux-04 §B.4
+不变量「撤回时间窗由 `environments.settings...` 控制, **不能写死**」——
+若当初把撤回时间窗接到 `get()` 上, review **看不出任何问题**, 而线上每个
+环境的时间窗都是 120s。这比明写死更难发现, 因为它骗过了检查。
+
+**修法**: 改为真读 `environments.settings` JSONB(`SELECT settings FROM
+environments WHERE id = $1`)。三个刻意的设计:
+
+- **不缓存**。原设计有 `HashMap` + Valkey 失效广播, 但失效通道属 **WBS D-4**,
+  尚未落地 —— 没有失效的缓存是正确性隐患(运营改了配置, 进程内仍按旧值判定,
+  且**没有任何办法**让它刷新)。MVP 每次读一次(主键索引查询, 撤回是低频操作)。
+  真正的缓存随 D-4 落地时再加, 届时失效通道与缓存同时到位。
+- **环境不存在返 `NotFound`, 不返默认**。「环境不存在」与「环境存在但没配该
+  字段」是两件事: 前者若静默落 120, 线上表现为「撤回窗口莫名其妙变成 2 分钟」,
+  极难排查; 后者才由 serde 逐字段 default 正常兜底。
+- **反序列化失败不回落默认**。库里存着解析不了的 JSON 时静默用默认值, 会让
+  运营以为自己的配置生效了(实际没生效)。
+
+**没有新增 `EnvironmentNotFound` 错误码**: 新增 `AppError` 变体必然新增一个
+wire 错误码, 而 aux-03 §B 是唯一权威表、新增码属协议变更,
+ImplementationSpec 处于 `[PROTOCOL-FROZEN]`。已注册的 `NOT_FOUND` 语义覆盖。
+
+#### B. `EventPublisher::publish` 写死单一事件类型
+
+签名原为 `publish(&self, topic: &str, payload: &MessageCreatedEvent)`。这不只是
+风格问题 —— 它让**除 created 之外的任何事件都发不出去**: aux-04 §B.4 不变量
+要求「转换必须 publish 事件 `im.message.{recalled,deleted}` 供其他 pod 同步」,
+但加 `MessageRecalledEvent` 时编译器直接拒绝(该不变量在**类型层面**就无法满足)。
+
+`DetailedDesign.md` §publisher.rs 本来写的就是 `publish(&self, topic, payload: &[u8])`
+—— 即**规范是对的, 实现偏离了规范**。故此项是实现回归规范, 不是引入新设计。
+
+#### C. `recall_message` 本身 (per aux-04 §B.4 转换表 line 241)
+
+| from | event | to | guard | 失败码 |
+|---|---|---|---|---|
+| `sent` / `delivered` / `read` | `recall_message` | `recalled` | actor = sender 且 `now - created_at ≤ recall_window` | `RECALL_WINDOW_EXPIRED` / `FORBIDDEN` |
+| `recalled` | 任何 | 拒绝(终态) | — | `INVALID_STATE_TRANSITION` |
+| `deleted` | 任何 | 拒绝(终态) | — | `INVALID_STATE_TRANSITION` |
+
+两处刻意的不确定性处理:
+
+- **边界用 `>` 而非 `>=`**: 转换表写的是 `≤` 才允许, 所以**恰好等于**窗口长度
+  时**仍应允许**。差一个字符就是差一个语义, 已用
+  `recall_window_boundary_is_inclusive_at_exactly_the_limit` 锁住
+  (aux-04 §F 要求「边界 ±1s」测试)。
+- **`read → recalled` 允许**: aux-04 的**转换图** line 225 在这条边上标了
+  「V1+ 评估是否允许」(GAP-3), 而**转换表** line 241 明确把 `read` 列入允许
+  来源集。此处以转换表为准(它才是规范性那张表), 且 GAP-3 的原文问题在**展示**
+  层面(「已读撤回是否还显示"已读"标识?」), 不是转移本身是否允许。
+  若 PM 认为应禁止, 只改 service 的状态守卫即可, 落库与事件逻辑不受影响。
+
+**`recall_window` 由调用方传入而非 service 自读**: 读 settings 需要
+`EnvironmentId`, 而 `MessageService` 从 `messages` 行拿不到它(要经
+conversation), 构造参数里也没有 settings 依赖。故与 `edit_message(max_size_bytes)`
+同一约定: 参数传入, 由 gateway 用 `SettingsService` 解析后传进来。service 因此
+可脱离 DB 单测, 且「值从哪来」只有一处。
+
+**广播**: `MessageRecalled` 带 `conversation_id`(aux-13 §1.2.7), 因此是
+**当前唯一可安全广播的变更类帧** —— 广播中枢能判断接收方是否成员。
+(`MessageEdited` / `ReactionAdded` 不带, 判为 `Undeliverable`, 见 §1.10。)
+
+#### 测试
+
+新增 7 个撤回真 PG 用例 + 5 个 `SettingsService` 真 PG 用例, 覆盖: 时间窗边界
+两侧(120s 恰好允许 / 121s 过期)、非 sender `Forbidden`、两个终态
+`InvalidStateTransition` 且**状态未被改动**、`read → recalled` 允许、事件确实
+发出且 `message_id` 是被撤回的那条; `SettingsService` 读真库(写入 777 而非
+默认 120)/ 两个 env 窗口不同 / 空 settings 落 serde 默认 / 部分覆盖不丢其余
+字段 / 不存在的 env 返 `NotFound`。
+
+**测试技巧**: 时间窗用例用 `UPDATE messages SET created_at = now() - interval`
+把时间**回拨**到目标偏移, 而不是 `sleep` —— 睡 120s 既慢又 flaky, 且让
+「窗口 120s」与「窗口 1s」能用同一段代码测。
+
+#### 边界测试**无法**通过挂钟观测 —— 已改为纯函数测试
+
+最初写了一条 `recall_window_boundary_is_inclusive_at_exactly_the_limit`:
+把 `created_at` 回拨到**恰好**等于窗口上限(120s), 断言仍允许。它**稳定失败**,
+返回 `RecallWindowExpired`。
+
+原因不是实现错, 是**测试前提不可达**: UPDATE 与 service 调用之间已经过去
+了几毫秒, `elapsed` 实际是 120.00Xs 而非 120s。挂钟回拨只能稳定测「明显在
+窗内」和「明显超窗」, 中间那一毫秒**测不到**。
+
+修法: 把判定抽成纯函数 `within_recall_window(now, created_at, window)`, 用
+**精确构造的入参**测边界(`t + 120s` vs `t`)。这比挂钟回拨**更强** ——
+它精确验证了 `≤` 这一个字符, 且不依赖任何时序运气; 集成测试则退守到
+「60s < 120s」这种有余量的情形, 只验接线。
+
+**共性**: 这与 §1.9 那条「给容器加了清扫后, 断言垃圾会堆积的测试必然失败」
+同族 —— **测试描述的状态在真实世界不可达**。区别在于处置: 上次是「测试前提
+错、改测试」, 这次是「前提不可达、改设计让边界可测」。判别式:
+**写完断言后问「这个状态在真实执行中真的可达吗? 还是会像上面那样, 在两次
+操作之间就漂走了?」**
+
 
 
 

@@ -180,11 +180,15 @@ async fn main() -> std::io::Result<()> {
     ));
 
     // 9. AppState
+    let settings_service = Arc::new(im_core::settings::service::SettingsService::new(
+        pg_pool.clone(),
+    ));
     let app_state = AppState::new(
         conversation_service,
         message_service,
         token_service,
         identity_service,
+        settings_service,
     );
 
     // 9b. WS 广播中枢 —— 进程内单例。

@@ -10,12 +10,34 @@
 //! - message.retention_days.dm / group / channel
 //! - voice.enabled
 //! - audit.detailed
+//!
+//! ## 2026-10-03 变真
+//!
+//! 此前本文件是一个**看起来存在、实则什么都没做**的实现:
+//! - `load_initial()` 注释写「实际: SELECT id, settings FROM environments」,
+//!   函数体是 `Ok(())` —— 从不读库;
+//! - `get(env)` 从一个**永远为空**的 `HashMap` 取值, 任何 env 都落到
+//!   `unwrap_or_default()`, 即**恒定返回 `recall_window_seconds = 120`**;
+//! - `invalidate()` 只从那个空 map 里删一个不存在的键, 从不重读。
+//!
+//! 与 `ws::handler` 那个「占位 broadcast channel」同族 —— 文档说有、代码没有。
+//! 危险之处在于它**看起来是可配的**: 若把撤回时间窗接到 `get()` 上, 代码读起来
+//! 是「从 env settings 读」(符合 aux-04 §B.4 不变量「不能写死」), 实际却恒为
+//! 120 —— 这比明写死更糟, 因为它骗过了 review。
+//!
+//! ## 为什么 MVP **不缓存**
+//!
+//! 原设计有 `HashMap` 缓存 + Valkey pub/sub 失效广播。但失效通道属于
+//! **WBS D-4 (Valkey)**, 尚未落地 —— 没有失效的缓存是**正确性隐患**: 运营改了
+//! `recall_window_seconds`, 进程内仍按旧值判定, 且没有任何办法让它刷新。
+//! 故 MVP 每次调用读一次(走 `environments.id` 主键, 一次索引查询; 撤回是低频
+//! 操作, 无需优化)。真正的缓存随 D-4 落地时再加, 届时失效通道与缓存同时到位。
 
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use sqlx::PgPool;
 
 use im_common::ids::EnvironmentId;
 use im_common::AppError;
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvironmentSettings {
@@ -123,40 +145,55 @@ pub struct AuditSettings {
     pub detailed: bool,
 }
 
+/// 环境级配置读取(per `environments.settings` JSONB 列)
+///
+/// 该列 `NOT NULL DEFAULT '{}'`, 且有 `CHECK (jsonb_typeof(settings) = 'object')`
+/// 约束 —— 所以「行存在但 settings 为空对象」是合法状态, 必须由
+/// `EnvironmentSettings` 的 serde `default` 逐字段补齐(每个字段都带
+/// `#[serde(default = ...)]`), 而**不是**在代码里判空回退。
 pub struct SettingsService {
-    cache: HashMap<EnvironmentId, EnvironmentSettings>,
+    pool: PgPool,
 }
 
 impl SettingsService {
-    pub fn new() -> Self {
-        Self {
-            cache: HashMap::new(),
-        }
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
     }
 
-    /// 启动时全量加载(实际从 DB + 写 Valkey)
-    pub async fn load_initial(&mut self) -> Result<(), AppError> {
-        // MVP: 仅初始化空 cache
-        // 实际:SELECT id, settings FROM environments
-        Ok(())
+    /// 读某环境的完整 settings
+    ///
+    /// 环境不存在时返回 `AppError::NotFound` —— 这与「环境存在但某个字段没配」
+    /// 是**两件事**, 必须让调用方能区分: 前者应报 404, 后者由 serde default
+    /// 正常兜底。
+    ///
+    /// **为什么用 `NotFound` 而不新增 `EnvironmentNotFound` 变体**: 新增
+    /// `AppError` 变体必然新增一个 wire 错误码, 而 aux-03 §B 是 MVP 错误码的
+    /// 唯一权威表、新增码属协议变更, ImplementationSpec 处于 `[PROTOCOL-FROZEN]`。
+    /// 已注册的 `NOT_FOUND` 语义上完全覆盖(就是一个不存在的东西), 不必为此
+    /// 冒破冻结的风险; 具体是哪个 id 放在 message 里, 服务端日志查得到。
+    ///
+    /// 反序列化失败**不**回退到 `default()`: 库里存着一份解析不了的 JSON,
+    /// 静默当成默认值会让运营以为自己改的配置生效了(实际没生效), 且撤回
+    /// 时间窗会悄悄变成 120s。故如实报错。
+    pub async fn get(&self, env: EnvironmentId) -> Result<EnvironmentSettings, AppError> {
+        let row: Option<(serde_json::Value,)> =
+            sqlx::query_as("SELECT settings FROM environments WHERE id = $1")
+                .bind(env.0)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx settings: {e}")))?;
+
+        let Some((raw,)) = row else {
+            return Err(AppError::NotFound(format!("environment {}", env.0)));
+        };
+        serde_json::from_value(raw)
+            .map_err(|e| AppError::Internal(anyhow::anyhow!("environments.settings 解析失败: {e}")))
     }
 
-    /// 获取 env 配置
-    pub fn get(&self, env: EnvironmentId) -> EnvironmentSettings {
-        self.cache.get(&env).cloned().unwrap_or_default()
-    }
-
-    /// 收到 Valkey pub/sub 失效广播后重载
-    pub async fn invalidate(&mut self, env: EnvironmentId) -> Result<(), AppError> {
-        self.cache.remove(&env);
-        // 实际:重新从 DB SELECT
-        Ok(())
-    }
-}
-
-impl Default for SettingsService {
-    fn default() -> Self {
-        Self::new()
+    /// 撤回时间窗(秒)—— 便捷方法, 语义即 aux-04 §B.4 不变量里的
+    /// `env.settings.message.recall_window_seconds`
+    pub async fn recall_window_seconds(&self, env: EnvironmentId) -> Result<u32, AppError> {
+        Ok(self.get(env).await?.message.recall_window_seconds)
     }
 }
 
