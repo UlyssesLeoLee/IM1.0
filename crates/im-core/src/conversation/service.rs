@@ -2,10 +2,8 @@
 //!
 //! 依据: ImplementationSpec §7.4.2 + DetailedDesign §9.3
 
-#![allow(dead_code, unused_imports, unused_variables)] // 2026-08-26 Day 2 GATE: 占位模块,clippy -D warnings 通过;V1 实装时移除
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde_json::Value;
 
 use im_common::ids::{ConversationId, EnvironmentId, UserId};

@@ -165,6 +165,61 @@ test-integration job 已注入 `DATABASE_URL` + `sqlx migrate run`,会自动生�
 - `deploy-dev.yml` 的 K3s 实际部署链路从未在真实集群上端到端跑过。F-1 未解除前
   F-2 / F-3 / F-4 不再受此 Blocker 阻塞,可按 `132-wbs.md` 推进。
 
+### 1.1.4 移除 17 处 blanket lint 压制 —— CI 绿灯改为"真干净" (2026-10-03)
+
+§1.1.1 提到 clippy 靠"占位模块加 `#![allow(dead_code, unused_imports,
+unused_variables)]`"通过。审计发现**全仓共 17 处这种 blanket 压制** + 1 处
+`#![allow(clippy::all)]` —— 也就是说 CI 的 clippy 闸门对绝大部分代码是**空洞的**:
+不是代码干净,是警告被静音。
+
+**测量方法**: 在隔离 worktree 里剥掉全部压制后跑
+`cargo clippy --workspace --all-targets -- -D warnings`,逐轮修完再看下一轮。
+
+> ⚠️ **测量陷阱(本次踩到)**: clippy 遇到第一个编译失败的 crate 就停止,后面
+> 的 crate **根本不会被检查**。第一轮只报出 16 个 im-core error,一度被误读成
+> "真实债务只有 16 个且全在 im-core";修完 im-core 后才露出 14 个 im-gateway
+> error。**真实总数 30**,必须逐轮修完才能看全。
+
+**真实债务 30 个,分布**:
+
+| 位置 | 数量 | 性质 |
+|---|---|---|
+| `im-core/src/identity/service.rs` | 5 | 4 未用 import + 1 未读字段 |
+| `im-core/src/identity/token.rs` | 3 | 3 未用 import(其中 1 个见下) |
+| `im-core/src/identity/repository.rs` | 2 | 未用 import |
+| `im-core/src/message/repository.rs` | 2 | 未用 import |
+| `im-core/src/{conversation/repository,conversation/service,event/events,message/content}.rs` | 各 1-2 | 未用 import / 未用变量 |
+| `im-gateway/src/placeholder.rs` | 10 | 未接线端点桩(文件整体语义) |
+| `im-gateway/src/health.rs` + `http/state.rs` | 2 | 未接线 `readyz` / 未读 `tenant_id` |
+| **合计** | **30** | |
+
+**处理方式(逐项区分,不做一刀切删除)**:
+
+- **未用 import → 直接删**,但有一个陷阱:`identity/token.rs` 的 `EnvironmentId`
+  表面未用,实际在 `#[cfg(test)] mod tests` 内被 `use super::*` 带进来使用。
+  直接删会**打断 test 目标编译**。已按 im-gateway 的既有做法移进测试模块。
+- **刻意保留的死代码 → 标注不删**,每项写明缺口编号与接线条件:
+  `IdentityService::server_secrets`(C-3 S2S 接线)、
+  `health::readyz`(F-4 依赖 F-2/F-3)、
+  `AuthedUser::tenant_id`(多租户隔离随 G-1/V1)。
+- **`placeholder.rs`**: 该文件唯一职责就是存放"已定义但未接线"的端点桩,
+  函数按定义不会被调用。保留 `#![allow(dead_code)]`,但**从原先三项收窄到一项** ——
+  原先的 `unused_imports` / `unused_variables` 会连带掩盖本文件未来真实的
+  import / 变量问题。
+- **`im-proto` 的 `#![allow(clippy::all)]` 保留**: 唯一手写代码只是一层
+  `include_proto!` 转发, 实质内容全由 tonic-build 生成
+  (`OUT_DIR/im.core.v1.rs`), 生成物稳定触发 `result_large_err` 等 lint
+  (实测 22 处) 且不受我们控制。已在注释里写明保留理由与收窄待办。
+
+**结果**: 剥掉 17 处压制后
+`cargo clippy --workspace --all-targets -- -D warnings` **exit 0**,
+`cargo fmt --all -- --check` **exit 0**。CI 的 clippy 绿灯从此不再是压制出来的。
+
+**未修的既有问题(仅记录)**: `message/content.rs` 的
+`.map_err(|_| AppError::MessageTooLarge(0, max_bytes))` 把真实 size 丢了
+(传的是硬编码 0), 调用方无法知道实际大小。本次只做最小化(消除 unused 变量),
+改行为属另一议题。
+
 ### 1.2 第一个产品线:IM Core (消息为主)
 
 - **优先级**:P0

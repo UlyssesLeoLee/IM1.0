@@ -2,12 +2,10 @@
 //!
 //! 依据: ImplementationSpec §7.4.2
 
-#![allow(dead_code, unused_imports, unused_variables)] // 2026-08-26 Day 2 GATE: 占位模块,clippy -D warnings 通过;V1 实装时移除
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use uuid::Uuid;
 
 use im_common::ids::{ConversationId, EnvironmentId, UserId};
 use im_common::AppError;

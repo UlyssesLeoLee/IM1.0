@@ -2,7 +2,6 @@
 //!
 //! 依据: ImplementationSpec §3.1.7
 
-#![allow(dead_code, unused_imports, unused_variables)] // 2026-08-26 Day 2 GATE: 占位模块,clippy -D warnings 通过;V1 实装时移除
 use actix_web::HttpResponse;
 use serde_json::json;
 
@@ -13,6 +12,9 @@ pub async fn healthz() -> HttpResponse {
 
 /// Readiness — 进程 + 依赖全部就绪
 /// MVP: 只检查进程;V1 加上 PG/Valkey/NATS 连接检查
+// 守门 #1 缺口台账: F-4 (healthz/readyz) 依赖 F-2/F-3 (K3s 部署), 路由尚未接线。
+// 保留不删; per docs/Project-Status.md 1.1.1 占位符保留约定。
+#[allow(dead_code)]
 pub async fn readyz() -> HttpResponse {
     HttpResponse::Ok().json(json!({"status": "ready"}))
 }

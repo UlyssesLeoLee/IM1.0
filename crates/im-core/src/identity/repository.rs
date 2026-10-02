@@ -2,16 +2,12 @@
 //!
 //! 依据: ImplementationSpec §7.4.1 + DetailedDesign §9.2
 
-#![allow(dead_code, unused_imports, unused_variables)] // 2026-08-26 Day 2 GATE: 占位模块,clippy -D warnings 通过;V1 实装时移除
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 pub use im_common::ids::{DeviceSessionId, EnvironmentId, UserId};
 use im_common::AppError;
-
-use super::token::DeviceSession;
 
 /// 用户类型
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

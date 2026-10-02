@@ -16,8 +16,6 @@
 //! - MessageService / RelationshipService
 //! - 限流 / 监控指标
 
-#![allow(dead_code)] // 部分字段留给后续 PR 接入
-
 use std::sync::Arc;
 
 use im_common::ids::UserId;
@@ -70,6 +68,10 @@ impl AppState {
 pub struct AuthedUser {
     pub user_id: UserId,
     pub environment_id: im_common::ids::EnvironmentId,
+    // 守门 #1 缺口台账: 已聚合进鉴权上下文, 但现有 handler 尚未按租户过滤
+    // (多租户隔离随 G-1/V1 落地)。保留字段不删;
+    // per docs/Project-Status.md 1.1.1 占位符保留约定。
+    #[allow(dead_code)]
     pub tenant_id: String,
     pub kind: String, // "user" | "guest"
 }

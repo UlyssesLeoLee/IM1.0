@@ -6,7 +6,6 @@
 //! 2026-09-01 新增(C-1 WBS):im-core 6 个 PgRepository 实装需求
 //! 之前 message 模块的注释提到 Reaction 但没单独建模块。
 
-#![allow(dead_code)] // 2026-09-01 Day 8 C-1:新模块,clippy 占位 OK,V1 实装/调优时移除
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 

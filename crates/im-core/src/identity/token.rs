@@ -2,15 +2,13 @@
 //!
 //! 依据: ImplementationSpec §7.4.1 + DetailedDesign §9.2
 
-#![allow(dead_code, unused_imports, unused_variables)] // 2026-08-26 Day 2 GATE: 占位模块,clippy -D warnings 通过;V1 实装时移除
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
-use im_common::ids::{DeviceSessionId, EnvironmentId, UserId};
-use im_common::{AppError, ErrorCode};
+use im_common::ids::{DeviceSessionId, UserId};
+use im_common::AppError;
 
 use super::repository::User;
 // UserId 从 im_common::ids 直接引用(已在上面 use)
@@ -207,7 +205,10 @@ impl From<TokenError> for AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // EnvironmentId 仅本测试模块使用 (生产路径走 claims 里的 env);
+    // 若留在文件顶层会被 non-test target 判 unused_imports。
     use crate::identity::repository::{UserKind, UserState};
+    use im_common::ids::EnvironmentId;
     use secrecy::SecretString;
 
     fn test_user() -> User {

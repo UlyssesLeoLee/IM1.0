@@ -8,9 +8,6 @@
 //! - Refresh Token Rotation
 //! - Guest Upgrade (LinkAccount)
 
-#![allow(dead_code, unused_imports, unused_variables)] // 2026-08-26 Day 2 GATE: 占位模块,clippy -D warnings 通过;V1 实装时移除
-use async_trait::async_trait;
-use chrono::Utc;
 use uuid::Uuid;
 
 use im_common::ids::{EnvironmentId, UserId};
@@ -20,8 +17,7 @@ use super::password::{
     hash_password, validate_password_strength, validate_username, verify_password,
 };
 use super::repository::{ExternalIdentity, User, UserKind, UserRepository, UserState};
-use super::token::{AccessToken, DeviceSessionRepository, TokenPair, TokenService};
-use crate::common::repository::*; // 留位,后续会用到
+use super::token::{DeviceSessionRepository, TokenPair, TokenService};
 
 /// Register 命令 (username/password 路径, 2026-09-21 整合 C-3)
 #[derive(Debug, Clone)]
@@ -47,6 +43,9 @@ pub struct IdentityService<U: UserRepository, D: DeviceSessionRepository> {
     pub(crate) user_repo: U,
     pub(crate) device_repo: D,
     token_service: std::sync::Arc<TokenService>,
+    // 守门 #1 缺口台账: S2S token exchange 要按 environment 取 secret, 接线未完成。
+    // 保留字段不删, 待 WBS C-3 接线; per docs/Project-Status.md 1.1.1 占位符保留约定。
+    #[allow(dead_code)]
     server_secrets: std::collections::HashMap<EnvironmentId, secrecy::SecretString>,
 }
 

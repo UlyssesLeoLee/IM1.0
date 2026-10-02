@@ -2,7 +2,13 @@
 //!
 //! 所有端点暂时返回 501 Not Implemented,实际 handler 在后续 PR 提交
 
-#![allow(dead_code, unused_imports, unused_variables)] // 2026-08-26 Day 2 GATE: 占位模块,clippy -D warnings 通过;V1 实装时移除
+// 本文件的**唯一职责**就是存放"已定义但尚未接线"的端点桩, 每个函数按定义
+// 都不会被调用 —— 这不是"漏了调用",而是文件本身的语义。故此处把原先的
+// `dead_code, unused_imports, unused_variables` 三项 blanket 压制收窄到
+// `dead_code` 一项: 后两项会连带掩盖本文件未来真实的 import/变量问题。
+// 接线完成后应连同本属性一并移除。
+#![allow(dead_code)]
+
 use actix_web::HttpResponse;
 use serde_json::json;
 
