@@ -14,7 +14,7 @@
 //!   - `Ping` → `HeartbeatState::on_frame()` 重置心跳 + 回
 //!     `ServerFrame::Pong { ts }`(ts 原样回传, per aux-13 §1.1.8)。
 //!     **2026-10-03 已修复**: 此前没有 Ping 分支, ping 落进业务帧兜底被回
-//!     `UNSUPPORTED_OPERATION`, 客户端永远收不到 pong。
+//!     `VALIDATION_ERROR` 错误帧, 客户端永远收不到 pong。
 //!   - 其他业务帧 (SendMessage / Edit / Recall / React / MarkRead / Typing) → 列已知缺口 (C-9 messages handler 还没做)
 //! - 30s 心跳检查间隔(常量 `HEARTBEAT_TICK`)与 60s 无帧超时(`HeartbeatConfig::no_frame_timeout`)
 //!   在 `run_ws_loop` 的 `select!` 内**同处判定**: 每 30s 查一次 idle, 满 60s
@@ -27,13 +27,31 @@
 //! - ForceDisconnect hook stub (后续 G-1 presence 集成)
 //!
 //! ### 已知缺口 (per 守门 #1 缺标比错标)
-//! 1. **业务帧处理 (SendMessage / Edit / Recall / React / MarkRead / Typing)**: 留 C-9 + 后续 lane; 当前收到非 Auth/Ping 帧返 `UNSUPPORTED_OPERATION` (501, per aux-13 §4)
+//! 1. **业务帧处理 (SendMessage / Edit / Recall / React / MarkRead / Typing)**: 留 C-9 + 后续 lane
+//!
+//!    **2026-10-03 更正 —— 本条原注释是双重错误, 勿照抄**:
+//!    - 原写「返 `UNSUPPORTED_OPERATION` (501, per aux-13 §4)」。**该错误码不存在**:
+//!      `aux-03-error-code-registry.md` §B 是 MVP 错误码的**唯一权威表**, 列出 21 个
+//!      已注册码, 与 `im_common::ErrorCode` 枚举逐项一致, 其中**没有**
+//!      `UNSUPPORTED_OPERATION`, 也没有 501。
+//!    - 原引用的 `aux-13 §4` 是**「前置条件 (Prerequisites)」**章节, 不是错误码章节 ——
+//!      出处本身也不成立。
+//!    - 实际代码返回 `VALIDATION_ERROR` (400)。它是个**已注册**码, 但语义不合:
+//!      业务帧格式完全合法, 缺的只是服务端处理器。aux-03 §B 对该码的定义是
+//!      「请求体校验失败 / 字段类型、长度、枚举值不合法」。
+//!
+//!    **为何不改成 501**: `aux-03 §B` 写明「任何 PR 增加必须同时更新本表与
+//!    DetailedDesign」, 即新增错误码是**协议变更**; 而 ImplementationSpec 处于
+//!    `[PROTOCOL-FROZEN]`。是否新增「未实装」类错误码属规范所有者的决定, 不是
+//!    架构师可自行拍板的实现细节。已记入 `docs/gap-ledger.md` §1.6。
 //! 2. **im-proto gRPC 客户端**: 有 stub (per worker-C 探索 `im_proto::im::core::v1::core_service_client::CoreServiceClient`), 但 MVP Day 3 没 wire-up gRPC channel; Auth 帧的 TokenClaims 解析走本地 TokenService (已经在 im-gateway 进程内), 不走 gRPC
 //! 3. **ForceDisconnect broadcast**: 占位 broadcast channel, 实际 broadcasting 留 G-1 presence
-//! 4. **device_session_id 来自 JWT claims**: 当前 TokenClaims 没 `dsid` 字段 (per 138 §8 缺口 + AuthedUser), 用 refresh_token split 兜底
 //!
-//! 已于 2026-10-03 结清: 曾列为缺口 5 的「60s 无帧超时未真正关闭连接」已修复 ——
-//! tick 搬进 `run_ws_loop` 的 `select!`, 超时即退出主循环并走 close。
+//! 已于 2026-10-03 结清:
+//! - 曾列为缺口 4 的「60s 无帧超时未真正关闭连接」已修复 —— tick 搬进
+//!   `run_ws_loop` 的 `select!`, 超时即退出主循环并走 close。
+//! - 曾列为缺口 5 的「device_session_id 来自 JWT claims / TokenClaims 没 `dsid` 字段」
+//!   已修复 —— 见 `docs/gap-ledger.md` §1.5 (C-7 logout 实装, 本轮一并补上)。
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -293,8 +311,8 @@ async fn run_ws_loop(
                         // per aux-13 §1.1.8: 客户端 ping → 服务端 pong, ts 原样回传。
                         //
                         // 2026-10-03 修复: 此前**没有这个分支** —— `ClientFrame::Ping`
-                        // 落进了下面的 `Ok(_)` 兜底, 被当成业务帧返回
-                        // UNSUPPORTED_OPERATION, 于是客户端发 ping 永远收不到 pong,
+                        // 落进了下面的 `Ok(_)` 兜底, 被当成业务帧回
+                        // VALIDATION_ERROR 错误帧, 于是客户端发 ping 永远收不到 pong,
                         // 而模块文档写的是"回 PongFrame(ts)"。这也是 #F 的
                         // `PingFrame`/`into_pong` 一直无人调用的直接原因。
                         // 现统一走 `im_protocol::ws_frames::ServerFrame::Pong` ——
@@ -324,7 +342,18 @@ async fn run_ws_loop(
                     }
                     Ok(_) => {
                         // 业务帧 (SendMessage / Edit / Recall / React / MarkRead / Typing):
-                        // 列已知缺口 — 留 C-9 + 后续 lane, 当前返 UNSUPPORTED_OPERATION
+                        // 留 C-9 + 后续 lane。
+                        //
+                        // 2026-10-03 更正: 本注释原写「当前返 UNSUPPORTED_OPERATION」——
+                        // **该错误码不存在**。aux-03 §B(MVP 错误码唯一权威表)的 21 个
+                        // 已注册码里没有它, 也没有 501。实际返回的是
+                        // `VALIDATION_ERROR` (400)。
+                        //
+                        // 语义确实不合(业务帧格式合法, 缺的是服务端处理器), 但**不能
+                        // 自行改成 501**: aux-03 §B 规定新增错误码须同步更新该表与
+                        // DetailedDesign, 属协议变更, 而 ImplementationSpec 处于
+                        // `[PROTOCOL-FROZEN]`。是否新增「未实装」类错误码由规范所有者
+                        // 决定。见模块文档缺口 1 + docs/gap-ledger.md §1.6。
                         send_error(
                             ws_session,
                             im_common::ErrorCode::ValidationError,

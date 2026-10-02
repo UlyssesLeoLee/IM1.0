@@ -131,11 +131,17 @@ jobs:
           cargo install --locked cargo-audit
           cargo audit
       - name: check error codes consistency (aux-03)
-        run: |
-          # 占位,恒通过:本步骤不校验错误码,只 echo,不能当门禁看。
-          # 2026-10-02 修正:原注释引用 scripts/check_error_codes.sh,但该文件不存在
-          # (scripts/ 下无此脚本),aux-03 §B 的一致性目前全靠人工 review。
-          echo "placeholder: no automated aux-03 §B error-code check is enforced here"
+        # 2026-10-03: 此前本步骤是**恒通过的占位符**, 只 echo 一行字, 注释里明写
+        # 「不能当门禁看」—— 因为它引用的 scripts/check_error_codes.sh 从不存在
+        # (连 .sh 后缀都是错的, scripts/ 下无此文件)。
+        # 现补上 scripts/check-error-codes.ps1 做真检查, 三项均为精确匹配(零误报):
+        #   1. error.rs 枚举变体 ↔ as_str() wire 名一一对应且唯一
+        #   2. aux-03 §B 权威表的 code 列 ↔ 枚举 wire 名集 双向完全相等
+        #   3. 全仓 crates/**/*.rs 的 ErrorCode::X 用法均指向真实变体
+        # 变异测试已验证判别力: 把 EnvironmentDisabled 的 wire 名改成别的, 本检查
+        # 双向各报一条并 exit 1。
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/check-error-codes.ps1
       - name: semgrep
         uses: returntocorp/semgrep-action@v1
         with:

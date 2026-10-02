@@ -1,13 +1,20 @@
 //! 统一错误类型 —— IM1.0 错误码单一来源
 //!
-//! 依据: docs/templates/04-detailed-design/aux/aux-03-error-code-registry.md §B (21 项)
+//! 依据: docs/templates/04-detailed-design/auxiliary/aux-03-error-code-registry.md §B (21 项)
 //!       docs/ImplementationSpec.md §5.1
 //!
 //! 关键原则:
 //! - `ErrorCode` 枚举即 wire format 的 code 字符串(由 strum AsRefStr 自动生成)
 //! - `AppError::code()` 是 im-gateway 边界统一转换的唯一点
 //! - 任何 `match err.code { ... }` 必须有 `default` 分支(防止枚举扩展后遗漏)
-//! - CI 由 `scripts/check_error_codes.sh` 扫描所有错误码字符串与枚举一致性
+//! - 2026-10-03: 本行原写「CI 由 `scripts/check_error_codes.sh` 扫描所有错误码字符串与
+//!   枚举一致性」——**该脚本从不存在**(`.sh` 后缀, scripts/ 下无此文件; ci.yml L136-137
+//!   早已记录此事, 但这里的声明没跟着改)。现已补上 `scripts/check-error-codes.ps1`
+//!   并挂进 CI 的 sast job, 检查 ①枚举↔as_str ②aux-03 §B 权威表↔枚举 双向一致
+//!   ③全仓 `ErrorCode::X` 用法合法。
+//! - 仍未自动化: 注释里「提到的错误码」是否已注册。SCREAMING_SNAKE 启发式实测
+//!   误报 228 处(环境变量名/常量/测试 fixture), 无语法位置可区分, 保留人工 review。
+//!   见 docs/gap-ledger.md §1.6。
 
 use strum::AsRefStr;
 use thiserror::Error;

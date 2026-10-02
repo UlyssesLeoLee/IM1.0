@@ -301,6 +301,61 @@ guest→user 升级流程(验 token / 校验 kind='guest' / 唯一性由
 实现**。不同之处在于前三处是「文档说有, 代码没有」, 本处是「文档说有,
 代码有一个永远失败的桩, 而文档对它的失败方式描述得都不一样」。
 
+### 1.6 伪造的错误码与出处: `UNSUPPORTED_OPERATION` / 501 (2026-10-03 消除)
+
+#### 缺陷
+
+`crates/im-gateway/src/ws/handler.rs` 共有 **4 处**注释声称业务帧
+(SendMessage / Edit / Recall / React / MarkRead / Typing) 返回
+`UNSUPPORTED_OPERATION`, 并注明 **501, per aux-13 §4**。**两处都是假的**:
+
+| 声称 | 事实 |
+|---|---|
+| `UNSUPPORTED_OPERATION` 是错误码 | **不存在**。`aux-03-error-code-registry.md` §B 是 MVP 错误码的**唯一权威表**, 列出 21 个已注册码, 与 `im_common::ErrorCode` 枚举逐项一致, 其中没有它, 也没有 501 |
+| 出处是 `aux-13 §4` | `aux-13` 的 §4 是**「前置条件 (Prerequisites / Inputs)」**, 不是错误码章节 |
+
+实际代码返回 `VALIDATION_ERROR` (400) —— 是个**已注册**码, 但语义不合:
+业务帧格式完全合法, 缺的只是服务端处理器。aux-03 §B 对该码的定义是
+「请求体校验失败 / 字段类型、长度、枚举值不合法」。
+
+#### 为何不改成 501
+
+`aux-03 §B` 明文规定「任何 PR 增加必须同时更新本表与 DetailedDesign」——
+即**新增错误码是协议变更**, 而 `ImplementationSpec` 处于 `[PROTOCOL-FROZEN]`。
+是否新增「未实装」类错误码属**规范所有者**的决定, 不是架构师可自行拍板的
+实现细节。故本轮**只更正注释、不动 wire 行为**, 并把决策点显式记下来。
+
+#### 结构性防护: 补上那个从未存在过的检查
+
+追查时发现 `error.rs` 声称「CI 由 `scripts/check_error_codes.sh` 扫描所有
+错误码字符串与枚举一致性」—— **该脚本从不存在**。更值得注意的是
+`ci.yml:136-137` 早在 2026-10-02 就记录了此事并把该步骤降级为**恒通过的
+echo 占位符**, 但 `error.rs` 的声明一直没跟着改。
+
+已新增 `scripts/check-error-codes.ps1` 并挂进 CI `sast` job(替换占位符),
+三项**精确匹配、零误报**的检查:
+
+1. `ErrorCode` 枚举变体 ↔ `as_str()` wire 名一一对应且唯一
+2. **`aux-03 §B` 权威表 ↔ 枚举 wire 名集双向完全相等** ← 这条正是能抓住
+   本次伪造码的检查, 同时也堵住反向缺口(枚举加了码却没更新权威表)
+3. 全仓 `crates/**/*.rs` 的 `ErrorCode::X` 用法均指向真实变体
+
+**变异测试**: 把 `EnvironmentDisabled` 的 wire 名改成 `ENVIRONMENT_DISABLED_MUTANT`,
+脚本**双向各报一条**并 exit 1; 还原后 exit 0, `git diff` 无残留。
+
+**脚本跨平台**: CI 跑在 ubuntu, 路径一律用正斜杠(Windows 下同样接受);
+已在 Windows PowerShell 5.1 与 pwsh 7 双版本下复验, 并按仓库既有要求加
+UTF-8 BOM、通过 `scripts/lint-ps1-encoding.ps1`。
+
+#### 明确未自动化的一项
+
+首版脚本还想扫描「注释里提到的错误码是否已注册」, 实测**误报 228 处**
+(`IM_HTTP_PORT` / `MAX_PASSWORD_LEN` / `CARGO_PKG_VERSION` / 测试 fixture …)——
+**没有语法位置**能区分「散文里提到的错误码」与「环境变量名或常量名」,
+该启发式不可用。已从脚本中移除, 并在脚本头部与本文档同时注明**保留人工
+review**, 不假装已覆盖。
+
+
 
 
 ---
