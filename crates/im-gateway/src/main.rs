@@ -227,6 +227,14 @@ async fn main() -> std::io::Result<()> {
     // `/v1/ws` 请求都会拿到 500 —— 故在此显式注册。
     let ws_hub = web::Data::new(ws::hub::WsHub::new());
 
+    // readiness 需要真实探测 PG, 故把 pool 也注入进去。
+    //
+    // 2026-10-03: `/readyz` 此前是 `main.rs` 里一个 `async fn readyz()`,
+    // **无条件返回 200** —— 而 `DetailedDesign §5` 要求「PG/Valkey/NATS
+    // 全部可达才 200」。后果: k8s 会把连不上数据库的实例判为 ready 并把
+    // 流量打过去, 而那个实例的每个业务端点都会 500。
+    let readiness_pool = web::Data::new(pg_pool.clone());
+
     let http_port = cfg.http_port;
     tracing::info!(http_port, "im-gateway binding HTTP server");
 
@@ -234,19 +242,15 @@ async fn main() -> std::io::Result<()> {
         App::new()
             .app_data(web::Data::new(app_state.clone()))
             .app_data(ws_hub.clone())
+            .app_data(readiness_pool.clone())
             .service(web::scope("/v1").configure(http::configure))
             .route("/healthz", web::get().to(health::healthz))
-            .route("/readyz", web::get().to(readyz))
+            .route("/readyz", web::get().to(health::readyz))
             .route("/metrics", web::get().to(health::metrics))
     })
     .bind(("0.0.0.0", http_port))?
     .run()
     .await
-}
-
-/// /readyz — D-1 wire-up 后, 只有 AppState 构造成功才 ready
-async fn readyz() -> actix_web::HttpResponse {
-    actix_web::HttpResponse::Ok().json(serde_json::json!({"status": "ready"}))
 }
 
 // 避免未用警告 (SigningKeyConfig 在 cfg 加载时使用, 此处 suppress)

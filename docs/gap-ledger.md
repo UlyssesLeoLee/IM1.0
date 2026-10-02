@@ -1140,13 +1140,61 @@ server(proto 里的 `CoreService` 由 gateway **进程内**直接调 im-core, �
 - F-2/F-3 的端到端仍**未跑通**: 本机 Docker Desktop 的 k8s API 超时
   (`172.28.176.169:6443 context deadline exceeded`), 而项目目标是 K3s。
 
+### 1.18 `/readyz` 无条件返回 200 —— k8s 会把流量送给一个每个端点都 500 的实例 (2026-10-03 已修)
+
+§1.17 记下「readyz 恒返 200」时写的是「未擅自改, 因为哪些依赖算可达涉及部署
+形态决策」。**复核后这个理由不成立**: `DetailedDesign §5` 已经点名了要求 ——
+「就绪检查(PG/Valkey/NATS 全部可达才 200)」。那是规范, 不是待定的设计选择。
+上一轮把规范已经回答过的问题当成「需要决策」, 是拖延的一种形式。
+
+#### 查什么, 不查什么
+
+| 依赖 | 查不查 | 理由 |
+|---|---|---|
+| **PostgreSQL** | ✅ | 唯一有**真实失败模式**的依赖: 每个业务端点都要它。查不到 = 接了流量也全部 500, 正是 readiness 该拦下的 |
+| NATS | ❌ | `NatsEventPublisher` 是 stub(`_client: None`), **没有任何连接可查**。查一个恒「可达」的空壳只会给虚假安全感 |
+| Valkey | ❌ | **D-4 未落地**, 配置无字段、代码无客户端。若强行查, readyz 永远 503, 整个部署起不来。宁可少查并**显式声明**, 也不要把 Pod 永久判死 |
+
+响应体里显式写出「没查」的两项(`not_checked_stub_publisher` /
+`not_implemented_D4`), 而不是让它们**不出现** —— 少一个字段, 读 `/readyz`
+的人会把「没提到」误读成「查过了且通过」。
+
+#### liveness 与 readiness 刻意**不**合并
+
+`/healthz` 绝不碰任何外部依赖。合并的后果: 数据库一抖, 全部副本同时被
+liveness 判死并重启 —— 把「一个依赖不可用」放大成「整个服务不可用且重启中」。
+
+#### 一个容易踩的坑: 探测必须有硬上界
+
+k8s 探针 `timeoutSeconds` 默认 **1s**。若 `SELECT 1` 挂住到 5s, 表现是探针
+持续超时 → 连环失败 → Pod 反复重启 —— 一个本该只影响流量的依赖故障被放大成
+CrashLoop。故 `PG_PING_TIMEOUT = 500ms`, 且由 `tokio::time::timeout` 强制,
+**不依赖 sqlx 自身的连接超时**(后者可能因池里有坏连接而拖得更久)。
+`pg_ping_timeout_is_well_under_the_default_probe_timeout` 锁住这个数值 ——
+它是纯逻辑断言, 因为本地没有 k8s 在跑, 线上才会暴露。
+
+#### 变异验证
+
+把 `if ok` 改成 `if true || ok`(等价于恢复成原来的无条件 200):
+`readyz_is_503_when_postgres_is_unreachable` 立刻变红, 报 `left: 200,
+right: 503`。
+
+#### 测试里一处**自己写错的前提**
+
+最初用 `PgPoolOptions::connect()` 构造「不可达的池」, 但它对不可达端口**当场
+返回 `Err(PoolTimedOut)`**, 根本走不到 handler。改用 `connect_lazy` —— 这也
+更贴近生产: 池在启动时建好(那时 PG 可可达, 否则进程起不来), readiness 要
+捕捉的是**之后**的不可用(PG 重启 / 网络分区 / 连接被中间件掐断)。
+
+---
+
 ---
 
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
 |---|---|---|
-| ~~`crates/im-gateway/src/health.rs:15` `readyz()` 路由尚未接线~~ | ~~F-4 (healthz/readyz) 路由尚未接线~~ | ✅ **已接线** (2026-10-03 更正本行旧描述): `main.rs` 早已注册 `/healthz` `/readyz` `/metrics` 三条路由。**但** `/readyz` 当前**无条件返回 200**, 不检查 PG/NATS/Valkey 可达性 —— 而 `DetailedDesign §5` 要求「PG/Valkey/NATS 全部可达才 200」。即 k8s 会把连不上库的实例判为 ready 并把流量打过去。未擅自改: 哪些依赖算「可达」涉及部署形态决策, 且 Valkey (D-4) 根本不存在。见 §1.17 |
+| ~~`crates/im-gateway/src/health.rs:15` `readyz()` 路由尚未接线~~ | ~~F-4 (healthz/readyz) 路由尚未接线~~ | ✅ **路由早已注册**; 2026-10-03 **实装真实依赖检查**: 原实现**无条件返回 200**, k8s 会把连不上库的实例判为 ready 并把流量打过去。现查 PG(带 500ms 硬上界, 避免探针超时变 CrashLoop), 不可达返 503; NATS(stub)与 Valkey(D-4 不存在)显式声明「未检查」而非省略。见 §1.18 |
 | `crates/im-gateway/src/http/state.rs:71` `AuthedUser.tenant_id` | 已聚合进鉴权上下文, 但现有 handler 尚未按租户过滤 | 多租户隔离随 **G-1 / V1** 落地 |
 | ~~`crates/im-core/src/identity/service.rs` `server_secrets`~~ | ~~S2S token exchange 要按 environment 取 secret, 接线未完成~~ | ✅ **已接线** (2026-10-03): 被 `IdentityService::verify_server_signature` 真正使用, 见 §1.3 |
 | `crates/im-gateway/src/http/auth_handlers.rs` `token_exchange` **nonce 防重放** | 协议有 `X-IM-Nonce`, 但服务端**未校验也未记录** —— 同一合法请求可在 ±300s 窗口内重放 | 需跨实例共享存储 → **WBS D-4 (Valkey)** 落地后接 |
