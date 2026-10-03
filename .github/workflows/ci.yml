@@ -68,6 +68,13 @@ jobs:
       # 两个变量指向同一个库, 但必须都设 —— 少一个就少一批测试在跑,
       # 而且从输出上看不出来。
       IM_POSTGRES_URL: postgres://im:im@localhost:5432/im_test
+      # 2026-10-03 新增: 让「连不上 PG 就静默跳过」在 CI 里变成**硬失败**。
+      # 本机没 PG 时跳过是合理的(否则无 PG 的开发机全红), 但 CI 明确挂了
+      # PG service container —— 此时跳过意味着 job 配错了, 而「跳过」在
+      # test harness 里就是「通过」, 配置错误会以绿灯的形式混过去。
+      # 真实教训: 2026-10-03 本机 Docker 停掉后, 6 个 WS e2e 全部「通过」,
+      # 实际一个都没跑。见 docs/gap-ledger.md §1.15 / §1.22。
+      IM_REQUIRE_PG: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -99,6 +106,13 @@ jobs:
       DATABASE_URL: postgres://im:im@localhost:5432/im_test
       # 见 test-unit job 内同名校验: 少设这个变量, im-migrate 的 e2e 会静默跳过
       IM_POSTGRES_URL: postgres://im:im@localhost:5432/im_test
+      # 2026-10-03 新增: 让「连不上 PG 就静默跳过」在 CI 里变成**硬失败**。
+      # 本机没 PG 时跳过是合理的(否则无 PG 的开发机全红), 但 CI 明确挂了
+      # PG service container —— 此时跳过意味着 job 配错了, 而「跳过」在
+      # test harness 里就是「通过」, 配置错误会以绿灯的形式混过去。
+      # 真实教训: 2026-10-03 本机 Docker 停掉后, 6 个 WS e2e 全部「通过」,
+      # 实际一个都没跑。见 docs/gap-ledger.md §1.15 / §1.22。
+      IM_REQUIRE_PG: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

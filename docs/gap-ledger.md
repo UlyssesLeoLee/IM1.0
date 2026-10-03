@@ -1406,6 +1406,78 @@ while executing migration 1: error returned from database: trigger ...
 
 ---
 
+### 1.22 WS 端点只挂在 `/v1/ws/ws` —— **按规范接的客户端根本连不上** (2026-10-03 已修)
+
+补全仓第一个 WS 端到端测试时, 第一条路径用例直接失败, 由此发现:
+
+| 层 | 代码 | 提供的路径片段 |
+|---|---|---|
+| `main.rs:246` | `.service(web::scope("/v1").configure(http::configure))` | `/v1` |
+| `http/mod.rs:140`(修前) | `cfg.service(web::scope("/ws").configure(ws::router::configure))` | `/ws` |
+| `ws/router.rs:12` | `cfg.service(web::scope("/ws").route(...))` | `/ws` |
+
+**actix 的 scope 是嵌套的 —— 前缀逐层相加, 同名前缀不会合并。**
+实测(`/v1/ws` → **404**, `/v1/ws/ws` → **200**), 故 WS 端点实际只挂在
+`/v1/ws/ws`。而 `ws/router.rs:9` 自己的文档写「注册 `/v1/ws` 端点」,
+`138-dev-plan.md:242` 也写「actix-ws 0.3 端点 `/v1/ws`」—— **两者都不是**。
+
+后果: 按规范实现的客户端 100% 连不上, 且因为**全仓没有任何测试会真的发起
+一次 WS 连接**, 这件事此前无人发现。
+
+修法: 删掉 `http/mod.rs` 那层冗余 scope, 直接 `crate::ws::router::configure(cfg)`
+—— 路径的定义权归 `ws::router`(它自带 scope 且文档写明路径)。
+
+#### 文档对 WS 路径本身有分歧(未擅自拍板)
+
+`aux-13` 的 wscat 样例(`wss://gateway.{tenant}.example.com/ws`)与
+`Observability.md §1.1.3` 写 `/ws`; `ImplementationSpec §3.2`、
+`138-dev-plan.md`、`ws/router.rs` 写 `/v1/ws`。本次按**代码既有意图 + 仓内
+REST 全在 `/v1` 下的惯例**取 `/v1/ws`, 并在代码注释里写明「若规范所有者定案
+为 `/ws`, 改 `ws/router.rs` 一行即可」。**需规范所有者裁决。**
+
+#### 顺带:我自己踩进了 §1.15 记的那个假绿灯, 而且是**新写的**代码
+
+写下这批 WS 用例后第一次运行, **6 个全「通过」**。实际: Docker Desktop 已被
+关掉, PG 容器随之消失, 6 个用例**全部走 `else { return }` 静默跳过** ——
+而「跳过」在 test harness 里**就是「通过」**。若不是顺手查了耗时(10.01s ≈
+`acquire_timeout(10s)`), 这会作为「WS e2e 已就位」被记进台账。
+
+**这说明 §1.15 那条不是「理论上的隐患」, 而是任何人新写 PG 相关测试时都会
+默认踩进去的坑。** 两处修法:
+
+1. **「路由挂在哪」根本不依赖 PG** —— 路径用例改用真实
+   `crate::http::configure` + `TestRequest`, 断言「**非 404**」而不是 101。
+   不注入 `web::Data<AppState>` 时, 路由命中会在提取 `web::Data` 时返 500,
+   未命中返 404 —— **500 与 404 恰好把「路由在不在」和「handler 能不能跑」
+   分开**。这类「本可不依赖外部资源、却因复用了完整夹具而被绑住」的测试,
+   环境一不稳就变成静默跳过。
+2. **加 `IM_REQUIRE_PG` 开关**: 值为 `1` 时, 连不上 PG **直接 panic 而不是
+   跳过**。本机没 PG 仍允许跳过(否则无 PG 的开发机全红), 但 CI 明确挂了
+   PG service container, 此时跳过意味着 job 配错了 —— 而配置错误会以绿灯的
+   形式混过去。`test-unit` / `test-integration` 两个 job 均已设上。
+   已验证: 设 `IM_REQUIRE_PG=1` 且 PG 不可用时, 4 个用例由「ok」变 **FAILED**
+   并给出明确原因。
+
+#### 验证状态(必须分开看)
+
+- ✅ **已验证**: `ws_route_is_registered_at_the_documented_path`(修复后
+  `/v1/ws` 非 404 且 `/v1/ws/ws` 为 404)、`nested_scopes_of_the_same_prefix_still_nest`、
+  `rfc6455_example_key_is_wellformed_base64`。均**不依赖 PG**。
+- ⚠️ **未验证**: 4 个真实 WS 用例(首帧必须 auth / ping→pong 回传 ts /
+  假 token 被拒 / 广播只到成员不到非成员)。编译与 clippy 均通过, 但
+  **本会话 PG 始终不可用**(Docker Desktop 进程拉不起来, `com.docker.service`
+  处于 Stopped 且当前 shell 无提权权限), 一次都没真跑过。**不声称它们通过。**
+  CI 侧因 `IM_REQUIRE_PG=1` 会在 PG 就绪时真跑, 配错则硬失败。
+
+#### 附:文档自身的一处回归(已修)
+
+上一条 §1.21 插入时, 锚点选取把本节标题 `## 2. 后续新增` 一并吃掉了 ——
+表格行还在、标题没了。**编辑长文档时用「下一节标题」当锚点, 必须确认
+`replace_all=false` 唯一命中, 否则旧内容会被静默吃掉。** 已补回。
+
+---
+
+## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
 |---|---|---|
@@ -1429,6 +1501,8 @@ while executing migration 1: error returned from database: trigger ...
 | CI 两个 job **不设 `IM_POSTGRES_URL`** | 只有 `DATABASE_URL`, 而 `im-migrate` 的 e2e 找不到变量就 `return` —— 静默跳过, 「跑过」与「没跑」从输出上无法区分 | ✅ **已修** (2026-10-03): `test-unit` / `test-integration` 均补 `IM_POSTGRES_URL`。**根治仍待 D-4**: im-gateway 那 26 个 e2e 的同类问题未动(见上表 §1.15 行) |
 | **Dockerfile 无法在本机构建验证** | 2026-10-03 实测: BuildKit 成功加载并解析 `Dockerfile`(语法有效), 但拉 `rust:1.98.1-slim-bookworm` 报 `registry-1.docker.io ... EOF` —— 与 GitHub 同一个代理问题, 且本地无 `rust:*` 缓存 | 与「推送本地 commit」同一个阻塞源: **本地代理掐断外网 registry**。代理恢复后跑 `docker build -t im1.0-im-gateway:local .` 即可验证。**本条不声称镜像可用** —— 只声称 Dockerfile 语法有效。见 §1.17 |
 | **`NatsEventPublisher` 是静默 no-op** (D-3) | `publish()` 只发一条 `debug!`(默认不可见)并返回 `Ok(())` —— 每条 `im.message.{created,recalled,deleted}` 都被丢弃, 而 aux-04 §B.4「publish 事件供其他 pod 同步」这条**不变量**从未被满足。返回值/日志/指标三条渠道都指向「正常」 | 2026-10-03 **已改为可见**: `warn!` 每次 + `/metrics` 暴露 `im_events_dropped_total`。**D-3 本身仍未实装** —— 需可连的 NATS server 才能测(依赖 Docker Hub 恢复)。见 §1.19 |
+| **WS 端点路径 `/ws` vs `/v1/ws`, 文档自相矛盾** | `aux-13` 的 wscat 样例与 `Observability.md §1.1.3` 写 `/ws`; `ImplementationSpec §3.2`、`138-dev-plan.md`、`ws/router.rs` 写 `/v1/ws`。**双层 scope 导致的 `/v1/ws/ws` 已修**(那两边都不是), 但这两者之间该选哪个仍未定 | **需规范所有者裁决**。本次按代码既有意图 + 仓内 REST 全在 `/v1` 下的惯例取 `/v1/ws`; 改判为 `/ws` 只需改 `ws/router.rs` 一行。见 §1.22 |
+| im-gateway 26 个 e2e 仍**静默跳过** | `IM_REQUIRE_PG` 只覆盖新增的 WS 用例。既有 26 个 e2e 沿用 `else { return }`, CI 里**已经设了 PG service container**, 故当前不会静默; 但本机无 PG 时仍会「跳过并报通过」 | 建议把这 26 个也切到 `IM_REQUIRE_PG` 同一套机制(机械改动, 无语义风险)。未擅自批量改 —— 见 §1.15 / §1.22 |
 
 ### 1.16 friends / media / me 共 8 个端点: 5 个已实装, 3 个卡在规范矛盾或缺基础设施 (2026-10-03)
 
@@ -1587,6 +1661,6 @@ G-1 / V1 (多租户隔离)
 
 ---
 
-**维护**: 本表为快照, 记录于 dev @ `44118b6` + 本次未提交改动 (2026-10-03)。
+**维护**: 本表为快照, 记录于 dev @ `a0e72f9` + 本次未提交改动 (2026-10-03)。
 缺口被接线后请同步勾除本文档与代码注释两侧, 避免再次出现
 「代码引用台账但台账不存在」或「台账有项但代码已删」的双向漂移。

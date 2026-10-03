@@ -137,5 +137,21 @@ pub fn configure(cfg: &mut web::ServiceConfig) {
     );
 
     // WebSocket (C-11 driver) — MVP Day 4 实装
-    cfg.service(actix_web::web::scope("/ws").configure(crate::ws::router::configure));
+    //
+    // 2026-10-03 修正: 原先是 `cfg.service(scope("/ws").configure(ws::router::configure))`,
+    // 而 `ws::router::configure` 内部**已经自带** `scope("/ws")`。actix 的 scope
+    // 是**嵌套**的(前缀逐层相加, 不合并), 于是实际路径变成 `/v1/ws/ws` ——
+    // `ws/router.rs` 自己的文档与 `138-dev-plan.md` 都写的是 `/v1/ws`, 两者
+    // 都不是。按规范接的客户端**根本连不上**, 且因全仓无任何测试真的发起一次
+    // WS 连接而一直无人发现。
+    //
+    // 路径的定义权归 `ws::router`(它自带 scope 且文档写明 `/v1/ws`), 这里
+    // **直接调用**而不再包一层。
+    //
+    // 注: 文档对 WS 路径本身有分歧 —— `aux-13` 的 wscat 样例与
+    // `Observability.md §1.1.3` 写 `/ws`, `ImplementationSpec §3.2` 与
+    // `138-dev-plan` 写 `/v1/ws`。此处按**代码既有意图 + 仓内 REST 全在 `/v1`
+    // 下**的惯例取 `/v1/ws`; 若规范所有者定案为 `/ws`, 改 `ws/router.rs` 一行
+    // 即可。记在 docs/gap-ledger.md §1.22。
+    crate::ws::router::configure(cfg);
 }

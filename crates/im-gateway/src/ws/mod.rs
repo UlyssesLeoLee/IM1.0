@@ -15,3 +15,6 @@ pub mod heartbeat;
 pub mod hub;
 pub mod router;
 pub mod session;
+
+#[cfg(test)]
+mod e2e;
