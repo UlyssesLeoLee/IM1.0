@@ -96,8 +96,12 @@ fn migrator_parses_all_six_files() {
 
 #[test]
 fn expected_14_tables_referenced_in_sql() {
-    // 静态检查: 14 张表名在 6 份 SQL 中能找到 (create 计数 + 注释 + FK 引用)
-    // 实际执行由 testcontainers 版本负责
+    // 静态检查: 14 张表名在 7 份 SQL 中能找到 (create 计数 + 注释 + FK 引用)
+    //
+    // 真 PG 上的实际执行**不由本文件负责**, 也不由 testcontainers 负责 ——
+    // 2026-10-04 已确认 testcontainers 是全仓无代码引用的死依赖并被删除
+    // (见 docs/gap-ledger.md §1.23)。执行者是同目录的 `migration_smoke_pg.rs`
+    // (查 information_schema / pg_indexes) 与 `im-migrate` 的 e2e。
     let mut all_sql = String::new();
     for entry in fs::read_dir(MIGRATIONS_DIR).expect("read migrations/") {
         let entry = entry.expect("dir entry");

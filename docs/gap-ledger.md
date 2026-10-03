@@ -1509,6 +1509,94 @@ target 目录锁, 与新起的 `cargo` 互相阻塞, 表现为「Compiling 挂�
 手动清掉 `cargo`/`rustc`/`link`(按 `Path` 过滤, 避免误杀其他项目的编译)
 之后才恢复。
 
+### 1.23 `cargo audit` 长期红且**没人处理** —— 一个永远红的门禁等于没有门禁 (2026-10-04 已修)
+
+CI 的 `cargo audit` 从建仓起一直红。它和其它红门禁的区别在于: **其它门禁红会
+被人看见, 而这一条红得足够久之后就成了背景噪音。** 本次修完: `cargo audit`
+**exit 0**。
+
+守则写进 `.cargo/audit.toml` 顶部(规则比这次的具体修复更重要):
+**能修的一律修, 不靠豁免; 只对「无修复版本 + 有可验证的不可达理由」的项写豁免,
+且必须写明重新评估的触发条件。**
+
+#### 直接修掉三项(不在 `ignore` 列表里)
+
+| Advisory | 包 | 处置 |
+|---|---|---|
+| RUSTSEC-2026-0285 | rustls 0.23.43 | TLS 1.3 跨加密层级边界错误接受握手消息 → 升 **0.23.45** |
+| RUSTSEC-2025-0111 | tokio-tar 0.3.1 | PAX 头解析错误 → 文件偷渡; **无修复版本**, 改从依赖树里**消除** |
+| RUSTSEC-2025-0134 | rustls-pemfile | unmaintained; 随 testcontainers 一并从树里消失 |
+
+**rustls 那项在生产树上, 不是 dev-only**: 路径是
+`tokio-rustls ← async-nats 0.50.0 ← im-core ← im-gateway`, 故必须修。
+
+**tokio-tar 的根因不是「版本太老」, 而是一个全仓无代码引用的死依赖。**
+已用 grep 实证: `testcontainers` / `bollard` 在**任何 `.rs` 文件里都没有真实
+引用**, 只出现在注释与文档(`ImplementationSpec.md` 规定用它、
+`migration_smoke.rs` 的注释说「实际执行由 testcontainers 版本负责」)。
+它把 `bollard → tokio-tar` 整条树拉进来, 自己却从不被调用。
+
+故处置是**删除依赖声明**而非「声明可接受」—— 依赖树从 **492 降到 439 crates**,
+漏洞从图里消失。**一个从未被调用的依赖不该出现在审计报告里**, 让它留在
+`ignore` 里等于把「我们不需要它」伪装成「我们接受它的漏洞」。
+
+#### 唯一豁免项: h2 RUSTSEC-2026-0258, 且**前提被机器守住**
+
+h2 0.3.27 **已是 0.3 线的最后一个版本**, 没有 0.3.x 修复版。修复版 0.4.16+
+属于 0.4 大版本线, 而 0.3.27 是被 `actix-http 3.13.3` 锁死的 —— 拿到 0.4.x
+就得升到 actix-http 4 / actix-web 5, 那是 Web 框架的**大版本迁移**,
+与「打一个安全补丁」完全不是一回事(需单独排期、单独评审)。
+
+不可达理由是**结构性的, 不是「我们觉得没事」**: h2 只在 TLS/ALPN 协商出 HTTP/2
+时才被使用, 而网关 `main.rs:251` 是 `.bind(("0.0.0.0", http_port))` ——
+**明文 HTTP, 不做 TLS 终止**; `deploy/k3s/dev/im-gateway.yaml` 也只有 8080
+明文端口、无 443。TLS 由上游 envoy 终止, envoy 与网关之间是明文 HTTP/1.1,
+**h2 的代码路径根本不会被协商到**。
+
+#### 关键做法: 豁免的**前提**必须被机器守住, 而不是只写在注释里
+
+上面那条「不做 TLS 终止」写在注释里, 而**注释不会因为代码变化而失效**。
+有人某天给网关加上 `bind_rustls`(完全合理的需求 —— 比如让网关直接对外),
+注释仍写着「不做 TLS 终止」而暴露面已经变了; 豁免会在**没人察觉**的情况下
+变成一个错误的安全假设。
+
+故新建 `crates/im-gateway/tests/audit_precondition.rs`, 把前提做成断言:
+`gateway_does_not_terminate_tls_so_h2_is_unreachable` 断言 `main.rs` 里不出现
+`bind_rustls` / `bind_openssl` / `bind_ssl` / `.rustls(` / `.openssl(`; 命中即
+FAILED, 失败信息直接给出二选一(撤豁免并排期 actix-web 5 迁移 / 或去掉误加的
+TLS 终止), 并明写「**别只是把本测试改回通过 —— 那是把安全假设藏起来**」。
+另配反向锁定 `gateway_binds_plain_http_on_its_configured_port`, 在绑定方式被
+大改时给出提示。
+
+#### 验证
+
+- `cargo audit` **exit 0**: **439 crates、0 漏洞**、1 条 allowed warning
+  (`chacha20 0.10.1` yanked —— 被作者撤回过的版本, 不等于有漏洞, 故记在
+  `[yanked]` 而非 `ignore`)。
+- **守卫测试有判别力, 用变异验证证明**: 向 `main.rs` 注入 `bind_rustls` 标记后,
+  两条守卫测试均 **FAILED**(exit 101); 验证完已还原, `git diff` 为空、无探针
+  残留。**绿灯只证明「没报错」, 判别力只能靠故意注入缺陷证明。**
+- 守卫测试第一版在**干净代码上就是红的**: 路径写成了相对路径
+  `crates/im-gateway/src/main.rs`, 而 cargo 跑集成测试时 CWD 是**包根**
+  `crates/im-gateway/`。**一个永远失败的守卫比没有守卫更糟** —— 它会让人慢慢
+  习惯「这测试本来就是红的」。已改用 `CARGO_MANIFEST_DIR` 拼绝对路径。
+
+#### 顺带修掉三处因本次改动而**说谎**的注释
+
+删除 testcontainers 之后, 有三处注释开始描述一个不存在的执行者。这类过时比
+缺注释更坏 —— **它会让人以为某件事由别人负责**:
+
+1. `migration_smoke.rs:100`「实际执行由 testcontainers 版本负责」→ 实改为同目录
+   `migration_smoke_pg.rs` + `im-migrate` e2e(覆盖并未丢失, 只是**指错了人**)。
+2. 同文件 `:99`「14 张表名在 **6** 份 SQL 中」→ 实为 **7** 份
+   (`migrations/0001..0007`; 同文件 `:84` 自己的断言已经是 7)。
+3. `migration_smoke_pg.rs` 顶部仍写 CI「已用 `sqlx migrate run` 建库」→ §1.21
+   已改为仓内 `im-migrate`; 同时该注释只说「未设 `DATABASE_URL` 则跳过」,
+   漏了 `IM_REQUIRE_PG=1` 会把跳过变成**硬失败**。
+
+**判别式**: 删依赖 / 改配置后, grep 一遍被删符号的名字 —— 注释和文档里的
+「幽灵引用」不会有编译错误, 只会静静地指向空气。
+
 ---
 
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)

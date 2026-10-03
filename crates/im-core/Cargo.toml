@@ -56,8 +56,16 @@ figment = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
-testcontainers = { workspace = true }
-testcontainers-modules = { workspace = true }
+# 2026-10-03 移除 testcontainers / testcontainers-modules。
+#
+# 两者**全仓无任何 Rust 代码引用** —— 唯一的提及是两处注释明说「不需要
+# testcontainers」(`im-gateway/tests/migration_smoke_pg.rs:12` 与
+# `migration_smoke.rs:100`)。也就是说它们是纯死依赖, 唯一的作用是把
+# `tokio-tar 0.3.1` 拖进依赖树, 而后者带一条**无修复版本**的漏洞:
+# RUSTSEC-2025-0111(PAX 扩展头解析错误 -> 文件偷渡)。
+#
+# `cargo audit` 因此永远红, 而唯一的「修法」是加豁免。删掉死依赖比写豁免
+# 更干净: 漏洞**从依赖树里消失**, 而不是被声明为可接受。
 mockall = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

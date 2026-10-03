@@ -1,0 +1,47 @@
+# cargo-audit 配置
+#
+# 2026-10-03 新增。此前 CI 的 `cargo audit` 长期红, 且**没人处理** ——
+# 一个永远红的门禁等于没有门禁(人会开始习惯性地忽略它)。
+#
+# 原则: 能**修**的一律修, 不靠豁免; 只对「无修复版本 + 有可验证的不可达
+# 理由」的项写豁免, 且必须写明**重新评估的触发条件**。
+# 本文件里 2026-10-03 已直接修掉的三项(不在下面的 ignore 列表里):
+#   - RUSTSEC-2026-0285 rustls 0.23.43 TLS 1.3 跨加密层级边界错误接受握手消息
+#       -> 升到 0.23.45。**它在生产树里**(tokio-rustls <- async-nats <- im-gateway),
+#          不是 dev-only, 必须修。
+#   - RUSTSEC-2025-0111 tokio-tar 0.3.1 PAX 头解析错误 -> 文件偷渡
+#       -> **无修复版本**。但根因是 testcontainers 这个**全仓无代码引用的死依赖**,
+#          已直接删除(连同 bollard), 漏洞从依赖树消失, 而不是被声明可接受。
+#   - RUSTSEC-2025-0134 rustls-pemfile unmaintained
+#       -> 随 testcontainers 一并从树里消失。
+
+[advisories]
+# h2: "unbounded empty DATA frames" (RUSTSEC-2026-0258, 修复需 >= 0.4.16)
+#
+# 为什么只能豁免而不能修:
+#   h2 0.3.27 **已是 0.3 线的最后一个版本**, 没有 0.3.x 的修复版。
+#   修复版 0.4.16+ 属于 h2 0.4 大版本线, 而 0.3.27 是被
+#   `actix-http 3.13.3` 锁定的 —— 要拿到 0.4.x 就得升到
+#   actix-http 4 / actix-web 5, 那是 Web 框架的**大版本迁移**,
+#   与「打一个安全补丁」完全不是一回事(要单独排期、单独评审)。
+#
+# 为什么风险在当前部署下不可达(而不是「我们觉得没事」):
+#   h2 只在 TLS/ALPN 协商出 HTTP/2 时才被使用。本仓网关
+#   `main.rs:251` 是 `.bind(("0.0.0.0", http_port))` —— **明文 HTTP, 不做
+#   TLS 终止**(无 `bind_rustls`), `deploy/k3s/dev/im-gateway.yaml` 也只有
+#   8080 明文端口、无 443。TLS 由上游 envoy 终止, envoy 与网关之间是
+#   明文 HTTP/1.1, h2 的代码路径**根本不会被协商到**。
+#
+# **重新评估的触发条件(任一成立就必须撤掉这条豁免并排期修)**:
+#   1. 网关开始自己做 TLS 终止(出现 `bind_rustls` / `bind_openssl`);
+#   2. envoy->网关 这一段改成 h2c / HTTP/2 上游;
+#   3. 升到 actix-web 5 / actix-http 4。
+# 上述条件由测试强制看守: `crates/im-gateway/tests/audit_precondition.rs`
+# 断言 main.rs 里**不出现** TLS 绑定 —— 一旦有人加了 TLS 终止, 测试先红,
+# 提醒他回来处理这条豁免。
+ignore = ["RUSTSEC-2026-0258"]
+
+[yanked]
+# chacha20 0.10.1 是 yanked: 传递依赖, 由谁拉进来的会随升级变化, 我们不直接
+# 依赖它, 也没有可控的修复入口。记为允许(yanked 不等于有漏洞, 只是被作者
+# 撤回过的版本)。不写进 `ignore` 是因为它在 `[yanked]` 而不是漏洞。

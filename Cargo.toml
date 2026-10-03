@@ -127,8 +127,9 @@ parking_lot = "0.12"
 # 故直接移除依赖,不替换 (未来 V1+ 若需并发 map 选 parking_lot::Mutex<HashMap>)
 
 # ---- 测试 ----
-testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["postgres", "redis"] }
+# 2026-10-03 移除 testcontainers / testcontainers-modules: 无任何代码引用,
+# 却把带无修复漏洞(RUSTSEC-2025-0111)的 tokio-tar 拖进树里。详见
+# crates/im-core/Cargo.toml 同名注释。
 proptest = "1"
 mockall = "0.13"
 criterion = { version = "0.5", features = ["html_reports"] }

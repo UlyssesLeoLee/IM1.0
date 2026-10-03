@@ -10,13 +10,21 @@
 //! 设计: **不引入新依赖**。`im-gateway` 的 dev-dependencies 已含
 //!       `sqlx`(含 `migrate` feature), 直接用 `PgPool` 查询 `information_schema`
 //!       / `pg_indexes` 断言真实 schema, 不需要 testcontainers。
+//!       (2026-10-04: testcontainers 已作为**全仓无代码引用的死依赖**被删除,
+//!        见 docs/gap-ledger.md §1.23 —— 本文件从未依赖过它, 不是这次移除
+//!        的受害者。)
 //!
 //! 环境:
 //!   - 设 `DATABASE_URL` 指向**已应用 migration** 的 PG → 跑真实断言
 //!   - 未设 `DATABASE_URL` → 打印提示并**跳过**(不算失败), 保证无 PG 的
 //!     开发机 / 沙箱跑 `cargo test --workspace` 仍然全绿。
-//!   - CI: `.github/workflows/ci.yml` 的 test-integration job 已用
-//!     `sqlx migrate run` 建好 postgres:18.6 并注入 `DATABASE_URL`, 会自动生效。
+//!   - **`IM_REQUIRE_PG=1` 时「跳过」改为硬失败**: 本机没 PG 时跳过是合理的,
+//!     但 CI 明确挂了 PG service container, 此时跳过意味着 job 配错了 —— 而
+//!     「跳过」在 test harness 里就是「通过」, 配置错误会以绿灯的形式混过去。
+//!   - CI: `.github/workflows/ci.yml` 的 test-integration / test-unit 两个 job
+//!     均设 `DATABASE_URL` + `IM_POSTGRES_URL` + `IM_REQUIRE_PG=1`; 建库用
+//!     **仓内 `im-migrate`**(2026-10-03 起不再是 `sqlx migrate run` ——
+//!     CI 必须跑我们真正要部署的那段代码, 见 §1.21)。
 //!
 //! 覆盖:
 //!   1. 14 张表在真 PG 中确实存在
