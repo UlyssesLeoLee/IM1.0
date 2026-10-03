@@ -1190,6 +1190,68 @@ right: 503`。
 
 ---
 
+### 1.19 事件总线是**静默 no-op** —— 每条领域事件都被丢弃, 而系统看起来完全正常 (2026-10-03 已改为可见)
+
+做了一次全仓空转普查(搜 `todo!` / `unimplemented!` / `占位` / `placeholder` /
+`not yet implemented`), 大部分命中都已入台账且属有意保留。**唯一一条不在册的**
+是这个。
+
+#### 问题
+
+`NatsEventPublisher::publish()` 的完整实现是:
+
+```rust
+tracing::debug!(topic, bytes = payload.len(), "NatsEventPublisher.publish (stub)");
+Ok(())
+```
+
+`MessageService` 在 `send_message` / `recall_message` 之后都调它, 于是
+`im.message.created` / `im.message.recalled` / `im.message.deleted`
+**全部被丢弃**。而 aux-04 §B.4 转换表把「publish 事件供其他 pod 同步」
+写成**不变量** —— 这条不变量从未被满足。
+
+**为什么说它比报错更糟**: 三个渠道都指向「正常」——
+1. 返回值是 `Ok(())`, 调用方的错误处理分支永不进入;
+2. 日志级别是 `debug`, **默认不可见**;
+3. `/metrics` 里没有任何相关指标。
+
+于是「跨 pod 事件同步根本没工作」这件事, 在整个运行期**没有任何外部表征**。
+读代码的人(`self.events.publish(topic, &payload).await` + `Ok(())`)会以为事件
+发出去了。这与 §1.11 记的 `SettingsService` 恒返 120s 是同一族问题:
+**代码读起来是合规的, 实际什么都不做**。
+
+#### 修法: 不改语义, 改**可见性**
+
+**没有**实装真 NATS —— 拉不到 `nats:*` 镜像(代理掐断 Docker Hub), 写一份
+无法测试的实现比留 stub 更糟。**也没有**改启动语义(让网关硬依赖 NATS 属于
+部署决策, 不由实现方拍板)。
+
+改的是让这个沉默**变成事实而不是意外**:
+
+| 之前 | 现在 |
+|---|---|
+| `debug!` 一行 | `warn!` 每次(默认级别可见), 带 `dropped_total` |
+| 无指标 | `/metrics` 暴露 `im_events_dropped_total` counter |
+| `connect()` 静默 | `connect()` 发一条 `warn!`, 明确声明「事件会被丢弃」 |
+| 无 | 模块文档说明「**不声称事件已发出**」 |
+
+面板上把 `rate(im_events_dropped_total[5m])` 画出来, 应当恒为 0; D-3 接线后它
+归零, 之后任何非 0 都是真丢事件。
+
+#### 变异验证
+
+把 `EVENTS_DROPPED.fetch_add(1, ..)` 改成不累加(即恢复原 no-op 行为):
+`metrics_expose_the_dropped_event_counter` 立刻变红, 报 `left: 0, right: 1`。
+该用例同时锁住两件容易漏的事: ① 计数真的在累加; ② 计数真的被挂到了
+`/metrics` 上(加了计数器却忘了暴露, 是同一种静默)。
+
+#### D-3 本身仍未实装
+
+真 NATS 连接 + `async_nats` publish 需要一个可连的 NATS server 才能测。
+依赖 Docker Hub 恢复。WBS D-3 状态不变。
+
+---
+
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
@@ -1211,6 +1273,7 @@ right: 503`。
 | `POST /v1/media/presign` / `GET /v1/media/{id}` **无对象存储** | aux-13 §3.6 请求/响应样例齐全、proto 也有 message, 但预签名 URL 只能由真实 MinIO/S3 签发; 仓库无 media 模块、无 media 表、无对象存储配置。aux-06 line 442 亦写明「V1+ 实装」 | 依赖对象存储基础设施落地。返 mock URL 比不实现**更糟**(客户端拿着签不出东西的 URL 去 PUT, 失败难以诊断), 故不实装。即 WBS **G-2**, 状态 `Blocked` 等 **H-6**。见 §1.16 |
 | `deploy/k3s/dev/migrate-job.yaml` 引用**无法构建**的镜像 | 清单跑 `ghcr.io/yourorg/im1.0-im-migrate:latest` 执行 `sqlx migrate run`, 但仓内**没有** migrate 二进制, 也没有任何东西能构建该镜像 | 需加 migrate 目标(新 bin, 或改用 `sqlx/sqlx-cli` 基础镜像 + 挂 `migrations/`)。本次未做: 它不影响「gateway 起不来」这个已修的问题。见 §1.17 |
 | **Dockerfile 无法在本机构建验证** | 2026-10-03 实测: BuildKit 成功加载并解析 `Dockerfile`(语法有效), 但拉 `rust:1.98.1-slim-bookworm` 报 `registry-1.docker.io ... EOF` —— 与 GitHub 同一个代理问题, 且本地无 `rust:*` 缓存 | 与「推送本地 commit」同一个阻塞源: **本地代理掐断外网 registry**。代理恢复后跑 `docker build -t im1.0-im-gateway:local .` 即可验证。**本条不声称镜像可用** —— 只声称 Dockerfile 语法有效。见 §1.17 |
+| **`NatsEventPublisher` 是静默 no-op** (D-3) | `publish()` 只发一条 `debug!`(默认不可见)并返回 `Ok(())` —— 每条 `im.message.{created,recalled,deleted}` 都被丢弃, 而 aux-04 §B.4「publish 事件供其他 pod 同步」这条**不变量**从未被满足。返回值/日志/指标三条渠道都指向「正常」 | 2026-10-03 **已改为可见**: `warn!` 每次 + `/metrics` 暴露 `im_events_dropped_total`。**D-3 本身仍未实装** —— 需可连的 NATS server 才能测(依赖 Docker Hub 恢复)。见 §1.19 |
 
 ### 1.16 friends / media / me 共 8 个端点: 5 个已实装, 3 个卡在规范矛盾或缺基础设施 (2026-10-03)
 

@@ -87,7 +87,7 @@ pub async fn readyz(pool: web::Data<sqlx::PgPool>) -> HttpResponse {
     }
 }
 
-/// Prometheus 指标(MVP 占位)
+/// Prometheus 指标(MVP: 手工暴露, 未接 prometheus exporter)
 pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpResponse {
     // 广播订阅数是本进程**唯一**能立刻回答的运营问题(WS 到底连上了几个),
     // 且它就挂在 `WsHub` 上, 不需要额外的指标框架即可暴露。
@@ -96,13 +96,29 @@ pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpRe
     // subscribe 了), 所以这个值略大于「在线用户数」—— 排查时以
     // `ws::hub::Audience` 过滤后的实际投递为准。
     let subs = hub.subscriber_count();
+
+    // 被丢弃的领域事件数 (D-3)。
+    //
+    // 2026-10-03 新增。这个指标的意义不是「监控一个正常运行的指标」, 而是
+    // **让一个架构性缺口可见**: `NatsEventPublisher` 仍是 stub, 每条
+    // `im.message.{created,recalled,deleted}` 都被丢弃。若这个数持续增长,
+    // 就说明「跨 pod 事件同步」根本没在工作 —— 而从日志或返回值上完全看不出来
+    // (stub 返回 `Ok(())`, 日志级别是默认不可见的 `debug`)。
+    //
+    // 面板上把 `rate(im_events_dropped_total[5m])` 画出来, 应当恒为 0;
+    // 一旦 D-3 接线, 它会归零, 且之后任何非 0 都意味着真丢事件了。
+    let dropped = im_core::event::publisher::dropped_event_count();
+
     HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4")
         .body(format!(
             "# MVP: prometheus exporter not yet enabled (set IM_PROMETHEUS_BIND to enable)\n\
              # HELP im_ws_broadcast_subscriptions 已订阅 WS 广播的连接数\n\
              # TYPE im_ws_broadcast_subscriptions gauge\n\
-             im_ws_broadcast_subscriptions {subs}\n"
+             im_ws_broadcast_subscriptions {subs}\n\
+             # HELP im_events_dropped_total 因 D-3 stub 被丢弃的领域事件数(实现 NATS 后应恒为 0)\n\
+             # TYPE im_events_dropped_total counter\n\
+             im_events_dropped_total {dropped}\n"
         ))
 }
 
@@ -195,6 +211,56 @@ mod tests {
             "PG 探测上界({:?})必须 < k8s 探针默认 timeoutSeconds(1s), \
              否则依赖抖动会变成 CrashLoop",
             PG_PING_TIMEOUT
+        );
+    }
+
+    /// D-3 缺口必须**在 `/metrics` 里看得见**, 而不是只躺在日志里。
+    ///
+    /// 先 publish 一次把计数推上去, 再断言 `/metrics` 文本里出现了它。
+    /// 锁住两件事: ① `publish()` 确实在计数(没被悄悄改回 no-op);
+    /// ② 计数真的被暴露了(加了计数器却忘了挂到指标上, 是同一种静默)。
+    #[actix_web::test]
+    async fn metrics_expose_the_dropped_event_counter() {
+        use im_core::event::publisher::{EventPublisher, NatsEventPublisher};
+
+        let before = im_core::event::publisher::dropped_event_count();
+        let pubr = NatsEventPublisher::connect("nats://stub:4222")
+            .await
+            .expect("stub publisher 不会失败");
+        pubr.publish("im.message.created", b"{\"probe\":1}")
+            .await
+            .expect("stub 返回 Ok");
+        assert_eq!(
+            im_core::event::publisher::dropped_event_count(),
+            before + 1,
+            "stub publish 必须让丢弃计数 +1"
+        );
+
+        let app = actix_web::test::init_service(
+            actix_web::App::new()
+                .app_data(web::Data::new(crate::ws::hub::WsHub::new()))
+                .route("/metrics", web::get().to(metrics)),
+        )
+        .await;
+        let resp = actix_web::test::call_service(
+            &app,
+            actix_web::test::TestRequest::get()
+                .uri("/metrics")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
+        let bytes = actix_web::test::read_body(resp).await;
+        let text = String::from_utf8(bytes.to_vec()).expect("utf8");
+
+        assert!(
+            text.contains("im_events_dropped_total"),
+            "/metrics 必须暴露丢弃计数, 否则 D-3 缺口继续隐身: {text}"
+        );
+        assert!(
+            text.contains(&format!("im_events_dropped_total {}", before + 1)),
+            "指标值必须是真实计数({}), 而非占位: {text}",
+            before + 1
         );
     }
 }
