@@ -25,10 +25,21 @@ spec:
               done
       containers:
         - name: migrate
+          # 2026-10-03: 此前引用的镜像**没有任何东西能构建它**(仓内无 migrate
+          # 二进制、无 CI build job), 也没有任何测试跑过迁移。
+          # 现由 `crates/im-migrate` 提供: `sqlx::migrate!` 把 SQL **编译期内嵌**
+          # 进二进制 —— 镜像只有一个文件, 且它携带的迁移与编译它的代码必然同版本。
+          # 详见 docs/gap-ledger.md §1.20。
           image: ghcr.io/yourorg/im1.0-im-migrate:latest
-          command: ["sqlx", "migrate", "run"]
+          # 不用 `command: ["sqlx", "migrate", "run"]`: 那要求镜像里装 sqlx CLI,
+          # 于是 SQL 与 CLI 都得挂进容器, 版本对应关系就断了。
+          command: ["/app/im-migrate"]
           env:
-            - name: IM_DATABASE_URL
+            # 变量名与 im_common::config::AppConfig::postgres_url 一致, 不是
+            # sqlx CLI 惯用的 DATABASE_URL —— 整个仓的配置读取都走
+            # IM_<UPPER_SNAKE> 规则, 迁移工具没有理由成为例外。
+            # (此前写的 `IM_DATABASE_URL` 同样对不上, 已更正。)
+            - name: IM_POSTGRES_URL
               valueFrom:
                 secretKeyRef:
                   name: im-core-env

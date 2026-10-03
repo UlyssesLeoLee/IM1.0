@@ -1,0 +1,24 @@
+[package]
+name = "im-migrate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "IM1.0 数据库迁移执行器 —— 编译期内嵌 migrations/, 无需 sqlx CLI"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[[bin]]
+name = "im-migrate"
+path = "src/main.rs"
+
+[dependencies]
+im-common = { workspace = true }
+sqlx = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

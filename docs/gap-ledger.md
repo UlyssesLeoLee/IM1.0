@@ -1252,6 +1252,76 @@ Ok(())
 
 ---
 
+### 1.20 仓内**没有任何代码能应用迁移** —— 7 份 SQL 从未由本仓的代码执行过 (2026-10-03 已修)
+
+`deploy/k3s/dev/migrate-job.yaml` 引用 `im1.0-im-migrate:latest` 执行
+`sqlx migrate run`, 但**没有任何东西能构建那个镜像**(无 migrate 二进制、
+无 CI build job)。凑合的办法是换 `sqlx/sqlx-cli` 基础镜像并挂载
+`migrations/` —— 那等于把 schema 版本与镜像版本拆开, 于是会出现
+「镜像里的 SQL 比镜像里的代码旧」这种最难排查的状态。
+
+#### 顺带暴露的一件没人提过的事
+
+`crates/im-gateway/tests/migration_smoke_pg.rs` 是**查 schema** 的测试, 它
+要求 `DATABASE_URL` 指向一个「**已应用迁移**」的库 —— 谁应用的、什么时候应用
+的, 它一概不问。
+
+也就是说: 那条测试能证明「schema 是对的」, 但**证明不了「我们的代码能把它
+变成对的」**。7 份 migration 在本仓的历史上从未被仓内代码在任何环境执行过;
+它们「看起来是对的」是因为有人(某次手工操作)在某个库上跑过, 之后的测试都复用
+那个已建好的库。
+
+#### 修法: `sqlx::migrate!` 编译期内嵌
+
+新增 `crates/im-migrate`(bin + lib):
+
+- `sqlx::migrate!("../../migrations")` 把 7 份 SQL **编译期内嵌进二进制**。
+  多一份文件、或者改了 SQL 忘记重建镜像, 都会在**构建期**炸, 而不是上线后
+  行为诡异地不一致。
+- 走 `run()` 而非 `run_direct()`: 后者不写 `_sqlx_migrations` 表, 于是无法
+  判断哪些已应用, 重复跑会撞约束。
+- 环境变量用 `IM_POSTGRES_URL` 而非 sqlx CLI 惯例的 `DATABASE_URL` —— 整个仓
+  的配置读取都走 `IM_<UPPER_SNAKE>`(`AppConfig`), 迁移工具没有理由成为例外。
+  顺带更正: `migrate-job.yaml` 原先写的 `IM_DATABASE_URL` **同样对不上**。
+- `Dockerfile` 加 `--target migrate`, **复用同一个 runtime stage** 只换
+  ENTRYPOINT, 于是两个镜像的 OS / CA / 用户必然一致。
+
+#### 新增的真实验证(本项目第一次)
+
+`crates/im-migrate/tests/migrations_e2e.rs`: 建一个**全新的空库** → 跑全部
+7 份迁移 → 断言 14 张表建成 / 0007 的两列与两条索引都在 / 历史表 7 条全 success
+→ **再跑一次验证幂等** → 无条件 `DROP DATABASE` 清理。
+
+「重跑必须幂等」这条不是凑数: 迁移 Job 的 `backoffLimit: 3` 意味着它会被反复
+触发, 不幂等就会在重试里撞约束 —— 那正是「Job 永远失败」的经典原因。
+
+#### 三处自己写错的, 都被测试/工具当场抓住
+
+1. `with_database` 手搓 URL 解析**漏掉路径分隔符**, 拼出
+   `postgres://im:im@localhost:5544probe`, 而 sqlx 报的错是
+   `invalid port number` —— 错误信息与真正原因毫无关联。修法: 抽成纯函数
+   `im_migrate::with_database` **并配单测**, 不靠连库才发现。
+2. sqlx 0.9 对非字面量 SQL 有**编译期拒绝**, 连 `raw_sql` 也要
+   `AssertSqlSafe` 显式豁免(书面承诺「我审计过」)。DDL 的库名不能是绑定参数,
+   所以拼接无法避免 —— 于是紧挨着写一条白名单断言, 让「审计」是可执行的。
+3. `migrator_embeds_all_seven_migrations` 锁住「7 份 + 版本连续」, 免得将来加了
+   第 8 份却没人更新文档里的「7/7」表述。
+
+#### 顺带拿到代理问题的**精确根因**
+
+跑 `docker build` 时报错比之前信息量大得多:
+
+    failed to fetch oauth token: Post "https://auth.docker.io/token":
+    proxyconnect tcp: dial tcp 127.0.0.1:7897: connectex:
+    No connection could be made because the target machine actively refused it
+
+即: Docker 被配置为走 `127.0.0.1:7897` 的本地代理, 而**那个代理进程没在运行**
+(主动拒绝 = 端口上没有监听)。这比「外网被掐断」具体得多 —— 要么把代理起起来,
+要么把 Docker 的代理配置摘掉。两个 target 的 Dockerfile **语法均已验证通过**
+(`load build definition ... DONE`), 但**实际构建仍未验证**。
+
+---
+
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
@@ -1271,7 +1341,7 @@ Ok(())
 | im-gateway 26 个 e2e 用例**连不上 PG 就静默通过** | 沿用 `auth_handlers` 约定 `let Some(p) = .. else { return }`。CI 若无 `DATABASE_URL`, 全部「跑过」与「没跑」**无法区分** —— 假绿灯向量 | 需 D-4 后在 CI 挂 PG service container; 或改「连不上即 fail」(会让无 PG 的本地全红, 属取舍, 未擅自改)。见 §1.15 |
 | `GET /v1/friends` **aux-13 与 proto 互相矛盾** | aux-13 说 `repeated Friend {user_id, display_name, state, since}`, proto 说 `repeated User`(带 `external_identity_json` / `environment_id`)。按 `User` 实装 = 把**每个人的外部身份**发给所有能列好友的人; 按 `Friend` 实装 = 要新增类型并改 proto。仓储层另缺 cursor 支持 | **需规范所有者裁决**。不擅自选边。见 §1.16 |
 | `POST /v1/media/presign` / `GET /v1/media/{id}` **无对象存储** | aux-13 §3.6 请求/响应样例齐全、proto 也有 message, 但预签名 URL 只能由真实 MinIO/S3 签发; 仓库无 media 模块、无 media 表、无对象存储配置。aux-06 line 442 亦写明「V1+ 实装」 | 依赖对象存储基础设施落地。返 mock URL 比不实现**更糟**(客户端拿着签不出东西的 URL 去 PUT, 失败难以诊断), 故不实装。即 WBS **G-2**, 状态 `Blocked` 等 **H-6**。见 §1.16 |
-| `deploy/k3s/dev/migrate-job.yaml` 引用**无法构建**的镜像 | 清单跑 `ghcr.io/yourorg/im1.0-im-migrate:latest` 执行 `sqlx migrate run`, 但仓内**没有** migrate 二进制, 也没有任何东西能构建该镜像 | 需加 migrate 目标(新 bin, 或改用 `sqlx/sqlx-cli` 基础镜像 + 挂 `migrations/`)。本次未做: 它不影响「gateway 起不来」这个已修的问题。见 §1.17 |
+| ~~`deploy/k3s/dev/migrate-job.yaml` 引用**无法构建**的镜像~~ | ~~清单跑 `ghcr.io/yourorg/im1.0-im-migrate:latest` 执行 `sqlx migrate run`, 但仓内**没有** migrate 二进制, 也没有任何东西能构建该镜像~~ | ✅ **已修** (2026-10-03): 新增 `crates/im-migrate`, 用 `sqlx::migrate!` 把 7 份 SQL **编译期内嵌**进二进制(schema 与代码必然同版本); 清单命令改为 `/app/im-migrate`、环境变量更正为 `IM_POSTGRES_URL`; Dockerfile 加 `--target migrate`。**并首次由仓内代码在全新空库上真跑一遍** + 验证重跑幂等。见 §1.20 |
 | **Dockerfile 无法在本机构建验证** | 2026-10-03 实测: BuildKit 成功加载并解析 `Dockerfile`(语法有效), 但拉 `rust:1.98.1-slim-bookworm` 报 `registry-1.docker.io ... EOF` —— 与 GitHub 同一个代理问题, 且本地无 `rust:*` 缓存 | 与「推送本地 commit」同一个阻塞源: **本地代理掐断外网 registry**。代理恢复后跑 `docker build -t im1.0-im-gateway:local .` 即可验证。**本条不声称镜像可用** —— 只声称 Dockerfile 语法有效。见 §1.17 |
 | **`NatsEventPublisher` 是静默 no-op** (D-3) | `publish()` 只发一条 `debug!`(默认不可见)并返回 `Ok(())` —— 每条 `im.message.{created,recalled,deleted}` 都被丢弃, 而 aux-04 §B.4「publish 事件供其他 pod 同步」这条**不变量**从未被满足。返回值/日志/指标三条渠道都指向「正常」 | 2026-10-03 **已改为可见**: `warn!` 每次 + `/metrics` 暴露 `im_events_dropped_total`。**D-3 本身仍未实装** —— 需可连的 NATS server 才能测(依赖 Docker Hub 恢复)。见 §1.19 |
 

@@ -7,6 +7,7 @@ members = [
     "crates/im-gateway",
     "crates/im-presence",
     "crates/im-media",
+    "crates/im-migrate",
     "crates/extension-runtime",
     "crates/im-testkit",
 ]

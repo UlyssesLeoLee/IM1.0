@@ -57,6 +57,7 @@ COPY crates/im-core/Cargo.toml         crates/im-core/
 COPY crates/im-gateway/Cargo.toml      crates/im-gateway/
 COPY crates/im-presence/Cargo.toml     crates/im-presence/
 COPY crates/im-media/Cargo.toml        crates/im-media/
+COPY crates/im-migrate/Cargo.toml     crates/im-migrate/
 COPY crates/extension-runtime/Cargo.toml crates/extension-runtime/
 COPY crates/im-testkit/Cargo.toml      crates/im-testkit/
 
@@ -73,6 +74,18 @@ RUN mkdir -p crates/im-gateway/src \
 COPY crates/ crates/
 RUN cargo build --release --locked -p im-gateway \
     && strip target/release/im-gateway
+
+# ── im-migrate: 编译期内嵌 migrations/, 产出 migrate job 用的镜像 ──
+#
+# 刻意**不用** `sqlx migrate run`(那要镜像里装 sqlx CLI + 挂 migrations/)。
+# 用 `sqlx::migrate!` 把 SQL 烤进二进制后: 镜像只有一个文件, 且它携带的 schema
+# 与编译它的代码**必然同版本** —— 杜绝「镜像里的 SQL 比代码旧」这种最难排查
+# 的状态。
+#
+# 构建它需要 `migrations/` 在构建上下文里, 故 .dockerignore 特意**没有**
+# 排除该目录(注释里已写明)。
+RUN cargo build --release --locked -p im-migrate \
+    && strip target/release/im-migrate
 
 # ============================================================================
 # Stage 2 — runtime
@@ -92,6 +105,10 @@ RUN groupadd --system --gid 10001 im \
 
 WORKDIR /app
 COPY --from=builder /build/target/release/im-gateway /app/im-gateway
+# 迁移二进制同层带出: 目标 `im-migrate` 镜像复用同一 runtime stage, 只换
+# ENTRYPOINT。这样两个镜像的运行时(OS / CA / 用户)必然一致, 不会出现
+# 「在 migrate 镜像上验证过、在 gateway 镜像上却不能正常工作」这类偏差。
+COPY --from=builder /build/target/release/im-migrate /app/im-migrate
 
 USER 10001:10001
 
@@ -103,3 +120,17 @@ EXPOSE 8080
 # 「有个探针」而给运行镜像增加攻击面; 而且 HTTP 探针由 kubelet 从集群侧发起,
 # 不需要镜像内有客户端。
 ENTRYPOINT ["/app/im-gateway"]
+
+# ============================================================================
+# Stage 3 — migrate 目标
+# ============================================================================
+# 复用 stage 2 的 runtime(不是另起一个), 故 migrate 与 gateway 镜像的
+# OS / CA / 用户完全一致。构建:
+#
+#   docker build --target migrate -t im1.0-im-migrate:local .
+#
+# 刻意把 ENTRYPOINT 放在**最后一个 stage**: 这样 `--target runtime`(默认)
+# 产出的镜像仍以 im-gateway 启动, 而 `--target migrate` 产出的以 im-migrate
+# 启动。反过来(先定 ENTRYPOINT 再分叉)就得在分叉处重复写一遍, 容易漏。
+FROM runtime AS migrate
+ENTRYPOINT ["/app/im-migrate"]
