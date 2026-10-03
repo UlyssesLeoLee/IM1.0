@@ -1322,7 +1322,90 @@ Ok(())
 
 ---
 
-## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
+### 1.21 迁移撞上「手工建的库」时报的错**指向错误的方向**, 而不是没说清 (2026-10-03 已修)
+
+§1.20 修好了「没有代码能应用迁移」, 立刻暴露了下一个问题: 拿新的 `im-migrate`
+去跑本机的 `im_test` 库, 报的是:
+
+```text
+while executing migration 1: error returned from database:
+  trigger "trg_environments_before_update" for relation "environments"
+  already exists at line 765
+```
+
+真实原因: **那个库的 schema 是手工建的**, 从未记进 `_sqlx_migrations`,
+迁移器于是认定「什么都没应用过」, 从 0001 重放。
+
+#### 为什么第一个炸的是触发器 —— 纯属排在最后
+
+0001 里 `CREATE TABLE` / `CREATE INDEX` 都带 `IF NOT EXISTS`, 于是前面那些
+「已存在」全被**静默吞掉**; 而 PG 的 `CREATE TRIGGER` **没有** `IF NOT EXISTS`
+这种写法, 所以第一个真正报错的偏偏是它。换个库、先炸的完全可能是别的对象 ——
+**报错指向谁, 取决于谁没写兜底, 与谁才是真正的问题无关。**
+
+#### 比「没说清」更糟: sqlx 加的前缀在往错的方向指
+
+写台账时我先断言「报错里没有 `migration` 这个词」, 测试当场把它打脸:
+
+```
+while executing migration 1: error returned from database: trigger ...
+```
+
+`migration` 确实出现了 —— 但那是 **sqlx 自己拼的前缀**, PG 那半句里一个都没有。
+这个前缀的效果是让人以为「**迁移 1 写错了, 去改 SQL**」, 而 0001 一行没错。
+**往错误方向指比不指更费时间**: 顺着它走的人会去反复检查、修改本来正确的
+迁移文件。已据此改写本节结论, 并把断言改成对 PG 原文断言(剥掉前缀后不得
+出现 `_sqlx_migrations` / `history` / `hand` 这类能反推真实原因的词)。
+
+#### 修法: 迁移**前**判一次, 而不是让 PG 去报
+
+新增 `im_migrate::is_clean_target`, 判定为假时非 0 退出, 错误信息直接给出
+「A) 换新库 / B) 备份后手工登记迁移历史」两条路。
+
+**判据是「业务表在不在 + 迁移历史有几行」, 不是「历史表在不在」** —— 这是
+最容易写错的地方, 两种「空历史表」必须区别对待:
+
+| 状态 | 业务表 | 历史表行数 | 判定 | 理由 |
+|---|---|---|---|---|
+| 全新库 | 0 | 表不存在或 0 | **放行** | 没有任何东西可丢, 跑迁移安全 |
+| 受管库 | ≥14 | 7 | **放行** | 续跑是 Job 重试的常态 |
+| 手工建的库 | ≥1 | 表不存在或 0 | **拦下** | schema 来自别处, 迁移历史是空的 |
+
+中间那行(空历史表)配的是**残留**场景: 上次运行中途失败, sqlx 先建出历史表、
+在迁移 1 上失败后回滚业务表, 却把空表留在原地。**空历史表本身不是问题**
+(它是失败运行的正常残骸), **有业务表却没历史才是**。
+
+若按第一版写成「历史表存在即视为受管理」, 上面第三行会被**误放行**。
+变异验证: 判据换成 `history_table > 0` 后, 唯一被点亮的是
+`clean_target_rejects_hand_built_schema_even_with_an_empty_history_table` ——
+证明这条测试不是凑数。
+
+#### 「拦得值不值」的对照实验
+
+只断言「判 false」, 这个检查就成了无法证伪的仪式。所以那条用例在同一个库上
+**先判、再故意跳过检查直接跑**, 断言它**确实会炸**, 且炸在触发器上。
+`crates/im-migrate/tests/migrations_e2e.rs` 现有 6 个用例, 5 种库状态各自
+独立临时库, 跑完无条件 `DROP DATABASE`。
+
+真实库已复验: `cargo run -p im-migrate -- --database-url .../im_test` 现在输出
+人话诊断并以 1 退出(Job 的 `restartPolicy: OnFailure` 依赖这个码), 不再吐触发器报错。
+
+#### 顺带修的 CI 两处
+
+1. `test-unit` / `test-integration` 两个 job 补 `IM_POSTGRES_URL`。**不补的话
+   `im-migrate` 的 e2e 会静默跳过** —— 沿用 `let Some(url) = .. else { return }`
+   约定, 从输出上看不出「跑过」与「没跑」的区别(同 §1.15 的假绿灯向量)。
+2. 「run migrations」从 `cargo install sqlx-cli` + `sqlx migrate run` 改为
+   `cargo run -p im-migrate --release -- --database-url "$IM_POSTGRES_URL"`。
+   第二个理由比省几分钟编译重要: **CI 必须跑我们真正要部署的那段代码**。
+   用 CLI 建 schema 的话, 部署用的那个二进制在 CI 上从未被执行过。
+
+`--database-url` 参数刻意支持(`--k v` 与 `--k=v` 两种形态), 解析逻辑抽成纯函数
+`parse_database_url` 配单测 —— 让「连的是哪个库」出现在 workflow 文件里, 读日志
+不必去猜 job 级 env 的解析结果。
+
+---
+
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
 |---|---|---|
@@ -1342,6 +1425,8 @@ Ok(())
 | `GET /v1/friends` **aux-13 与 proto 互相矛盾** | aux-13 说 `repeated Friend {user_id, display_name, state, since}`, proto 说 `repeated User`(带 `external_identity_json` / `environment_id`)。按 `User` 实装 = 把**每个人的外部身份**发给所有能列好友的人; 按 `Friend` 实装 = 要新增类型并改 proto。仓储层另缺 cursor 支持 | **需规范所有者裁决**。不擅自选边。见 §1.16 |
 | `POST /v1/media/presign` / `GET /v1/media/{id}` **无对象存储** | aux-13 §3.6 请求/响应样例齐全、proto 也有 message, 但预签名 URL 只能由真实 MinIO/S3 签发; 仓库无 media 模块、无 media 表、无对象存储配置。aux-06 line 442 亦写明「V1+ 实装」 | 依赖对象存储基础设施落地。返 mock URL 比不实现**更糟**(客户端拿着签不出东西的 URL 去 PUT, 失败难以诊断), 故不实装。即 WBS **G-2**, 状态 `Blocked` 等 **H-6**。见 §1.16 |
 | ~~`deploy/k3s/dev/migrate-job.yaml` 引用**无法构建**的镜像~~ | ~~清单跑 `ghcr.io/yourorg/im1.0-im-migrate:latest` 执行 `sqlx migrate run`, 但仓内**没有** migrate 二进制, 也没有任何东西能构建该镜像~~ | ✅ **已修** (2026-10-03): 新增 `crates/im-migrate`, 用 `sqlx::migrate!` 把 7 份 SQL **编译期内嵌**进二进制(schema 与代码必然同版本); 清单命令改为 `/app/im-migrate`、环境变量更正为 `IM_POSTGRES_URL`; Dockerfile 加 `--target migrate`。**并首次由仓内代码在全新空库上真跑一遍** + 验证重跑幂等。见 §1.20 |
+| 本机 `im_test` 库的 schema **不是用 `migrations/` 建的** | 手工建(或用更早版本 SQL 建), `_sqlx_migrations` 无有效记录。新 `im-migrate` 对它重放 0001, 报 `trigger "trg_environments_before_update" ... already exists`, 报错完全指不到原因; 更糟的是 sqlx 前缀 `while executing migration 1:` 让人误以为**迁移 1 写错了** | ✅ **已加迁移前检查** (2026-10-03): `im_migrate::is_clean_target` 判「业务表在 + 迁移历史空」时非 0 退出并给二选一处置指引。**该库本身未删**(它是本地测试依赖), 要么换新库, 要么备份后手工登记迁移历史。见 §1.21 |
+| CI 两个 job **不设 `IM_POSTGRES_URL`** | 只有 `DATABASE_URL`, 而 `im-migrate` 的 e2e 找不到变量就 `return` —— 静默跳过, 「跑过」与「没跑」从输出上无法区分 | ✅ **已修** (2026-10-03): `test-unit` / `test-integration` 均补 `IM_POSTGRES_URL`。**根治仍待 D-4**: im-gateway 那 26 个 e2e 的同类问题未动(见上表 §1.15 行) |
 | **Dockerfile 无法在本机构建验证** | 2026-10-03 实测: BuildKit 成功加载并解析 `Dockerfile`(语法有效), 但拉 `rust:1.98.1-slim-bookworm` 报 `registry-1.docker.io ... EOF` —— 与 GitHub 同一个代理问题, 且本地无 `rust:*` 缓存 | 与「推送本地 commit」同一个阻塞源: **本地代理掐断外网 registry**。代理恢复后跑 `docker build -t im1.0-im-gateway:local .` 即可验证。**本条不声称镜像可用** —— 只声称 Dockerfile 语法有效。见 §1.17 |
 | **`NatsEventPublisher` 是静默 no-op** (D-3) | `publish()` 只发一条 `debug!`(默认不可见)并返回 `Ok(())` —— 每条 `im.message.{created,recalled,deleted}` 都被丢弃, 而 aux-04 §B.4「publish 事件供其他 pod 同步」这条**不变量**从未被满足。返回值/日志/指标三条渠道都指向「正常」 | 2026-10-03 **已改为可见**: `warn!` 每次 + `/metrics` 暴露 `im_events_dropped_total`。**D-3 本身仍未实装** —— 需可连的 NATS server 才能测(依赖 Docker Hub 恢复)。见 §1.19 |
 
@@ -1502,6 +1587,6 @@ G-1 / V1 (多租户隔离)
 
 ---
 
-**维护**: 本表为快照, 记录于 dev @ `0a42026` (2026-10-03)。
+**维护**: 本表为快照, 记录于 dev @ `44118b6` + 本次未提交改动 (2026-10-03)。
 缺口被接线后请同步勾除本文档与代码注释两侧, 避免再次出现
 「代码引用台账但台账不存在」或「台账有项但代码已删」的双向漂移。

@@ -43,6 +43,104 @@ pub async fn run_migrations(pool: &sqlx::PgPool) -> Result<(), sqlx::migrate::Mi
     MIGRATOR.run(pool).await
 }
 
+/// 迁移前的状态检查: 这个库是「干净的」还是「建法不对」
+///
+/// 2026-10-03 新增。起因是一次真实失败: 对本机 `im_test` 库跑 `im-migrate`
+/// 报 `trigger "trg_environments_before_update" for relation "environments"
+/// already exists at line 765` —— 一句**完全指不出原因**的 PG 报错。
+///
+/// 真实原因: 该库的 schema 是**手工建的**(或用更早版本的 SQL 建的), 从未
+/// 记录进 `_sqlx_migrations`。于是迁移器认为「什么都没应用过」, 从 0001
+/// 开始重放, 撞上一堆已存在的对象。
+///
+/// 迁移文件用 `IF NOT EXISTS` 兜住了建表和索引, 但**触发器没有这种写法**
+/// (PG 的 `CREATE TRIGGER` 没有 `IF NOT EXISTS`), 所以第一个触发器就炸。
+/// 触发器之所以成了「最先报错的那个」纯属排在最后 —— 前面那些「已存在」
+/// 全被 `IF NOT EXISTS` 静默吞了。
+///
+/// 2026-10-03 实测的完整报错:
+///
+/// ```text
+/// while executing migration 1: error returned from database:
+///   trigger "trg_environments_before_update" for relation "environments"
+///   already exists at line 765
+/// ```
+///
+/// 注意 sqlx 加的 `while executing migration 1:` 前缀: 它把人往「迁移 1
+/// 写错了, 去改 SQL」上引, 而**迁移 1 完全正确**、是目标库建法不对。往错误
+/// 方向指比不指更费时间 —— 那半句 PG 原文里没有任何词提到迁移历史。
+/// 也就是说: 迁移对**全新库**是安全的(已由 e2e 验证), 对「手工建的库」必然
+/// 失败, 而失败信息指向的是触发器, 没人会想到真正的原因是历史缺失。
+///
+/// (上述两句断言由 `tests/migrations_e2e.rs` 的
+/// `clean_target_rejects_hand_built_schema_and_that_verdict_is_earned` 守着:
+/// 它在真实 PG 上复现这条报错, 并断言 PG 原文里不出现 `_sqlx_migrations` /
+/// `history` / `hand` 这类能反推真实原因的词。)
+///
+/// 返回值: `Ok(true)` = 可以安全开跑; `Ok(false)` = 检测到「有 schema 但无
+/// 迁移历史」, 调用方应拒绝并给出人话指引。
+///
+/// ## 判据是**迁移历史的行数 + 业务表的有无**, 不是「历史表是否存在」
+///
+/// 第一版写成「`_sqlx_migrations` 表存在即视为受管理」, 结果**没触发** ——
+/// 因为一次失败的运行会先建出这张表, 在迁移 1 上失败后回滚业务表, 却把空
+/// 的历史表留在原地。于是「手工建的库 + 残留空历史表」被误判为受管理,
+/// 放行之后就是上面那个指不到点上的触发器错误。故必须数行。
+///
+/// 两种「空历史表」必须区别对待, 这也是本函数最容易写错的地方:
+///
+/// | 状态 | 业务表 | 历史表行数 | 判定 | 理由 |
+/// |---|---|---|---|---|
+/// | 全新库 | 0 | 表不存在或 0 | **放行** | 没有任何东西可丢, 跑迁移是安全的 |
+/// | 受管库 | ≥14 | 7 | **放行** | 续跑是 Job 重试的常态 |
+/// | 手工建的库 | ≥1 | 表不存在或 0 | **拦下** | schema 来自别处, 迁移历史是空的 |
+///
+/// 一句话: **决定放行与否的是「业务表在不在」, 不是「历史表在不在」**。
+/// 空历史表本身不是问题(它是失败运行的正常残骸), 有业务表却没历史才是。
+///
+/// 上面 5 种状态由 `tests/migrations_e2e.rs` 在真实 PG 上逐一验证, 其中
+/// 「手工建的库」那条还额外断言了**不拦就真的会炸**, 以及报错里提不到
+/// `migration` —— 否则这个检查只是一句无法证伪的自我安慰。
+pub async fn is_clean_target(pool: &sqlx::PgPool) -> Result<bool, sqlx::Error> {
+    // 迁移历史里**有几条**记录。表不存在时下面这条会报错, 故先探表。
+    let history_table: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_name = '_sqlx_migrations'",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    let applied: i64 = if history_table == 0 {
+        0
+    } else {
+        sqlx::query_scalar("SELECT count(*)::bigint FROM _sqlx_migrations")
+            .fetch_one(pool)
+            .await?
+    };
+
+    // 已有成功记录 → 这个库确实由迁移系统管着, 交给 run() 续跑即可。
+    //
+    // 这里**必须数行, 不能看表在不在**。变异验证过: 判据换成
+    // `history_table > 0`(第一版)后, 「手工建的库 + 残留空历史表」会被
+    // 误放行, 紧接着就是那段指不到点上的触发器报错 ——
+    // 由 `clean_target_rejects_hand_built_schema_even_with_an_empty_history_table`
+    // 精确捕获。
+    if applied > 0 {
+        return Ok(true);
+    }
+
+    // 没有记录, 但已有业务表 → schema 是从别处来的(或上次跑崩了留下的残局)。
+    // 排除 `_sqlx_migrations` 自身, 否则「表存在但为空」会被误判成有业务表。
+    let business: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM information_schema.tables \
+         WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
+           AND table_name <> '_sqlx_migrations'",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(business == 0)
+}
+
 /// 从 `IM_POSTGRES_URL` 读连接串
 pub fn database_url() -> Result<String, String> {
     std::env::var("IM_POSTGRES_URL")
@@ -138,9 +236,6 @@ mod tests {
     ///
     /// 这组断言的存在是因为该函数曾写成漏掉路径分隔符的版本, 拼出
     /// `postgres://im:im@localhost:5544probe`, 而 sqlx 报的错是
-    /// `invalid port number` —— 错误信息与真正原因之间没有任何可追踪关联。
-    /// 纯函数 + 单测是这类 bug 唯一便宜的护栏。
-    /// `postgres://im:im@localhost:5544probe`, 而 sqlx 报的是
     /// `invalid port number` —— 错误信息与真正原因之间没有任何可追踪的关联。
     /// 纯函数 + 单测是这类 bug 唯一便宜的护栏。
     #[test]

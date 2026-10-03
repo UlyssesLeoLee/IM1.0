@@ -93,32 +93,51 @@ async fn scratch_db() -> Option<(sqlx::PgPool, String)> {
 /// 关联, 只能靠单测挡。
 use im_migrate::with_database as url_for;
 
-#[tokio::test]
-async fn migrations_apply_to_a_fresh_database() {
-    let Some((admin, name)) = scratch_db().await else {
-        eprintln!("skip: 未设 IM_POSTGRES_URL 或连不上");
-        return;
-    };
+/// 在一个**全新临时库**上执行 `body`, 结束后**无条件**删库
+///
+/// 返回 `None` = 跳过(没配 `IM_POSTGRES_URL` 或连不上), 与既有 e2e 约定一致。
+///
+/// 契约上有一条硬要求: `body` **不许 panic**, 只能返回 `Err`。因为清理语句
+/// 写在 `body` 之后, `body` 一旦 panic 就会跳过清理, 在 PG 上留下一个孤儿库
+/// —— 反复跑测试会把实例的库越堆越多, 而没人会去查是谁留下的。把「断言」
+/// 交给调用方在 `body` 返回之后做, 就同时拿到了「失败也清理」和「失败有
+/// 清晰信息」。
+///
+/// 参数传**拥有的 `String`** 而非 `&str`: 场景体是 async block, 若拿到借用
+/// 来的 `&str`, 编译器会要求 future 的生命周期短于调用点, 闭包形式写起来
+/// 要么过不了 lifetime 检查, 要么得靠 HRTB 把签名撑大。传所有权就没这回事 ——
+/// 顺带这也让每个场景能写成独立的 `async fn`(fn item 直接满足 `FnOnce`),
+/// 比匿名闭包好读, 报错时函数名也能直接指到是哪个场景。
+async fn in_scratch_db<T, F, Fut>(body: F) -> Option<T>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    let (admin, name) = scratch_db().await?;
     let base = admin_url().await.expect("scratch_db 成功说明 url 存在");
-
-    // 用完无条件清理, 包括中途 panic 的情况(析构里没有, 但 drop 前会跑到这里
-    // 之后的语句; 真正的保障是下面每一步都不假设前一步成功)
-    let result = probe(&url_for(&base, &name)).await;
-
-    // 清理先于断言: 断言失败时临时库也会被删掉, 不留垃圾
+    let out = body(url_for(&base, &name)).await;
+    // 清理先于返回: 断言在调用方做, 断言失败时库已经被删掉了。
     let _ = sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "DROP DATABASE IF EXISTS {name}"
     )))
     .execute(&admin)
     .await;
+    Some(out)
+}
 
+#[tokio::test]
+async fn migrations_apply_to_a_fresh_database() {
+    let Some(result) = in_scratch_db(probe).await else {
+        eprintln!("skip: 未设 IM_POSTGRES_URL 或连不上");
+        return;
+    };
     if let Err(e) = result {
         panic!("迁移未能应用到全新空库: {e}");
     }
 }
 
-async fn probe(url: &str) -> Result<(), String> {
-    let pool = im_migrate::connect(url)
+async fn probe(url: String) -> Result<(), String> {
+    let pool = im_migrate::connect(&url)
         .await
         .map_err(|e| format!("connect: {e}"))?;
 
@@ -194,4 +213,244 @@ async fn probe(url: &str) -> Result<(), String> {
 
     pool.close().await;
     Ok(())
+}
+
+// ============================================================================
+// is_clean_target: 迁移前该拦的拦, 不该拦的别拦
+// ============================================================================
+//
+// 起因是一次真实失败: 对本机 `im_test` 库跑 `im-migrate` 报
+// `trigger "trg_environments_before_update" for relation "environments"
+// already exists at line 765` —— 一句完全指不出原因的 PG 报错。
+// 真实原因: 该库的 schema 是手工建的, 从未记进 `_sqlx_migrations`,
+// 迁移器于是从 0001 重放, 撞上一堆已存在的对象。
+//
+// 迁移文件用 `IF NOT EXISTS` 兜住了建表和索引, 但 **CREATE TRIGGER 没有
+// 这种写法**, 所以第一个触发器就炸。触发器成了「最先撞墙的那个」纯属
+// 巧合 —— 报错指向它只是因为它排在最后, 而前面那些「已存在」都被静默吞了。
+//
+// 所以这些用例要同时钉两件事:
+//   1. 拦得住(判 false)
+//   2. **被拦下的那件事确实会发生**(不拦就会炸, 且报错指不到点上)
+// 只断言第 1 条, 检查就成了无法证伪的仪式。
+
+/// 在指定库上跑一段静态 DDL
+///
+/// `raw_sql` 在 sqlx 0.9 里对非字面量 SQL 有编译期拒绝, `AssertSqlSafe`
+/// 是唯一显式豁免。本文件的 SQL 全部是字面量, 不含任何外部输入。
+async fn ddl(pool: &sqlx::PgPool, sql: &str) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql.to_string()))
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// 手工建出来的 `environments` + 触发器, 逐字照抄 0001 的结构
+///
+/// 刻意保持**能通过前 3 个 `IF NOT EXISTS`**(表 / 索引)的样子, 这样
+/// `run_migrations` 才会一路走到 `CREATE TRIGGER` 才炸 —— 复现的才是那次
+/// 真实的失败路径, 而不是随便一个更早的报错。
+const HAND_BUILT_ENVIRONMENTS: &str = "CREATE TABLE environments (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    game_id UUID NOT NULL,
+    name TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+)";
+
+const HAND_BUILT_FUNC: &str = "CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = now();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql";
+
+const HAND_BUILT_TRIGGER: &str = "CREATE TRIGGER trg_environments_before_update
+BEFORE UPDATE ON environments
+FOR EACH ROW EXECUTE FUNCTION set_updated_at()";
+
+/// sqlx 的迁移历史表(空表, 无任何行)
+const EMPTY_HISTORY_TABLE: &str = "CREATE TABLE _sqlx_migrations (
+    version BIGINT PRIMARY KEY,
+    description TEXT NOT NULL,
+    installed_on TIMESTAMPTZ NOT NULL DEFAULT now(),
+    success BOOLEAN NOT NULL,
+    checksum BYTEA NOT NULL,
+    execution_time BIGINT NOT NULL
+)";
+
+async fn check_clean(url: String) -> Result<bool, String> {
+    let pool = im_migrate::connect(&url)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    let r = im_migrate::is_clean_target(&pool)
+        .await
+        .map_err(|e| format!("is_clean_target: {e}"));
+    pool.close().await;
+    r
+}
+
+/// 状态 1: 全新空库 → 可以跑
+#[tokio::test]
+async fn clean_target_accepts_a_completely_empty_database() {
+    let Some(r) = in_scratch_db(check_clean).await else {
+        eprintln!("skip: 未设 IM_POSTGRES_URL 或连不上");
+        return;
+    };
+    assert_eq!(r, Ok(true), "全新空库没有任何东西可丢, 必须放行");
+}
+
+/// 状态 2: 被迁移系统管着的库(7 条历史)→ 可以跑
+#[tokio::test]
+async fn clean_target_accepts_a_migrated_database() {
+    let Some(r) = in_scratch_db(scenario_migrated).await else {
+        eprintln!("skip: 未设 IM_POSTGRES_URL 或连不上");
+        return;
+    };
+    assert_eq!(r, Ok(true), "已有成功迁移历史的库必须放行(续跑是常态)");
+}
+
+async fn scenario_migrated(url: String) -> Result<bool, String> {
+    let pool = im_migrate::connect(&url)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    im_migrate::run_migrations(&pool)
+        .await
+        .map_err(|e| format!("run: {e}"))?;
+    let r = im_migrate::is_clean_target(&pool)
+        .await
+        .map_err(|e| format!("is_clean_target: {e}"));
+    pool.close().await;
+    r
+}
+
+/// 状态 3: 全新空库, 但**残留一张空的** `_sqlx_migrations` → 仍然可以跑
+///
+/// 这条是「上一次运行中途失败」留下的痕迹: sqlx 先建出历史表, 在迁移 1 上
+/// 失败后回滚业务表, 却留下空的历史表。此时库里**没有任何业务表**, 跑迁移
+/// 完全安全 —— 拦它只会逼人手工清一张空表, 属于假阳性。
+///
+/// 把它与状态 5 并排看才说得清: 决定放行与否的是**业务表在不在**,
+/// 不是历史表在不在。
+#[tokio::test]
+async fn clean_target_accepts_a_fresh_database_with_a_leftover_empty_history_table() {
+    let Some(r) = in_scratch_db(scenario_leftover_empty_history).await else {
+        eprintln!("skip: 未设 IM_POSTGRES_URL 或连不上");
+        return;
+    };
+    assert!(
+        r.expect("场景内各步都返回 Ok"),
+        "只有一张空历史表、没有业务表的库应当放行; 拦它会逼人手工清空表"
+    );
+}
+
+async fn scenario_leftover_empty_history(url: String) -> Result<bool, String> {
+    let pool = im_migrate::connect(&url)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    ddl(&pool, EMPTY_HISTORY_TABLE)
+        .await
+        .map_err(|e| format!("建空历史表: {e}"))?;
+    let r = im_migrate::is_clean_target(&pool)
+        .await
+        .map_err(|e| format!("is_clean_target: {e}"));
+    pool.close().await;
+    r
+}
+
+/// 状态 4: 手工建的 schema, 无迁移历史 → 拦下, 且**证明不拦就会炸**
+#[tokio::test]
+async fn clean_target_rejects_hand_built_schema_and_that_verdict_is_earned() {
+    let Some(r) = in_scratch_db(scenario_hand_built).await else {
+        eprintln!("skip: 未设 IM_POSTGRES_URL 或连不上");
+        return;
+    };
+    let (verdict, boom) = r.expect("场景内各步都返回 Ok");
+
+    assert_eq!(verdict, Ok(false), "手工建的 schema 没有迁移历史, 必须拦下");
+    // 对照组: 报错指向触发器, 而触发器只是**最后**撞墙的那个; 前面 3 个
+    // `IF NOT EXISTS` 全都静默放行了。
+    //
+    // 更糟的是 sqlx 加的前缀 `while executing migration 1:` —— 它让人以为
+    // 「迁移 1 写错了, 去改 SQL」。而这个库恰恰是**迁移 1 完全正确**、
+    // 目标库建法不对。往错误方向指比不指更费时间。
+    //
+    // 故断言 PG 那半句里**没有任何**能让人反推出真实原因的词。
+    let pg_part = boom
+        .split_once("error returned from database:")
+        .map(|(_, rest)| rest)
+        .unwrap_or(boom.as_str());
+    assert!(
+        pg_part.contains("trg_environments_before_update"),
+        "预期复现 `CREATE TRIGGER` 无 IF NOT EXISTS 导致的失败, 实际: {boom}"
+    );
+    for hint in ["_sqlx_migrations", "history", "hand", "已存在业务表"] {
+        assert!(
+            !pg_part.to_lowercase().contains(&hint.to_lowercase()),
+            "PG 报错里出现了 {hint:?}, 它比预期更有指向性, \
+             「完全指不出真正原因」的说法需要修正。实际: {boom}"
+        );
+    }
+}
+
+async fn scenario_hand_built(url: String) -> Result<(Result<bool, String>, String), String> {
+    let pool = im_migrate::connect(&url)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    for stmt in [HAND_BUILT_ENVIRONMENTS, HAND_BUILT_FUNC, HAND_BUILT_TRIGGER] {
+        ddl(&pool, stmt)
+            .await
+            .map_err(|e| format!("手工建表: {e}"))?;
+    }
+    let verdict = im_migrate::is_clean_target(&pool)
+        .await
+        .map_err(|e| format!("is_clean_target: {e}"));
+    // 故意**跳过**检查直接跑, 看它到底会怎么炸 —— 这才是「拦得值不值」
+    // 的唯一证据。
+    let boom = im_migrate::run_migrations(&pool)
+        .await
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| "居然成功了, 未复现那次失败".to_string());
+    pool.close().await;
+    Ok((verdict, boom))
+}
+
+/// 状态 5: 手工建的 schema **+ 残留空历史表** → 拦下
+///
+/// 这条是「故必须数行」那句话的全部意义。判据若写成「历史表存在即视为
+/// 受管理」(第一版), 这里会**放行** —— 而放行之后就是状态 4 里那个
+/// 指不到点上的触发器错误。
+#[tokio::test]
+async fn clean_target_rejects_hand_built_schema_even_with_an_empty_history_table() {
+    let Some(r) = in_scratch_db(scenario_hand_built_with_empty_history).await else {
+        eprintln!("skip: 未设 IM_POSTGRES_URL 或连不上");
+        return;
+    };
+    assert!(
+        !r.expect("场景内各步都返回 Ok"),
+        "业务表在 + 历史表空 => 仍须拦下; 只看「历史表是否存在」会误放行"
+    );
+}
+
+async fn scenario_hand_built_with_empty_history(url: String) -> Result<bool, String> {
+    let pool = im_migrate::connect(&url)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    for stmt in [
+        HAND_BUILT_ENVIRONMENTS,
+        EMPTY_HISTORY_TABLE,
+        HAND_BUILT_FUNC,
+        HAND_BUILT_TRIGGER,
+    ] {
+        ddl(&pool, stmt)
+            .await
+            .map_err(|e| format!("手工建表: {e}"))?;
+    }
+    let r = im_migrate::is_clean_target(&pool)
+        .await
+        .map_err(|e| format!("is_clean_target: {e}"));
+    pool.close().await;
+    r
 }

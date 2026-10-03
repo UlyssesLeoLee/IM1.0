@@ -62,6 +62,12 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://im:im@localhost:5432/im_test
+      # 2026-10-03 新增。仓内配置读取一律走 IM_<UPPER_SNAKE> 规则
+      # (见 im_common::config::AppConfig), 只有 DATABASE_URL 会让
+      # im-migrate 的 e2e 用例**静默跳过**(它找不到变量就 return, 不报错)。
+      # 两个变量指向同一个库, 但必须都设 —— 少一个就少一批测试在跑,
+      # 而且从输出上看不出来。
+      IM_POSTGRES_URL: postgres://im:im@localhost:5432/im_test
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -91,6 +97,8 @@ jobs:
           --health-retries 5
     env:
       DATABASE_URL: postgres://im:im@localhost:5432/im_test
+      # 见 test-unit job 内同名校验: 少设这个变量, im-migrate 的 e2e 会静默跳过
+      IM_POSTGRES_URL: postgres://im:im@localhost:5432/im_test
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -99,12 +107,19 @@ jobs:
         # 缺失会让 im-proto 的 build.rs 失败并击穿所有编译 workspace 的 job。
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - uses: Swatinem/rust-cache@v2
-      - name: install sqlx-cli
-        # 2026-10-02 修:版本对齐 workspace 依赖 sqlx = "0.9"(Cargo.lock 解析 0.9.0)。
-        # 原为 '^0.8',是 2026-08-26 sqlx 0.8.6 → 0.9.0 升级时漏改的残留。
-        run: cargo install sqlx-cli --version '^0.9' --no-default-features --features rustls,postgres --locked
       - name: run migrations
-        run: sqlx migrate run --database-url $DATABASE_URL
+        # 2026-10-03 改用仓内自己的 im-migrate 二进制(此前是 sqlx CLI)。
+        #
+        # 两个理由, 第二个更重要:
+        #   1. 少一步 `cargo install sqlx-cli`(编译整个 CLI, 数分钟)。
+        #   2. **CI 跑的必须是我们要部署的那段代码**。用 CLI 建 schema 的话,
+        #      我们的迁移二进制在 CI 上从未被执行过 —— 而它正是
+        #      migrate-job.yaml 里实际跑的东西。改用自己之后, 每次 CI 都在
+        #      验证真实的部署路径。
+        #
+        # 变量名与 AppConfig.postgres_url 一致(不是 sqlx CLI 惯例的
+        # DATABASE_URL), 故显式传 --database-url。
+        run: cargo run -p im-migrate --release -- --database-url "$IM_POSTGRES_URL"
       - name: cargo test (integration)
         # 2026-10-02 修正:集成用例已不"尚少"——crates/*/tests/ 共 6 个文件 66 个
         # #[test]/#[tokio::test],其中 pg_repos_integration.rs 的 22 个跑真实 PG。
