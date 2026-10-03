@@ -62,6 +62,28 @@ fn database_url() -> Option<String> {
         .filter(|s| !s.trim().is_empty())
 }
 
+/// 连不上 PG 时: 静默跳过, 还是直接失败
+///
+/// `IM_REQUIRE_PG=1` 时 panic 而不是跳过。
+///
+/// **为什么不能靠 grep CI 输出**: `cargo test` 默认丢弃**通过**测试的
+/// stdout/stderr, 而「跳过」在 libtest 眼里就是「通过」—— 那句
+/// `eprintln!("SKIP: ...")` 根本不会出现在正常输出里。实测全量
+/// `cargo test --workspace` 日志里 skip 行数为 0, 而当时确有大批用例在跳过。
+/// 只有 `--nocapture` 才看得见, 但那会让 CI 输出不可靠。故做在代码里。
+///
+/// 完整背景与教训见 `src/http/test_support.rs::skip_or_fail_pg` 与
+/// `docs/gap-ledger.md` §1.15 / §1.22。
+fn skip_or_fail_pg(context: &str) {
+    if std::env::var("IM_REQUIRE_PG").as_deref() == Ok("1") {
+        panic!(
+            "IM_REQUIRE_PG=1 但连不上 PG({context})。这个环境**声称**要跑 PG 测试, \
+             连不上只能是配置错了; 静默跳过会让「跑过」与「没跑」无法区分。"
+        );
+    }
+    eprintln!("SKIP: {context}");
+}
+
 async fn pool() -> Option<sqlx::PgPool> {
     let url = database_url()?;
     match PgPoolOptions::new()
@@ -72,10 +94,10 @@ async fn pool() -> Option<sqlx::PgPool> {
     {
         Ok(p) => Some(p),
         Err(e) => {
-            eprintln!(
-                "SKIP: 设了 DATABASE_URL 但连不上 ({e})。\
+            skip_or_fail_pg(&format!(
+                "设了 DATABASE_URL 但连不上 ({e})。\
                  确认该实例已 `sqlx migrate run` 过。"
-            );
+            ));
             None
         }
     }

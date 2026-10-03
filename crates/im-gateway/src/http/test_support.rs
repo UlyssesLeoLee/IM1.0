@@ -35,15 +35,66 @@ use im_core::identity::token::{SigningKey, TokenService};
 use super::error_response::json_response;
 use super::state::AppState;
 
+/// 连不上 PG 时:静默跳过, 还是直接失败
+///
+/// ## 为什么必须在**代码里**做, 而不能靠 grep CI 输出
+///
+/// 最自然的想法是「跑完 grep 一下输出里有没有 `skip:`, 有就红」。行不通:
+/// `cargo test` **默认丢弃通过测试的 stdout/stderr**, 而「跳过」在 libtest 眼里
+/// 就是「通过」—— 那句 `eprintln!("skip: ...")` 根本不会出现在正常输出里。
+/// 实测: 全量 `cargo test --workspace` 日志里 `SKIP_LINES=0`, 而当时确实有大批
+/// 用例在跳过。只有加 `--nocapture` 才看得见, 但那会让 CI 输出变得又吵又不可靠。
+///
+/// 所以开关做在这里: 把「跳过」变成**真正的失败**, libtest 就一定会显示它。
+///
+/// ## 两种模式各自解决什么
+///
+/// - 未设 `IM_REQUIRE_PG`: 连不上就跳过。本机没 PG 时不该全红 —— 开发者
+///   仍能跑其余 200+ 个用例。
+/// - `IM_REQUIRE_PG=1`(CI): 连不上就 panic。CI 明确挂了 PG service container,
+///   此时「连不上」只可能是 job 配错了 —— 而配置错误若以绿灯形式混过去,
+///   整个门禁就失去意义。
+///
+/// ## 2026-10-03 的真实教训
+///
+/// 新写的 WS e2e 第一次运行「6 个全通过」, 实际是 6 个全部静默跳过(Docker
+/// Desktop 已被关掉, PG 容器随之消失)。若不是顺手核对了耗时(10.01s ≈
+/// `acquire_timeout(10s)`), 这会作为「WS 端到端已就位」被写进台账。
+/// **任何新写 PG 相关测试的人都默认会踩这个坑** —— 它的形态是「看起来
+/// 一切正常」, 所以必须由机制挡住, 不能靠自觉。
+pub fn pg_required() -> bool {
+    std::env::var("IM_REQUIRE_PG").as_deref() == Ok("1")
+}
+
+/// 供各测试文件的 `pool()` 在连不上时调用
+///
+/// 返回 `true` = 调用方应当 `return`(跳过); `IM_REQUIRE_PG=1` 时不返回,
+/// 直接 panic。
+pub fn skip_or_fail_pg(context: &str) -> bool {
+    if pg_required() {
+        panic!(
+            "IM_REQUIRE_PG=1 但连不上 PG({context})。这个环境**声称**要跑 PG 测试, \
+             连不上只能是配置错了。静默跳过会让「跑过」与「没跑」无法区分 —— \
+             见 docs/gap-ledger.md §1.15 / §1.22。"
+        );
+    }
+    eprintln!("skip: {context} —— 未设 DATABASE_URL 或连不上 PG");
+    true
+}
+
 /// e2e 用的连接池 (max_connections=2: 单个测试只串行用两条)
 pub async fn e2e_pool() -> Option<sqlx::PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
-    sqlx::postgres::PgPoolOptions::new()
+    let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(std::time::Duration::from_secs(10))
         .connect(&url)
         .await
-        .ok()
+        .ok();
+    if pool.is_none() {
+        skip_or_fail_pg("test_support::e2e_pool");
+    }
+    pool
 }
 
 /// 一个 env + 三个用户 + 两个会话 + 一条 Alice 发的消息
@@ -129,16 +180,21 @@ pub async fn rest_fixture(p: &sqlx::PgPool) -> RestFixture {
         .await
         .unwrap();
 
-    let msg_id: Uuid = sqlx::query_scalar(
-        "INSERT INTO messages (conversation_id, sequence, sender_id, kind, content, idempotency_key) \
-         VALUES ($1, 1, $2, 'text', '{\"kind\":\"text\",\"text\":\"hi\"}', gen_random_uuid()::text) RETURNING id",
-    )
-    .bind(conv.id.0)
-    .bind(alice.0)
-    .fetch_one(p)
-    .await
-    .expect("insert message");
-    let msg = im_common::ids::MessageId(msg_id);
+    // 2026-10-03 修正: 种子消息此前是**手写 SQL** 插的, 且硬编码 `sequence = 1`。
+    //
+    // 那条 SQL 绕过了 `conversation_sequences` 分配器, 于是夹具造出一个生产中
+    // **不可能出现**的状态: `messages` 里已有 sequence=1, 而分配器的
+    // `next_sequence` 仍停在 1。之后任何一次真实 `send_message` 都会拿到 1,
+    // 与既有行撞 `messages(conversation_id, sequence)` 唯一约束 ->
+    // `sqlx insert` 失败 -> WS 侧表现为 `INTERNAL_ERROR: internal error`。
+    //
+    // 症状出现在广播链路上, 真正的原因却在夹具里 —— 这也是为什么 WS 用例
+    // 必须先断言发送方的 ack(见 ws/e2e.rs): 否则会拿着「广播没送达」去查
+    // WsHub, 而问题根本不在那里。
+    //
+    // 改法: 种子消息也走 `MessageService::send_message` —— 真实路径, 顺带
+    // 不再在测试里复刻一遍生产逻辑(分配器 / 幂等 / 内容 schema 校验)。
+    // 注意它必须在 message_service 构造**之后**才能调用, 故挪到下面。
 
     // 与 main.rs 装配同构: 6 个 service
     let message_repo: Arc<dyn MessageRepository> = Arc::new(PgMessageRepository::new(p.clone()));
@@ -173,7 +229,23 @@ pub async fn rest_fixture(p: &sqlx::PgPool) -> RestFixture {
             password_hash: None,
             created_at: chrono::Utc::now(),
         };
-        token_service.issue_access_token(&u).expect("签 token").0
+        // 2026-10-03 修正: 此前用 `issue_access_token(&u)` —— 那是**刻意不带 dsid**
+        // 的遗留入口, 其文档明写「签发登录/注册类 token 时应改用
+        // issue_access_token_for_session」。后果: WS 鉴权
+        // (`ws::handler::handle_auth` 读 `dsid` claim, 缺则 UNAUTHORIZED) 对本夹具
+        // 签出的 token **一律拒绝**, 表现为
+        // `access token carries no device session (dsid); re-authenticate`。
+        //
+        // 这与真实登录流程不一致: `IdentityService::issue_token_pair` 是
+        // **先建 device session 再签 token**, 所以生产 token 带 dsid。夹具必须
+        // 跟上, 否则 e2e 测的是一个生产中不存在的 token 形状。
+        //
+        // 这里用构造出的 session id 即可: `handle_auth` 只**读 claim**、不回查
+        // `device_sessions` 表, 所以不需要真的插一行。
+        token_service
+            .issue_access_token_for_session(&u, Some(im_common::ids::DeviceSessionId::new()))
+            .expect("签 token")
+            .0
     };
     let alice_token = mk_token(alice);
     let bob_token = mk_token(bob);
@@ -184,16 +256,33 @@ pub async fn rest_fixture(p: &sqlx::PgPool) -> RestFixture {
 
     let conversation_repo: Arc<dyn ConversationRepository> =
         Arc::new(PgConversationRepository::new(p.clone()));
+
+    // 种子消息走真实路径(见上方长注释): 分配器 / 幂等 / schema 校验全都不绕。
+    let message_service = im_core::message::service::MessageService::new(
+        message_repo,
+        sequencer,
+        events,
+        conversation_repo.clone(),
+    );
+    let seed = message_service
+        .send_message(im_core::message::service::SendMessageCommand {
+            conversation_id: conv.id,
+            sender_id: alice,
+            idempotency_key: uuid::Uuid::new_v4().to_string(),
+            kind: "text".to_string(),
+            content: json!({"kind": "text", "text": "hi"}),
+            reply_to: None,
+            max_size_bytes: 65_536,
+        })
+        .await
+        .expect("夹具的种子消息必须能通过真实 send_message 路径");
+    let msg = seed.id;
+
     let state = web::Data::new(AppState::new(
         Arc::new(im_core::conversation::service::ConversationService::new(
             conversation_repo.clone(),
         )),
-        Arc::new(im_core::message::service::MessageService::new(
-            message_repo,
-            sequencer,
-            events,
-            conversation_repo.clone(),
-        )),
+        Arc::new(message_service),
         token_service.clone(),
         Arc::new(im_core::identity::service::IdentityService::new(
             im_core::identity::pg::PgUserRepository::new(p.clone()),

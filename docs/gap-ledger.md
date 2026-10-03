@@ -1458,22 +1458,56 @@ REST 全在 `/v1` 下的惯例**取 `/v1/ws`, 并在代码注释里写明「若�
    已验证: 设 `IM_REQUIRE_PG=1` 且 PG 不可用时, 4 个用例由「ok」变 **FAILED**
    并给出明确原因。
 
-#### 验证状态(必须分开看)
+#### 验证状态
 
-- ✅ **已验证**: `ws_route_is_registered_at_the_documented_path`(修复后
-  `/v1/ws` 非 404 且 `/v1/ws/ws` 为 404)、`nested_scopes_of_the_same_prefix_still_nest`、
-  `rfc6455_example_key_is_wellformed_base64`。均**不依赖 PG**。
-- ⚠️ **未验证**: 4 个真实 WS 用例(首帧必须 auth / ping→pong 回传 ts /
-  假 token 被拒 / 广播只到成员不到非成员)。编译与 clippy 均通过, 但
-  **本会话 PG 始终不可用**(Docker Desktop 进程拉不起来, `com.docker.service`
-  处于 Stopped 且当前 shell 无提权权限), 一次都没真跑过。**不声称它们通过。**
-  CI 侧因 `IM_REQUIRE_PG=1` 会在 PG 就绪时真跑, 配错则硬失败。
+**全 7 个用例已真跑通过(2026-10-03 晚, PG 恢复后)。** 五道门带
+`IM_REQUIRE_PG=1` 跑: fmt / ps1lint / errcodes(21) / clippy `-D warnings` /
+test 全 0, **410 passed / 0 failed**。开关生效时任何跳过都会 panic, 故
+「0 失败」同时证明**零静默跳过** —— 这比 grep 日志强, 因为
+`cargo test` 默认就丢弃通过测试的输出。
+
+其中 `broadcast_reaches_other_members_but_never_a_non_member` 是 WS 侧最要紧
+的一条: Bob(会话成员)收到 `message_new`, Carol(非成员)**收不到**。
+
+#### 跑通它们的过程中, 夹具暴露了两个真实问题(都已修)
+
+1. **夹具签的 token 缺 `dsid` → WS 鉴权一律 UNAUTHORIZED。**
+   `test_support::rest_fixture` 用的是 `TokenService::issue_access_token(&u)`,
+   那个入口**刻意不带 dsid**, 其文档明写「签发登录/注册类 token 时应改用
+   `issue_access_token_for_session`」。真实登录路径
+   `IdentityService::issue_token_pair` 是**先建 device session 再签 token**,
+   所以生产 token 带 dsid —— 即**这不是产品缺陷, 是夹具在测一个生产中
+   不存在的 token 形状**。已改用 `issue_access_token_for_session`。
+   (`auth_handlers.rs` 里另一处 `issue_access_token` 变量名为 `legacy`、
+   注释「签旧式 token」, 是**故意**测无 dsid 的旧 token, 未动。)
+
+2. **夹具的种子消息绕过序列号分配器 → 后续任何 `send_message` 都 INTERNAL。**
+   夹具此前用**手写 SQL** 插 `messages(sequence=1)`, 而
+   `conversation_sequences.next_sequence` 仍停在 1 —— 夹具造出了一个生产中
+   **不可能出现**的状态。之后真实 `send_message` 拿到同一个 1, 撞
+   `messages(conversation_id, sequence)` 唯一约束 -> `sqlx insert` 失败 ->
+   WS 侧只看到 `INTERNAL_ERROR: internal error`。已改为让种子消息也走
+   `MessageService::send_message`, 顺带不再在测试里复刻一遍生产逻辑。
+
+#### 症状在广播链路上, 原因却在夹具里 —— 所以先断言发送方 ack
+
+第 2 条最初表现为「Bob 收不到广播」。若照字面去查 `WsHub`, 会一路查错地方。
+因此该用例现在**先断言 Alice 收到了 `ok:true` 且回显 `req_id` 的 ack**, 再去
+查 Bob —— 一条分不清「动作失败」与「效果没传播」的失败信息是有害的:
+它把排查方向直接带偏。
 
 #### 附:文档自身的一处回归(已修)
 
 上一条 §1.21 插入时, 锚点选取把本节标题 `## 2. 后续新增` 一并吃掉了 ——
 表格行还在、标题没了。**编辑长文档时用「下一节标题」当锚点, 必须确认
-`replace_all=false` 唯一命中, 否则旧内容会被静默吃掉。** 已补回。
+`replace_all=false` 唯一命中, 且替换文本里要把那行重新写回去。** 已补回。
+
+#### 另一条独立的环境事实
+
+`task_stop` **只杀任务, 不杀子进程**: 被取消的 `cargo test` 仍在后台占着
+target 目录锁, 与新起的 `cargo` 互相阻塞, 表现为「Compiling 挂住不动」。
+手动清掉 `cargo`/`rustc`/`link`(按 `Path` 过滤, 避免误杀其他项目的编译)
+之后才恢复。
 
 ---
 
@@ -1502,7 +1536,7 @@ REST 全在 `/v1` 下的惯例**取 `/v1/ws`, 并在代码注释里写明「若�
 | **Dockerfile 无法在本机构建验证** | 2026-10-03 实测: BuildKit 成功加载并解析 `Dockerfile`(语法有效), 但拉 `rust:1.98.1-slim-bookworm` 报 `registry-1.docker.io ... EOF` —— 与 GitHub 同一个代理问题, 且本地无 `rust:*` 缓存 | 与「推送本地 commit」同一个阻塞源: **本地代理掐断外网 registry**。代理恢复后跑 `docker build -t im1.0-im-gateway:local .` 即可验证。**本条不声称镜像可用** —— 只声称 Dockerfile 语法有效。见 §1.17 |
 | **`NatsEventPublisher` 是静默 no-op** (D-3) | `publish()` 只发一条 `debug!`(默认不可见)并返回 `Ok(())` —— 每条 `im.message.{created,recalled,deleted}` 都被丢弃, 而 aux-04 §B.4「publish 事件供其他 pod 同步」这条**不变量**从未被满足。返回值/日志/指标三条渠道都指向「正常」 | 2026-10-03 **已改为可见**: `warn!` 每次 + `/metrics` 暴露 `im_events_dropped_total`。**D-3 本身仍未实装** —— 需可连的 NATS server 才能测(依赖 Docker Hub 恢复)。见 §1.19 |
 | **WS 端点路径 `/ws` vs `/v1/ws`, 文档自相矛盾** | `aux-13` 的 wscat 样例与 `Observability.md §1.1.3` 写 `/ws`; `ImplementationSpec §3.2`、`138-dev-plan.md`、`ws/router.rs` 写 `/v1/ws`。**双层 scope 导致的 `/v1/ws/ws` 已修**(那两边都不是), 但这两者之间该选哪个仍未定 | **需规范所有者裁决**。本次按代码既有意图 + 仓内 REST 全在 `/v1` 下的惯例取 `/v1/ws`; 改判为 `/ws` 只需改 `ws/router.rs` 一行。见 §1.22 |
-| im-gateway 26 个 e2e 仍**静默跳过** | `IM_REQUIRE_PG` 只覆盖新增的 WS 用例。既有 26 个 e2e 沿用 `else { return }`, CI 里**已经设了 PG service container**, 故当前不会静默; 但本机无 PG 时仍会「跳过并报通过」 | 建议把这 26 个也切到 `IM_REQUIRE_PG` 同一套机制(机械改动, 无语义风险)。未擅自批量改 —— 见 §1.15 / §1.22 |
+| im-gateway 26 个 e2e 仍**静默跳过** | ~~需 D-4 后在 CI 挂 PG service container~~ | ✅ **已根治** (2026-10-03): `IM_REQUIRE_PG=1` 时连不上 PG 直接 panic, 已接到 3 处连接池构造点(`test_support::e2e_pool` / `auth_handlers::e2e_pool` / `tests/migration_smoke_pg::pool`), CI 两个 job 均设上。带该开关跑全量: 410 passed / 0 failed, **零静默跳过**。见 §1.22 |
 
 ### 1.16 friends / media / me 共 8 个端点: 5 个已实装, 3 个卡在规范矛盾或缺基础设施 (2026-10-03)
 

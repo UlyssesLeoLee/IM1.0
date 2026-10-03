@@ -377,18 +377,8 @@ macro_rules! hz {
                 // 静默跳过是本仓最大的假绿灯向量(台账 §1.15), 而**本文件开头
                 // 就栽在它上面过**: Docker 停掉后 6 个用例全部「通过」, 实际
                 // 一个都没跑 —— 因为「跳过」在 test harness 里就是「通过」。
-                //
-                // 故 CI 用 `IM_REQUIRE_PG=1` 把跳过变成硬失败: 本机没 PG 仍然
-                // 允许跳过(否则无 PG 的开发机全红), 但**声称要跑 PG 的环境
-                // 里连不上就必须红**。
-                if std::env::var("IM_REQUIRE_PG").as_deref() == Ok("1") {
-                    panic!(
-                        "IM_REQUIRE_PG=1 但连不上 PG。这些用例**本该跑**, \
-                         静默跳过会让「跑过」与「没跑」无法区分 —— \
-                         2026-10-03 本文件就是这么骗过一次自己的。"
-                    );
-                }
-                eprintln!("skip: 未设 DATABASE_URL 或连不上 PG");
+                // 统一走共享实现, 免得两处同义逻辑各自漂移。
+                crate::http::test_support::skip_or_fail_pg("ws::e2e (需要 PG)");
                 return;
             }
         }
@@ -560,16 +550,17 @@ async fn ping_after_auth_gets_pong_with_the_same_ts() {
 async fn broadcast_reaches_other_members_but_never_a_non_member() {
     let (h, f) = hz!();
 
-    let alice = authed(&h, &f.alice_token).await.expect("alice auth");
+    let mut alice = authed(&h, &f.alice_token).await.expect("alice auth");
     let mut bob = authed(&h, &f.bob_token).await.expect("bob auth");
     let mut carol = authed(&h, &f.carol_token).await.expect("carol auth");
 
     // Alice 在 conv 里发消息; Bob 是该会话成员, Carol 不是
+    let req_id = uuid::Uuid::new_v4();
     alice
         .send_text(
             &serde_json::json!({
                 "type": "send_message",
-                "req_id": uuid::Uuid::new_v4(),
+                "req_id": req_id,
                 "conversation_id": f.conv.0,
                 "idempotency_key": uuid::Uuid::new_v4(),
                 "kind": "text",
@@ -578,6 +569,28 @@ async fn broadcast_reaches_other_members_but_never_a_non_member() {
             .to_string(),
         )
         .expect("send_message");
+
+    // **先确认发送方拿到了成功的 ack**, 再去查广播。
+    //
+    // 少了这一步, 「Bob 没收到」这句话有两种完全不同的成因:
+    //   (a) Alice 的 send_message 本身被拒(成员校验/序列号/内容 schema)
+    //   (b) 消息写进去了, 但广播没送达
+    // 而这两者的排查方向毫不相干 —— (a) 查 MessageService, (b) 查 WsHub。
+    // 一条分不清这两者的失败信息会把人直接引到错的地方。
+    let ack = alice
+        .next_json(Duration::from_secs(10))
+        .await
+        .expect("Alice 发送后应收到 ack");
+    assert_eq!(
+        ack.get("ok").and_then(|v| v.as_bool()),
+        Some(true),
+        "send_message 本身必须成功, 否则下面的广播断言无从谈起。收到: {ack}"
+    );
+    assert_eq!(
+        ack.get("req_id").and_then(|v| v.as_str()),
+        Some(req_id.to_string().as_str()),
+        "ack 必须回显 req_id, 否则无法确认这个 ack 是本次发送的。收到: {ack}"
+    );
 
     // Bob 必须收到
     let got = bob

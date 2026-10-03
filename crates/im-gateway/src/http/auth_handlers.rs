@@ -807,12 +807,18 @@ mod tests {
 
     async fn e2e_pool() -> Option<sqlx::PgPool> {
         let url = test_db_url()?;
-        sqlx::postgres::PgPoolOptions::new()
+        let pool = sqlx::postgres::PgPoolOptions::new()
             .max_connections(2)
             .acquire_timeout(std::time::Duration::from_secs(10))
             .connect(&url)
             .await
-            .ok()
+            .ok();
+        if pool.is_none() {
+            // 见 test_support::skip_or_fail_pg 的长注释: 跳过在 libtest 眼里
+            // 就是「通过」, 故必须在代码里决定「跳过」还是「失败」。
+            super::super::test_support::skip_or_fail_pg("auth_handlers::e2e_pool");
+        }
+        pool
     }
 
     const E2E_SECRET: &str = "e2e-server-secret-for-token-exchange";
