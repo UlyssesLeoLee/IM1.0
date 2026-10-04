@@ -24,6 +24,16 @@ use std::process::ExitCode;
 /// 刻意支持它而不只读环境变量: CI 里显式传参能让「连的是哪个库」出现在
 /// workflow 文件里, 读日志时不必去猜 job 级的 env 解析结果。
 fn arg_database_url() -> Option<String> {
+    // 该规则针对的是把 `args` 拼进**安全敏感操作**(如拼命令行走 exec)。
+    // 此处是迁移二进制读**自己的** argv 取 `--database-url`, 是 CLI 的本职,
+    // 不存在「不可信输入拼进危险调用」的结构。反过来讲: 真正的连接串来自
+    // IM_POSTGRES_URL 环境变量, 这里的命令行参数只是显式覆盖, 且下游
+    // parse_database_url 只做「找到 flag 后取下一个非空串」, 不做任何拼接执行。
+    //
+    // 注意: `nosemgrep` **只对紧邻的下一行生效**。第一版把它写在这段说明**上方**,
+    // 中间隔了 4 行说明, 关联就断了 —— 扫描仍报出该 finding, 是靠隔离探针
+    // (同目录三种写法 + 一个不抑制的对照组)才发现的, 不是什么玄学。
+    // nosemgrep: rust.lang.security.args.args
     parse_database_url(std::env::args().skip(1))
 }
 

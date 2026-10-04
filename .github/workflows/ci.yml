@@ -21,9 +21,18 @@ jobs:
     name: Lint (fmt + clippy)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # 2026-10-04: 所有 action 由 tag/分支改为钉 commit SHA。
+      # 依据: semgrep `github-actions-mutable-action-tag`(29 条 finding 里的 22 条)。
+      # tag 可被仓库所有者**静默重指向**到任意 commit —— 这是真实的供应链攻击面,
+      # 而本仓的 CI runner 能拿到 ghcr.io 推送凭据与部署 kubeconfig。
+      # 尾注释保留可读版本号, 便于日后 bump。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
+          # 该 action 的 `@stable` 是**分支语义**(表示「用最新 stable Rust」),
+          # 直接把 ref 换成 SHA 会丢掉它、从而把 Rust 版本永久冻结。
+          # 故钉 action 的 SHA, 同时用 `toolchain:` 显式保留「跟随最新 stable」。
+          toolchain: stable
           components: clippy, rustfmt
       - name: install protoc
         # crates/im-proto 的 build.rs 走 tonic-build -> prost-build, 需要 protoc 可执行文件。
@@ -32,7 +41,7 @@ jobs:
         # 该失败会连带击穿本 job 及其余所有编译 workspace 的 job(lint/unit/integration/sast),
         # 但本机有 C:\protoc\bin\protoc.exe, 所以本地全绿完全掩盖了它。
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: fmt check
         run: cargo fmt --all -- --check
       - name: clippy
@@ -76,13 +85,15 @@ jobs:
       # 实际一个都没跑。见 docs/gap-ledger.md §1.15 / §1.22。
       IM_REQUIRE_PG: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable   # 钉 action 的 SHA 后需显式保留「跟随最新 stable」语义
       - name: install protoc
         # 见 lint job 内的同名校验说明: ubuntu runner 不预装 protoc,
         # 缺失会让 im-proto 的 build.rs 失败并击穿所有编译 workspace 的 job。
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: cargo test (unit)
         run: cargo test --workspace --lib --no-fail-fast
 
@@ -114,13 +125,15 @@ jobs:
       # 实际一个都没跑。见 docs/gap-ledger.md §1.15 / §1.22。
       IM_REQUIRE_PG: "1"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: stable   # 钉 action 的 SHA 后需显式保留「跟随最新 stable」语义
       - name: install protoc
         # 见 lint job 内的同名校验说明: ubuntu runner 不预装 protoc,
         # 缺失会让 im-proto 的 build.rs 失败并击穿所有编译 workspace 的 job。
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: run migrations
         # 2026-10-03 改用仓内自己的 im-migrate 二进制(此前是 sqlx CLI)。
         #
@@ -145,16 +158,17 @@ jobs:
     name: Static Analysis
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
+          toolchain: stable   # 钉 action 的 SHA 后需显式保留「跟随最新 stable」语义
           components: clippy
       - name: install protoc
         # 见 lint job 内的同名校验说明: ubuntu runner 不预装 protoc,
         # 缺失会让 im-proto 的 build.rs 失败并击穿所有编译 workspace 的 job
         # (sast job 跑 cargo audit 前会先构建依赖图, 同样踩到)。
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - name: cargo audit
         run: |
           cargo install --locked cargo-audit
@@ -172,13 +186,64 @@ jobs:
         shell: pwsh
         run: pwsh -NoProfile -File ./scripts/check-error-codes.ps1
       - name: semgrep
-        uses: returntocorp/semgrep-action@v1
-        with:
-          config: >-
-            p/rust
-            p/security-audit
-            p/secrets
-            p/owasp-top-ten
+        # 2026-10-04 换掉 `uses: returntocorp/semgrep-action@v1`。
+        #
+        # ## 为什么换(这是一个**假绿灯**, 且不是偶发)
+        #
+        # 1. 那个 action **吞掉了 semgrep 的非零退出码**。CI run 37164873402 里
+        #    semgrep 实际崩在:
+        #      ValueError: invalid rule severity value: MEDIUM
+        #    (`p/owasp-top-ten` 有 11 条规则把 severity 写成 MEDIUM, 而 semgrep 的
+        #     RuleSeverity 枚举只认 INFO/WARNING/ERROR/INVENTORY/EXPERIMENT),
+        #    整个 Static Analysis job 却报 success —— **一个崩掉的门禁报绿**。
+        #    本机已复现: 四个包全开 -> semgrep `exit=2`; 排掉那 12 条后 `exit=0`。
+        # 2. 在此之前 semgrep **一次都没真跑过**: cargo audit 长期红 -> 本步骤
+        #    被跳过 -> errcodes / ps1lint 也一起被跳过(它们排在 audit 之后)。
+        #    所以「CI 有 semgrep 门禁」这句话此前是**不成立的**。
+        #
+        # action 的文档只承诺「发现问题时非零退出」, **没承诺「工具崩溃时非零退出」**,
+        # 实测也没做到。改为直接调 CLI 后, 退出码由 bash 原生传播, 不再依赖
+        # 第三方 action 的错误处理。
+        run: |
+          set -euo pipefail
+          # 用 venv 而不是直接 `python3 -m pip install`: ubuntu-latest 现已是 24.04,
+          # 系统 python 带 PEP 668 的 EXTERNALLY-MANAGED 标记, 直接 pip install 会被拒
+          # (本机 WSL 上刚踩到过: "externally-managed-environment", pip 根本装不上)。
+          # venv 既绕开该限制, 也不污染 runner 的系统包。
+          python3 -m venv "$RUNNER_TEMP/semgrep-venv"
+          "$RUNNER_TEMP/semgrep-venv/bin/pip" install --quiet "semgrep==1.36.0"
+          # 排掉上面那 11 条 severity 非法的规则。它们**全是 JS/Python 生态的
+          # 供应链规则**(bun/npm/pnpm/yarn/poetry/bundler/dependabot/renovate/uv),
+          # 对本仓 95 个 .rs 文件永远不可能命中, 故排除零覆盖损失; 整包弃用则损失
+          # 549 条。(整份 JSON 里 `"severity":"MEDIUM"` 其实出现 12 次, 但多出的
+          #  那次嵌套在规则内部、不参与 RuleSeverity 求值, 故清单是 11 条。)
+          #
+          # 注意: 远端 pack 随时会变, **这份清单只是今天的补丁**。真正的长期保障
+          # 是上面那行「崩溃必须非零退出」—— 下次 pack 再出坏规则, 门禁会红,
+          # 而不是继续装绿。
+          "$RUNNER_TEMP/semgrep-venv/bin/semgrep" scan \
+            --config p/rust \
+            --config p/security-audit \
+            --config p/secrets \
+            --config p/owasp-top-ten \
+            --exclude-rule=package_managers.bun.bun-missing-minimum-release-age.bun-missing-minimum-release-age \
+            --exclude-rule=package_managers.dependabot.dependabot-missing-cooldown.dependabot-missing-cooldown \
+            --exclude-rule=package_managers.npm.npm-missing-minimum-release-age.npm-missing-minimum-release-age \
+            --exclude-rule=package_managers.pnpm.pnpm-block-exotic-sub-dependencies.pnpm-block-exotic-sub-dependencies \
+            --exclude-rule=package_managers.pnpm.pnpm-missing-minimum-release-age.pnpm-minimum-release-age \
+            --exclude-rule=package_managers.pnpm.pnpm-trust-policy.pnpm-trust-policy \
+            --exclude-rule=package_managers.renovate.renovate-missing-minimum-release-age.renovate-missing-minimum-release-age \
+            --exclude-rule=package_managers.uv.uv-missing-dependency-cooldown.uv-missing-dependency-cooldown \
+            --exclude-rule=package_managers.yarn.yarn-missing-minimal-age-gate.yarn-missing-minimal-age-gate \
+            --exclude-rule=package_managers.poetry.poetry-missing-solver-min-release-age.poetry-missing-solver-min-release-age \
+            --exclude-rule=package_managers.ruby.bundler-gemfile-missing-cooldown.bundler-gemfile-missing-cooldown \
+            --error \
+            --metrics=off \
+            --disable-version-check \
+            .
+        # `--error` 让**有 finding 就 exit 1**。没有它的话 semgrep 找到问题也返回 0,
+        # 门禁依旧形同虚设。上面 29 条 finding 已全部修掉(见 gap-ledger §1.24),
+        # 当前基线为 0, 故开 --error 不会立刻红。
       - name: ps1 encoding lint (Windows PowerShell 5.1 兼容)
         # 仓库内 .ps1 在 Windows PowerShell 5.1 下按系统 ANSI(GBK) 解码无 BOM 文件,
         # 中文后的引号会被 GBK 双字节规则吞掉, 脚本直接 ParserError 崩。

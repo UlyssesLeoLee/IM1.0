@@ -17,6 +17,12 @@ spec:
     spec:
       containers:
         - name: valkey
+          # 2026-10-04 semgrep allow-privilege-escalation: 容器须显式禁止提权
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           image: valkey/valkey:8
           ports:
             - containerPort: 6379

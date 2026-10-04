@@ -17,6 +17,12 @@ spec:
     spec:
       containers:
         - name: nats
+          # 2026-10-04 semgrep allow-privilege-escalation: 容器须显式禁止提权
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
           image: nats:2.10-alpine
           args:
             - "--jetstream"

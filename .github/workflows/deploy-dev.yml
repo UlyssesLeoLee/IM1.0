@@ -25,7 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     environment: dev
     steps:
-      - uses: actions/checkout@v4
+      # 2026-10-04: action 由 tag 改为钉 commit SHA(依据: semgrep
+      # `github-actions-mutable-action-tag`)。本 workflow 能拿到共享 K3s dev
+      # 集群的 kubeconfig 与 Slack webhook, 属于高价值凭据。
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Setup kubeconfig
         env:
@@ -93,11 +96,30 @@ jobs:
 
       - name: Notify Slack
         if: always()
-        uses: slackapi/slack-github-action@v1
+        uses: slackapi/slack-github-action@fcfb566f8b0aab22203f066d80ca1d7e4b5d05b3 # v1
         with:
           payload: |
             {
-              "text": "IM1.0 dev deploy ${{ job.status }}: ${{ github.event.head_commit.message }}"
+              "text": "IM1.0 dev deploy ${{ job.status }} — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             }
+        # 2026-10-04 修 payload 注入(本条 semgrep 报不出来 —— 它只扫 `run:` 块,
+        # 不扫 `with:`, 是人工复核 workflow 时看到并确认的)。
+        #
+        # 原写法把 `${{ github.event.head_commit.message }}` 裸插进 JSON 字符串。
+        # 该值**完全由推送者控制**, 一个含 `"` 的提交信息就能闭合字符串、注入
+        # 伪造字段, 往 Slack 发任意内容(社工/钓鱼链接)。
+        #
+        # ## 为什么是「删掉」而不是「转义」
+        #
+        # 转义当然做得到(前一步用 jq 生成合法 JSON, 再用 `payload: |` 块标量传回),
+        # 但那条路要同时躲开两个坑: jq 输出的 JSON 以 `{` 开头, 直接写进
+        # `with: payload:` 会被 YAML 当成流式映射而非字符串; 而 GitHub 是
+        # **先做文本替换再解析 YAML**, 所以替换结果必须同时对 JSON 和 YAML 安全。
+        # 与其叠这两层精巧, 不如**不把不可信输入放进去** —— 下面是 run 链接,
+        # `github.server_url` / `github.repository` / `github.run_id` 都不受
+        # 提交者控制, 无需任何转义。
+        #
+        # **行为变化**: 通知里不再显示提交信息, 改为给出 run 链接(点进去能看到
+        # 提交信息)。若要恢复显示, 应按上面那条 jq + 块标量的路子做, 不要改回裸插。
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}

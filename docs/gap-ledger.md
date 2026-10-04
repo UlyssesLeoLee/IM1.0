@@ -1597,6 +1597,142 @@ TLS 终止), 并明写「**别只是把本测试改回通过 —— 那是把安
 **判别式**: 删依赖 / 改配置后, grep 一遍被删符号的名字 —— 注释和文档里的
 「幽灵引用」不会有编译错误, 只会静静地指向空气。
 
+### 1.24 semgrep 门禁**从未真正运行过**, 却一直报绿 (2026-10-04 已修)
+
+CI run `37164873402`(§1.23 之后的首次全绿)里, 我按惯例去读日志而不是只看 job 结论,
+看到 Static Analysis 报 success, 而 semgrep 实际崩在:
+
+```
+ValueError: invalid rule severity value: MEDIUM
+  File ".../semgrep/semgrep_main.py", line 512, in <lambda>
+    filtered_rules, lambda rule: rule.severity == RuleSeverity.EXPERIMENT
+```
+
+**这比 §1.23 修掉的 3 个漏洞更严重**: 那 3 个是「已知的洞」, 而这个是**门禁本身在说谎**。
+
+#### 两层问题, 必须分开看
+
+| 层 | 事实 | 证据 |
+|---|---|---|
+| **A: semgrep 自己崩了** | `p/owasp-top-ten` 里有 **11 条规则**把 `severity` 写成 `MEDIUM`, 而 semgrep 的 `RuleSeverity` 枚举只认 `INFO/WARNING/ERROR/INVENTORY/EXPERIMENT` | 拉 4 个 pack 的 JSON 逐个统计: 只有 owasp-top-ten 出现 `MEDIUM`, 其余 3 个包干净 |
+| **B: action 吞掉了非零退出码** | `returntocorp/semgrep-action@v1` 在 semgrep 崩溃后**没有**让 step 失败, job 照旧 success | 日志里 semgrep 段**没有任何 `end-action` 结论行**, 而 job 结论是 success |
+
+B 层才是要害: **即使把 A 修好, 这个门禁仍然没有牙** —— 将来任何 semgrep 故障
+(规则包改坏、引擎 OOM、超时)都会继续伪装成绿灯。action 的文档只承诺
+「发现问题时非零退出」, **没承诺「工具崩溃时非零退出」**。
+
+#### 更糟的一层: 它**一次都没跑过**
+
+`cargo audit` 长期红 → 失败后 GitHub Actions 跳过**后续所有 step** → 而
+`check error codes` / `semgrep` / `ps1 encoding lint` 全都排在 audit 之后。
+
+所以在 §1.23 之前, 这三个 step **在 CI 上从未真正执行过一次**。日志里出现的
+101 处 "semgrep" 全部来自 `Set up job` 阶段预拉 `semgrep-action` 镜像, 不是扫描。
+**「本仓有 semgrep 门禁」这句话此前是不成立的。**
+
+#### 本机复现: semgrep 在原生 Windows 上跑不了
+
+`pip install semgrep` 能装上(PIP_EXIT=0), 但 `import resource` 是 Unix-only,
+必然 `ModuleNotFoundError`。最终走 WSL: `get-pip.py --user --break-system-packages`
+(Ubuntu 24.04 的 PEP 668 externally-managed 会直接拒), 再 `pip install semgrep==1.36.0`
+(CI 里的同版本)。
+
+复现结果与 CI 完全一致:
+
+| 场景 | 退出码 |
+|---|---|
+| 4 个包全开(不排除) | **exit=2**(崩溃) |
+| 排除那 12 条 `MEDIUM` 规则 | **exit=0**, 725 条规则扫 358 个文件, **29 findings** |
+
+#### 排除清单的条数: 11, 不是 12 —— 差的那 1 次是**嵌套**的
+
+最初按正则统计整份 JSON, `"severity":"MEDIUM"` 命中 **12** 次, 于是各处都写了
+「12 条规则」。实跑排除 11 条就能通过, 遂回头逐条核对:
+
+| 口径 | 数量 |
+|---|---|
+| 顶层规则里 `severity == "MEDIUM"` | **11** |
+| 整份 JSON 里 `"severity":"MEDIUM"` 出现次数 | **12** |
+
+差的 1 次**嵌套在规则内部**(非规则级 severity), semgrep 不会拿它去求
+`RuleSeverity`, 因此不参与崩溃。**排除清单按 11 条写才是对的。**
+
+这条差值本身是个提醒: **正则计数与结构化计数不是一回事**。若当时照着 12 写
+排除清单, 清单里会多一条根本不存在的 rule id(无害, 但会让下一个人花时间
+去查「这条规则是哪来的」); 反过来若少写一条, 门禁就会莫名其妙地红。
+
+#### 29 条 finding: 门禁一开就全是真问题
+
+| 条数 | 规则 | 处置 |
+|---|---|---|
+| 22 | `github-actions-mutable-action-tag` | 全部 action 钉 commit SHA |
+| 5 | `allow-privilege-escalation-no-securitycontext` | 8 个容器(含 initContainer)加 `allowPrivilegeEscalation: false` + `capabilities.drop: [ALL]` |
+| 1 | `run-shell-injection`(`release.yml`) | `${{ }}` 改走 `env:` + `"$VAR"` |
+| 1 | `rust.lang.security.args.args` | 定向 `nosemgrep` + 理由 |
+
+其中两条是**真漏洞, 不是误报**:
+
+1. `release.yml` 把 `${{ github.ref_name }}` 直接插进 shell heredoc。`${{ }}` 是
+   **文本替换, 发生在 shell 解析之前**, 所以标签名里的 `$(...)`/反引号会被当命令执行 ——
+   而本 workflow 是 tag 触发, **标签名可任意构造**, 这是可达的攻击面。
+2. `dtolnay/rust-toolchain@stable` 的 `@stable` 是**分支语义**(「用最新 stable Rust」)。
+   直接把 ref 换成 SHA 会丢掉它、**把 Rust 版本永久冻结**。正解是
+   **钉 action 的 SHA + 显式 `with: toolchain: stable`**, 两者不冲突。
+
+#### 额外发现一条 semgrep 看不见的(人工复核 workflow 时看到)
+
+`deploy-dev.yml` 的 Slack 通知把 `${{ github.event.head_commit.message }}` 裸插进
+JSON payload。**提交信息完全由推送者控制**, 一个含 `"` 的信息就能闭合字符串、
+注入伪造字段, 往 Slack 发任意内容(社工/钓鱼)。semgrep 报不出来是因为它只扫
+`run:` 块, 不扫 `with:`。
+
+**处置是「删掉不可信输入」而不是「转义它」。** 转义做得到(前一步 `jq` 生成合法
+JSON, 再用 `payload: |` 块标量传回), 但那条路要同时躲两个坑: jq 输出的 JSON 以
+`{` 开头, 直接写进 `with: payload:` 会被 YAML 当**流式映射**而非字符串; 而
+GitHub 是**先做文本替换再解析 YAML**, 替换结果必须同时对 JSON 和 YAML 安全。
+现改为发 run 链接 —— `github.server_url` / `github.repository` /
+`github.run_id` 都不受提交者控制, **无需任何转义**。
+
+**行为变化**: 通知不再显示提交信息, 改为给 run 链接(点进去能看到)。若日后要
+恢复显示, 应走上面那条 jq + 块标量的路子, **不要改回裸插**。
+
+> 这里值得记一笔的是**过程**: 我第一版改成了 `toJSON()`, 自审时才发现它是错的 ——
+> `toJSON()` 返回的是**带引号的 JSON 字符串**, 嵌进已有引号里会得到
+> `"text": "...prefix "hello" suffix"`, JSON 直接坏掉。`toJSON` 只能用在
+> 「整个值」的位置。加上 §1.24 里的 pipefail 回归, 这条工作线上一共出现过
+> **三次「想当然的修复」**, 两次是自己读代码时抓到的, 一次是实跑抓到的。
+> 与其再叠一层精巧, 不如把危险输入拿掉。
+
+#### `nosemgrep` 只对**紧邻的下一行**生效 —— 靠隔离探针才发现
+
+抑制 `args` 那条时, 我把 `// nosemgrep:` 写在 5 行**说明注释的上方**, 扫描仍报出。
+隔离探针(同目录三种写法 + **一个不抑制的对照组**)结论:
+
+| 写法 | 结果 |
+|---|---|
+| A: 注释在上一行 | 已抑制 |
+| B: 注释在同行行尾 | 已抑制 |
+| C: **不抑制(对照组)** | **仍报出** |
+
+对照组是关键: 若三种写法都不报, 就无法区分「抑制生效」与「规则没触发」——
+**一个没有对照组的抑制实验, 证明不了任何事**。最终把 `nosemgrep` 挪到紧邻代码处。
+
+#### 验证(不是推断)
+
+- **门禁有牙**: 故意不排除那 12 条 → **exit=2**; 换成 CI 同款命令 → **exit=0**。
+  两条都是实跑, 不是推理。
+- 修完后 CI 同款命令: **725 条规则 / 358 个文件 / 0 finding / exit=0**。
+- 本地五道门: fmt exit 0、ps1lint exit 0(12 个 .ps1 全 OK)。
+- 3 个 workflow YAML 与 5 个 k8s manifest 均用 PyYAML 解析通过; 8 个容器
+  的 `securityContext` 用脚本逐个断言存在(不是靠肉眼看)。
+
+#### 未验证的部分(必须写明)
+
+k8s 那 5 处 `securityContext` **没有在真集群上 apply 过** —— F-2/F-3 的部署端到端
+本来就没跑通(K3s API 曾超时), 且 Docker daemon 现已停掉。故本次只声称
+「YAML 结构正确、字段已就位」, **不声称「已验证不破坏现有工作负载」**。
+`capabilities.drop: [ALL]` 对 postgres/nats/valkey 官方镜像的兼容性同理未实测。
+
 ---
 
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
