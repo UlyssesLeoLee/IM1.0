@@ -1616,7 +1616,6 @@ ValueError: invalid rule severity value: MEDIUM
 |---|---|---|
 | **A: semgrep 自己崩了** | `p/owasp-top-ten` 里有 **11 条规则**把 `severity` 写成 `MEDIUM`, 而 semgrep 的 `RuleSeverity` 枚举只认 `INFO/WARNING/ERROR/INVENTORY/EXPERIMENT` | 拉 4 个 pack 的 JSON 逐个统计: 只有 owasp-top-ten 出现 `MEDIUM`, 其余 3 个包干净 |
 | **B: action 吞掉了非零退出码** | `returntocorp/semgrep-action@v1` 在 semgrep 崩溃后**没有**让 step 失败, job 照旧 success | 日志里 semgrep 段**没有任何 `end-action` 结论行**, 而 job 结论是 success |
-
 B 层才是要害: **即使把 A 修好, 这个门禁仍然没有牙** —— 将来任何 semgrep 故障
 (规则包改坏、引擎 OOM、超时)都会继续伪装成绿灯。action 的文档只承诺
 「发现问题时非零退出」, **没承诺「工具崩溃时非零退出」**。
@@ -1716,6 +1715,22 @@ GitHub 是**先做文本替换再解析 YAML**, 替换结果必须同时对 JSON
 
 对照组是关键: 若三种写法都不报, 就无法区分「抑制生效」与「规则没触发」——
 **一个没有对照组的抑制实验, 证明不了任何事**。最终把 `nosemgrep` 挪到紧邻代码处。
+
+#### 一条必须写明的判据修正: `end-action` 只对 `uses:` 步骤有意义
+
+本节开头用「semgrep 段没有 `end-action` 结论行」当作崩溃的证据 —— 那是**当时**的
+step 类型(`uses:`)下才成立的判据。
+
+替换成 `run:` 之后, **该 step 同样没有 `end-action` 行, 但这是正常的**:
+GitHub Actions 只为 `uses:` 步骤发 `end-action`, `run:` 步骤一律不发。
+若沿用旧判据, 会在修好之后继续把「没有 end-action」读成崩溃, 或者反过来在
+真出问题时误判为正常。
+
+**换 step 类型就得换判据。** 现在判「semgrep 是否正常跑完」看的是:
+
+1. 该 job 实际执行过的 step 名字里**有** `semgrep`(`run:`/`uses:` 都适用, 最可靠);
+2. semgrep **自己的结论行**且数字对得上: `Ran 725 rules on 358 files: 0 findings`;
+3. 紧随其后的 `ps1 encoding lint` 照常执行(证明前一步没有中断整个 job)。
 
 #### 验证(不是推断)
 
