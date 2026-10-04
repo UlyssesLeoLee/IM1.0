@@ -53,6 +53,7 @@ __pycache__/
 *.pyc
 
 # ===== 临时文件 =====
+dist/
 fp.txt
 auxout.txt
 c1.txt

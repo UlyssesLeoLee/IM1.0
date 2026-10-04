@@ -1748,6 +1748,146 @@ k8s 那 5 处 `securityContext` **没有在真集群上 apply 过** —— F-2/F
 「YAML 结构正确、字段已就位」, **不声称「已验证不破坏现有工作负载」**。
 `capabilities.drop: [ALL]` 对 postgres/nats/valkey 官方镜像的兼容性同理未实测。
 
+### 1.25 三个镜像**一个都构建不出来** —— 首次真构建才暴露 (2026-10-04 已修)
+
+长期挂着「镜像实际构建未验证」这条。起因是网络: 本机代理 10808 下线, 但
+**Docker Hub 直连是通的** —— 于是这个卡了很久的 blocker 反而先解开了。
+`docker pull rust:1.98.1-slim-bookworm` 成功, 于是第一次真正跑了 `docker build`。
+
+结果: **三个 Dockerfile 全部失败或产出错误的东西。**
+
+#### 1. `im-gateway.Dockerfile` 缺 `libprotobuf-dev` —— CI 绿而 Docker 红
+
+```
+protoc failed: google/protobuf/empty.proto: File not found.
+google/protobuf/timestamp.proto: File not found.
+```
+
+`core.proto` import 了两个 well-known types, 而 `build.rs` 只给了 `&["proto"]`
+作 include 路径、**没设 `PROTOC_INCLUDE`**, 完全依赖系统那份。
+
+**关键在于两个发行版的打包不同**:
+
+| 发行版 | `protobuf-compiler` 是否带 `/usr/include/google/protobuf/*.proto` |
+|---|---|
+| Ubuntu | **带**(顺带提供) |
+| Debian | **不带**(在 `libprotobuf-dev` 里) |
+
+CI 跑在 ubuntu-latest 上, 所以**一直是绿的**; 而镜像基础镜像是
+`debian:bookworm-slim`, 只有 Docker 构建会炸。同一个 `build.rs`, 两条路径两种结果。
+
+**判别式: 「本机能编」和「CI 能编」都不能替代「镜像能编」** —— 它们连
+发行版都不是同一个。凡是「构建步骤依赖系统预置文件」的地方, 都要问一句
+**目标基础镜像里到底有没有**。
+
+#### 2. `docker build --check` **抓不到上面这个错**
+
+三个文件 `--check` 全部 `no warnings found`。BuildKit 的 linter 检查的是
+Maintainer/secret/ARG 那一类**惯例问题**, 不验证「COPY 的源在构建产物里是否存在」。
+故**静态检查通过 ≠ 能构建**, 容器这条只能靠真构建。
+
+#### 3. `im-core.Dockerfile` 叠了三重错
+
+原文是:
+
+```dockerfile
+COPY --from=builder /build/target/release/im-core /usr/local/bin/im-core 2>/dev/null || \
+     COPY --from=builder /build/target/release/im-gateway /usr/local/bin/im-core
+```
+
+1. **COPY 后面没有 shell** —— `2>/dev/null ||` 会被当成源路径的一部分, 语法非法。
+2. **源文件永远不存在** —— `crates/im-core` **没有 `src/main.rs`**, 是纯库 crate
+   (`lib.rs` + 无 `[[bin]]`), `cargo build -p im-core` 根本不产出可执行文件。
+3. 就算能跑, 一个「叫 im-core、内容是 gateway」的二进制会**主动误导**排障的人。
+
+改为显式构建 `im-gateway` 并**如实命名**; V1 真拆出独立进程、im-core 有了
+真实 `main.rs` 之后再改。
+
+#### 4. `im-migrate.Dockerfile` 与 `migrate-job.yaml` **直接矛盾**
+
+`migrate-job.yaml` 从 2026-10-03 起就写着 `command: ["/app/im-migrate"]`,
+并附注释「不用 `command: ["sqlx","migrate","run"]`: 那要求镜像里装 sqlx CLI」。
+
+**而 Dockerfile 当时没跟着改** —— 它 `cargo install sqlx-cli`、ENTRYPOINT 指向
+`sqlx`、把 `migrations/` 当独立目录 COPY 进去。两者对不上的后果很具体:
+**Job 跑 `/app/im-migrate`, 镜像里根本没有这个文件** -> 容器直接 crash, 迁移永远跑不了。
+
+同一个缺陷在 `im-gateway.yaml` 的 `run-migrations` initContainer 里也有一份:
+`command: ["sqlx", ...]` + `IM_DATABASE_URL`(这个变量名**根本不存在**,
+`AppConfig` 的字段是 `postgres_url`, 按 `IM_<UPPER_SNAKE>` 规则对应
+`IM_POSTGRES_URL`)。
+
+**2026-10-03 那次修复只改了 manifest, 漏了 Dockerfile 和另一个 manifest** ——
+因为镜像从没被构建过, 没人能发现两处对不上。
+
+#### 5. `secrets-template.yaml` 漏声明 `postgres-credentials`
+
+`postgres.yaml` x3 + `im-gateway.yaml` x2 都在引用它, 模板里**只声明了
+`im-core-env`**。缺它时 postgres 容器拿不到凭据 -> `CreateContainerConfigError`
+-> Pod 卡在 `ContainerCreating`, 整个 namespace 起不来。已补上。
+
+#### 6. 顺带: `EXPOSE 9000` 与实际不符
+
+两个 Dockerfile 都 `EXPOSE 8080 9000`, 但本仓**没有任何 gRPC server**
+(`grep -rn 9000 crates/` 无监听方; im-gateway.yaml 的 9000 Service 端口
+早已删除)。留一个永不监听的端口只会让人以为有可连的 gRPC 端点, 已删。
+
+#### 7. 修日志时, 我自己又引入一个 bug —— 靠实测抓住
+
+`im-migrate` 的收尾日志写着「跑之前先报总数, 跑之后报**实际执行数**……两者不等
+(本次没新增)时, 日志里能直接看出『这次是空跑』」, 但那行 SQL 是
+`SELECT count(*) FROM _sqlx_migrations WHERE success` —— 数的是**表里全部成功行**,
+与本次运行无关, 所以 `applied` 永远等于 `total`, **它声称要解决的困惑根本没被解决**。
+
+改成「跑前记一次、跑后记一次、取差值」之后, **第一版守卫写错了**:
+
+```sql
+SELECT CASE WHEN to_regclass('public._sqlx_migrations') IS NULL THEN 0
+            ELSE (SELECT count(*) FROM _sqlx_migrations WHERE success) END
+```
+
+看着能兼顾「新库还没这张表」, 实测在**全新库上报错**, 被 `unwrap_or(-1)` 吞成
+-1, 于是日志打出「本次应用了 **8** 份」这种明显荒谬的数。
+
+原因: **PG 在解析/计划阶段就解析子查询里的表名**, relation 不存在直接报错,
+`CASE` 的短路求值没机会生效。表在不在的判断必须在**独立于该表**的查询里做。
+改成两次查询。
+
+**而新库正是首次安装的主路径** —— 只测「已迁移库的空跑」那条会完全错过它。
+四个用例实测全对:
+
+| 场景 | 结果 |
+|---|---|
+| 全新空库 | `applied_before=0 applied_now=7`, exit 0 |
+| 立刻重跑 | `applied_before=7 applied_now=0`, exit 0 |
+| 已迁移过的库 | `applied_now=0`, exit 0 |
+| 手工建表的库 | **拒绝**, exit 1(`is_clean_target` 生效) |
+
+#### 验证(全部实跑)
+
+| 项 | 数字 |
+|---|---|
+| `im-gateway` 镜像 | **141MB, 构建 exit 0**; 跑起来 exit 78 并给出 `IM_POSTGRES_URL + IM_JWT_SIGNING_KEYS + IM_REFRESH_PEPPER` 提示; `id -u` = **1000**(非 root) |
+| `im-migrate` 镜像 | **132MB, exit 0**; 内含 `/app/im-migrate`, **无 sqlx**, **无 /migrations**(迁移已内嵌) |
+| `im-core` 镜像 | **141MB, exit 0**; 日志前缀 `[im-gateway]`, 如实反映内容 |
+| 端到端迁移 | 新空库 `applied_now=7`; `_sqlx_migrations` 恰好 **7 行**无重复; 15 张表; 2 个触发器只建一次 |
+| 幂等 | 第二次跑 exit 0, 行数不变 |
+| `ldd` | 二进制只依赖 `libgcc_s` / `libm` / `libc` —— **镜像里装的 `libssl3` 其实用不到** |
+| 本地门 | fmt exit 0(修完新代码后); 5 个 k8s manifest + 3 个 workflow YAML 解析通过; 8 个容器 `securityContext` 逐个断言存在 |
+
+#### 未验证
+
+**两个 k8s 清单的 `securityContext` 没有在真集群上 apply 过**(F-2/F-3 部署端到端
+仍未跑通), 只声称「YAML 结构正确、字段已就位」, **不声称不破坏现有工作负载**;
+`capabilities.drop: [ALL]` 对 postgres/nats/valkey 官方镜像的兼容性同理未实测。
+
+#### 顺带发现一处 CI 抓不到的矛盾, 需部署负责人定
+
+`database-url` 这个键在 **`postgres-credentials`**(im-gateway 用)与
+**`im-core-env`**(migrate-job 用)里**各有一份**。两处都得手工填, 改一处忘另一处
+就会连不上库。**需要一个单一事实源。** 本次未擅自统一, 因为这取决于真实集群里
+已经存在哪个 Secret。
+
 ---
 
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)

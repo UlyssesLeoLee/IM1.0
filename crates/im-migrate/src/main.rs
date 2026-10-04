@@ -55,6 +55,46 @@ fn parse_database_url<I: Iterator<Item = String>>(args: I) -> Option<String> {
     None
 }
 
+/// 已成功应用的迁移份数
+///
+/// ## 为什么是两次查询, 而不是一条带 CASE 的
+///
+/// 第一版写成:
+/// ```text
+/// SELECT CASE WHEN to_regclass('public._sqlx_migrations') IS NULL THEN 0
+///            ELSE (SELECT count(*) FROM _sqlx_migrations WHERE success) END
+/// ```
+/// 看着能兼顾「新库还没这张表」与「老库数行数」, 实际**在全新库上报错**,
+/// 被 `unwrap_or(-1)` 吞成 -1。实测: 新库上 `applied_before=-1`,
+/// 于是 `applied_now = 7 - (-1) = 8` —— 日志里出现「本次应用了 8 份」这种
+/// 明显荒谬的数。
+///
+/// 原因: **PG 在解析/计划阶段就解析子查询里的表名**, relation 不存在会直接
+/// 报错, `CASE` 的短路求值根本没机会生效。表存在与否的判断必须在**独立于该表**
+/// 的查询里做。
+///
+/// -1 与 0 必须区分: 0 是「确实没应用过」, -1 是「查不到, 未知」。把未知说成 0,
+/// 恰好会重演本函数要修的那个毛病(数字看着正常, 其实没说真话)。
+async fn applied_migration_count(pool: &sqlx::PgPool) -> i64 {
+    // 第一步: 这张表在吗? (`to_regclass` 在表不存在时返回 NULL 而不是报错)
+    let exists: Option<String> =
+        sqlx::query_scalar("SELECT to_regclass('public._sqlx_migrations')::text")
+            .fetch_one(pool)
+            .await
+            .ok()
+            .flatten();
+
+    match exists {
+        None => 0,
+        Some(_) => {
+            sqlx::query_scalar("SELECT count(*)::bigint FROM _sqlx_migrations WHERE success")
+                .fetch_one(pool)
+                .await
+                .unwrap_or(-1)
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
@@ -115,20 +155,40 @@ async fn main() -> ExitCode {
         }
     }
 
-    // 跑之前先报总数, 跑之后报实际执行数 —— 两者不等(本次没新增)时, 日志
-    // 里能直接看出「这次是空跑」。CI 里最常见的困惑是「Job 成功了但好像
-    // 什么都没做」, 这行就是给那种困惑用的。
+    // 跑之前先记一次「已应用数」, 跑完再记一次, **差值**才是本次真正执行的份数。
+    //
+    // 2026-10-04 修: 此前这里只查了跑**之后**的
+    // `SELECT count(*) FROM _sqlx_migrations WHERE success`, 并把它叫作
+    // 「实际执行数」, 注释还写着「两者不等(本次没新增)时, 日志里能直接看出
+    // 这次是空跑」。但那条 SQL 数的是**表里全部成功行**, 与本次运行无关 ——
+    // 跑完永远是 7, 于是 `total` 与 `applied` **永远相等**, 它声称要解决的
+    // 「Job 成功了但好像什么都没做」根本没被解决。
+    // 实测证据: 对同一个已迁移完的库跑第二次, 旧日志仍打 `total=7 applied=7`,
+    // 而 `_sqlx_migrations` 行数没变(本次实际应用 0 份)。
+    //
+    // `to_regclass` 分支: 新库上 `_sqlx_migrations` 这个表**还不存在**
+    // (它由 sqlx 的 migrator 自己建), 直接查会因 relation 不存在而报错。
+    // 那种情况下「已应用数」的正确答案就是 0, 故在 SQL 里判掉。
     let total = im_migrate::MIGRATOR.migrations.len();
-    tracing::info!(total, "im-migrate: 开始应用迁移");
+    let applied_before = applied_migration_count(&pool).await;
+    tracing::info!(
+        total,
+        applied_before,
+        "im-migrate: 开始应用迁移(applied_before = 跑之前已应用的份数)"
+    );
 
     match im_migrate::run_migrations(&pool).await {
         Ok(()) => {
-            let applied: i64 =
-                sqlx::query_scalar("SELECT count(*)::bigint FROM _sqlx_migrations WHERE success")
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap_or(-1);
-            tracing::info!(total, applied, "im-migrate: 迁移完成");
+            let applied_after = applied_migration_count(&pool).await;
+            let applied_now = applied_after - applied_before;
+            tracing::info!(
+                total,
+                applied_before,
+                applied_now,
+                applied_total = applied_after,
+                "im-migrate: 迁移完成(applied_now = 本次实际应用的份数; \
+                 0 = 空跑, 库已是最新)"
+            );
             ExitCode::SUCCESS
         }
         Err(e) => {

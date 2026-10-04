@@ -39,9 +39,22 @@ spec:
               drop:
                 - ALL
           image: ghcr.io/yourorg/im1.0-im-migrate:latest
-          command: ["sqlx", "migrate", "run"]
+          # 2026-10-04 修(与 migrate-job.yaml 同一个缺陷, 当时只修了后者):
+          #   1. 此前 `command: ["sqlx", "migrate", "run"]` 要求镜像里装 sqlx CLI,
+          #      而 im-migrate 镜像装的是**仓内自带的 im-migrate 二进制**
+          #      (`sqlx::migrate!` 把迁移编译期内嵌)。沿用 sqlx 命令会直接
+          #      `exec: "sqlx": executable file not found`。
+          #      现与 migrate-job.yaml 一致, 直接用镜像的 ENTRYPOINT。
+          #   2. 此前写的是 `IM_DATABASE_URL` —— **这个变量名根本不存在**:
+          #      `AppConfig` 的字段叫 `postgres_url`, 按仓内 `IM_<UPPER_SNAKE>`
+          #      规则对应 `IM_POSTGRES_URL`(见 gap-ledger §1.17)。
+          #      写错名字的表现是 im-migrate 非 0 退出, 迁移压根没跑,
+          #      而本 initContainer 失败会连带网关起不来。
+          #
+          # 迁移已内嵌进二进制, **不需要**再挂 migrations/ 目录 ——
+          # 二进制携带的迁移与编译它的代码必然同版本。
           env:
-            - name: IM_DATABASE_URL
+            - name: IM_POSTGRES_URL
               valueFrom:
                 secretKeyRef:
                   name: postgres-credentials
