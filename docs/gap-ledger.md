@@ -2048,6 +2048,32 @@ VERDICT: -D warnings DOES reject the injected naming violation
    `CreateConversation`/`GetConversation → Conversation`)。强制后缀要改 5 个
    活 rpc 的 wire 契约。脚本因此**只检查返回类型确实存在**。
 
+#### CI 实证 (run 37196505674, commit b699472)
+
+绿灯不等于门禁跑过, 故按「读 step 列表 + 读工具自己的结论行」验收:
+
+- 4/4 job success, 且**每个 job 的 step 都在实际执行**(按 step 名去重后:
+  lint 11 / unit 11 / integration 12 / sast 12, 无跳过)。
+- `aux-01 naming check` 在 **ubuntu runner 上真实运行**, 输出与本机**逐项一致**:
+  7 迁移 / 14 表 / 39 列 / 18 索引 / 6 具名约束 / 2 触发器 / 1 包 / 1 服务 /
+  31 消息 / 22 rpc / 95 个 .rs / 10 个模块目录。
+  **这条同时闭合了上面「大小写敏感枚举」的跨平台疑虑** —— 若 Linux 侧枚举
+  结果与 Windows 不同, 上述数字就会不一样。
+- 同 run 的既有门禁一并复核: `semgrep` = `Ran 725 rules on 359 files: 0 findings.`;
+  `aux-03` = `OK: registry, docs and usages agree (21 codes)`;
+  `cargo audit` = 扫描 439 crates 无漏洞;
+  `im-migrate` = `applied_before=0 applied_now=7 applied_total=7`;
+  Unit **148 passed / 0 failed**; Integration **412 passed / 0 failed**。
+
+#### 顺带确认: F-2/F-3 仍被真实阻塞, 且比想的更硬
+
+`kubectl` 可用(v1.36.1), 但 kubeconfig 指向 `172.28.176.169:6443`,
+**连接被主动拒绝 —— 集群根本不在跑**。更关键的是:
+`kubectl apply --dry-run=client` **仍需要 API server**(要取 `/openapi/v2` 做
+schema 校验), 报 `failed to download openapi`。所以**没有集群就连清单都用
+kubectl 验不了**, `kustomize build` 只能验 YAML 结构、验不了字段合法性。
+F-2/F-3 需要先起一个本地集群(k3d / kind), 属需批准装工具的范畴。
+
 #### 位置
 
 - `scripts/check-naming-convention.ps1`
