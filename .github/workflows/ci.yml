@@ -47,11 +47,32 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: aux-01 naming check
-        run: |
-          # 占位,恒通过:本步骤不做任何自动检查,只 echo,不能当门禁看。
-          # aux-01 §J 命名约定目前无工具强制;clippy 不含命名规范检查,
-          # 也未接入 sqlfluff / buf lint。后续 PR 补实现时再改这里。
-          echo "placeholder: no automated aux-01 §J naming check is enforced here"
+        # 2026-10-04: 此前本步骤是**恒通过的占位符**, 只 echo 一行字, 注释里明写
+        # "placeholder: no automated aux-01 §J naming check is enforced here"。
+        # 即 aux-01 §J「命名违规 → CI 失败」对本仓的 DB / proto / 文件命名层
+        # 一直是**不成立的**声明 —— 与 797b5bb 修掉的 semgrep 假绿灯同一类缺陷。
+        #
+        # 现补上 scripts/check-naming-convention.ps1 做真检查, 覆盖 aux-01
+        # §D(迁移名/表/列/索引/约束/触发器) + §E(proto package/service/message/rpc)
+        # + §F(Rust 文件与模块目录/proto 文件名) + §I(禁用 status、禁用 room/chat)。
+        #
+        # 判别力已用变异测试证明: 24 个用例, 0 失败 ——
+        #   - 18 项注入违规(表名 PascalCase / 列名 camelCase / 索引缺 idx_ 前缀 /
+        #     package 大写 / message 驼峰 / rpc 缺 Request 后缀 / 返回未声明类型 /
+        #     Message_Router.rs / chat_rooms 表 / status 列 ...) 全部被捕获并点名;
+        #   - 1 项**对照组**(完全不改动)保持绿灯, 用来区分"门禁能发现违规"与
+        #     "测试装置永远失败";
+        #   - 2 项解析退化(删迁移 / 删 rpc)返回 exit 2 而非假装通过, 这是脚本内
+        #     基线下限守卫的作用: 正则一旦失配, 0 违规与"仓库干净"无法区分;
+        #   - 2 项**反例守卫**: google.protobuf.Empty 与 migrations/README.md
+        #     必须放行, 防止把正常写法误判成违规;
+        #   - 1 项跨平台回归用例: 迁移文件改名成 .SQL 在 Linux 上必须仍被抓到
+        #     (Get-ChildItem -Filter 在 Linux 大小写敏感, 曾经会整个漏掉)。
+        #
+        # 该检查是纯 PowerShell, 不需要 cargo, 因此放在本 job 而非 sast job ——
+        # 排在 cargo audit 之后会重演"audit 长期红 → 后续 step 全被跳过"的级联。
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/check-naming-convention.ps1
 
   test-unit:
     name: Unit Tests

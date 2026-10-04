@@ -1890,6 +1890,173 @@ SELECT CASE WHEN to_regclass('public._sqlx_migrations') IS NULL THEN 0
 
 ---
 
+### 1.26 aux-01 命名门禁是**又一个恒通过的占位符** —— 补真检查, 并记下 4 条真实规范偏离 (2026-10-04 新发现 · 文档 owner)
+
+#### 缺陷本体: 门禁从不存在
+
+`.github/workflows/ci.yml` 的 lint job 里有一个步骤就叫 `aux-01 naming check`,
+body 只有一行:
+
+```bash
+# 占位,恒通过:本步骤不做任何自动检查,只 echo,不能当门禁看。
+echo "placeholder: no automated aux-01 §J naming check is enforced here"
+```
+
+**注释自己就承认了它不是门禁**, 却一直挂在 CI 上。aux-01 §J「工具强制」表格
+声明「命名违规 → CI 失败」, 而对本仓的 DB / proto / 文件命名层, 这句话一直是
+**不成立的**。与 §1.24 的 semgrep 假绿灯是同一类缺陷: 步骤存在 ≠ 检查存在。
+
+§J 原文指定的工具是 `clippy::naming` / `sqlfluff` / `buf lint` /
+`openapi-spec-validator`, **一个都没接**。CI 的 clippy 跑的是
+`-- -D warnings`, 不含 `naming` 组; sqlfluff / buf / openapi-validator 无踪。
+
+#### 处置: 新增 `scripts/check-naming-convention.ps1`
+
+覆盖 aux-01 中**能被机械判定且当前真实成立**的子集(每条都对应规范条目):
+
+| 规范 | 检查内容 | 当前基线(手工核对, 非估值) |
+|---|---|---|
+| §D.1/D.2 | 迁移文件名 `<4位>_<snake>.sql`; 序号 0001..N 无断档无重复 | 7 个迁移, 0001..0007 |
+| §D.3–D.7 | 表/列 snake_case; 索引 `idx_`/`uniq_`; 具名约束 `chk_`/`uniq_`; 触发器 `trg_` | 14 表 / 39 列 / 18 索引 / 6 约束 / 2 触发器 |
+| §E.1–E.5 | proto package `im.<svc>.v<n>`; service/message/rpc PascalCase; 请求类型 `...Request`; 返回类型必须是本 proto 已声明的消息或 `google.protobuf.*` | 1 包 / 1 服务 / 31 消息 / 22 rpc |
+| §F.1–F.3 | Rust 源文件名、模块目录、proto 文件名 snake_case | 95 个 .rs / 1 个 .proto / 10 个模块目录 |
+| §I.1 | 任何 SQL 标识符不得叫 `status` | 0 处(合规) |
+| §I.2 | 任何 SQL 对象名不得含 `room` / `chat` | 0 处(合规) |
+
+**基线下限守卫**: 每个解析出的集合都有一个**手工核对过的下限**, 低于下限即
+`exit 2` fail-closed。这不是多余的防御 —— 本脚本第一版的表解析器漏了
+`IF NOT EXISTS`, 从 39 个列名里静默抽出 **0 个**, 而「0 违规」与「仓库干净」
+在输出上完全无法区分。**一个总是静默通过的守卫比没有守卫更糟。**
+
+下限也在第一次运行时抓到了我自己的错: 我把索引数下限凭印象写成 20, 实际是
+**18** —— 全仓 19 行 `CREATE INDEX` 中有一行是注释掉的(`idx_messages_content_fts`,
+全文检索预留)。差点为了让门禁变绿而把下限改成一个仍然错误的数字。
+
+#### 判别力: 24 个变异用例, 0 失败
+
+绿灯只证明「没报错」。为证明它**能发现**违规, 对仓库副本逐项注入:
+
+- **18 项注入违规**全部被捕获并点名, 覆盖每个规则族: 表名 `DeviceSessions` /
+  列名 `displayName` / 索引 `index_users_state`(缺前缀) / 具名约束
+  `users_env_extid` / 触发器 `environments_before_update` /
+  package `im.Core.v1` / message `tokenPair` / rpc `listMessages` /
+  请求类型 `GetMeQuery` / 返回未声明的 `UserProfile` / 序号断档 / 序号重复 /
+  `Message_Router.rs` / `IdentityService/` / `Core.proto` /
+  `status` 列 / `chat_rooms` 表。
+- **1 项对照组**(完全不改动)保持绿灯 —— 没有它就无法区分「门禁能发现违规」与
+  「测试装置永远失败」。
+- **2 项解析退化**(删掉 5 个迁移 / 删掉 3 个 rpc)返回 `exit 2` 而非假装通过。
+- **2 项反例守卫**: `google.protobuf.Empty` 必须**放行**; `migrations/README.md`
+  这类非编号文件不得被误报。把宽泛规则写进去很容易, 但把正常写法当违规就是永久
+  误报。
+- **1 项跨平台回归用例**: 见下「大小写敏感枚举」。
+
+只有退出码不够 —— 用例 01 额外断言了**诊断文本本身**(`0003_Create_Friend_Requests.SQL`
+必须出现在输出里), 因为一个门禁「因为错误的原因变红」和「变绿」一样无用。
+
+#### aux-01 §J 规定的 clippy 命令**根本无法编译** (实测)
+
+§J 原文写的是:
+
+```
+cargo clippy -- -D clippy::all -D clippy::pedantic -D clippy::naming
+```
+
+实跑结果:
+
+```
+error[E0602]: unknown lint: `clippy::naming`
+  = help: did you mean: `clippy::panic`
+  = note: `-D unknown-lints` implied by `-D warnings`
+```
+
+**`clippy::naming` 不是存在的 lint 组**。clippy 没有 `naming` 这个分组, 命名类
+lint 是**逐个**的(`non_snake_case` / `non_camel_case_types` /
+`non_upper_case_globals` / `upper_case_acronyms` / `module_name_repetitions` ...)。
+而 `-D warnings` 会把 `unknown_lints` 升级为硬错误 —— **谁按 §J 原样接线, CI 会
+直接编译失败**。故本次**没有**把 `-D clippy::naming` 加进 `ci.yml`。
+
+#### Rust 命名层其实**已经被拦住了**(变异实测, 非推断)
+
+不能因为 §J 的命令写错就以为 Rust 命名没人管。实测: 往
+`crates/im-common/src/config.rs` 注入一个 `fn Badly_Named_Function_For_Mutation()`,
+跑 CI 同款命令 `cargo clippy --workspace --all-targets --locked -- -D warnings`:
+
+```
+error: function `Badly_Named_Function_For_Mutation` should have a snake case name
+CLIPPY_EXIT=101
+VERDICT: -D warnings DOES reject the injected naming violation
+```
+
+源文件改前改后 SHA256 一致(`RESTORE_OK=True`), 未留下任何残留。
+**结论: 命名 lint 里默认开启的那批(style 组)已被现有 `-D warnings` 覆盖,
+本仓 Rust 标识符命名在 CI 里是有牙的。** §J 缺的是 `clippy::pedantic` 与
+若干**未默认开启**的命名 lint, 而 `pedantic` 误报率高, 是否引入属规范 owner
+决策, 不宜由门禁工作顺手接上。
+
+#### 跨平台漏洞: 大小写敏感枚举 (Linux 上会漏)
+
+自审发现: `Get-ChildItem -Filter '*.sql'` 在 **Windows 大小写不敏感、在 Linux
+大小写敏感**。若迁移文件被改名成 `0003_....SQL`, 开发机上门禁能报出来, 而
+**真正跑 CI 的 ubuntu runner 上却完全看不见它** —— 门禁会在最该拦的那台机器上
+放行。已改为显式枚举目录并用 `-clike '*.sql'`(大小写敏感)判定, 同时把
+「数字开头但不是 `.sql`」的文件单独报出来。修复后补了对应的回归用例(用例 22)。
+
+同一次自审还改了 `Stop-Parse`: 它原先直接 `exit 2`, 把此前已收集的真实违规
+**一并吞掉**, 只留一句误导性的「无法解析」。现在先打印已收集的违规再退出 ——
+基线失败常常是前面某个问题的**后果**, 吞掉根因会把人引向错误的 bug。
+
+#### 变异测试抓到的真缺陷(本门禁自己有 13 处检查是废的)
+
+首轮 22 个用例红了 8 个。根因: **PowerShell 的 `-match` / `-notmatch` 默认忽略
+大小写**, 于是
+
+- `^[a-z][a-z0-9_]*\.rs$` 会**放行** `Message_Router.rs`
+- `^[A-Z][A-Za-z0-9]*$` 会**放行** `tokenPair`
+- `^im\.[a-z]...` 会**放行** `im.Core.v1`
+
+13 处风格判断全部改用 `-cnotmatch` 后重跑, 22/22 通过。
+(注: `[regex]::Match` 本身**是**大小写敏感的, 与 PowerShell 运算符不同 ——
+这正是 D.1 用 `[regex]` 而其余用 `-cnotmatch` 的原因。)
+
+#### 明确**不做**自动化、以及为什么(都是实测, 不是假设)
+
+| 规范条目 | 为何不查 |
+|---|---|
+| §I「禁中文/日文标识符」 | 需要真正的词法分析(先剥注释与字符串字面量)。实测朴素正则得 8 处命中, **全部是中文注释散文**, 零真违规 —— 会对注释误报的检查不是检查。clippy 无对应 lint, 留作 review 职责。 |
+| §E「REST 路径须带 `/v1/` 前缀」 | 实测本仓合法地同时存在 `/v1/friends` 与裸片段 `/friends`, 因为 actix 是 `web::scope("/v1")` 套 `web::scope("/friends")` 的**嵌套**。要还原成完整路径必须理解 App 树, 正则做不到。留作 review 职责。 |
+| §D「索引名须拼出每个列名」 | 其自带示例是 `uniq_users_environment_id_external_identity`。实测现有 9 个索引全部缩写(`uniq_users_env_extid` / `uniq_messages_idem` / `idx_messages_conversation_seq` 等)。第一天就报 9 条, 故**只记录不阻断**(见下)。 |
+| §D「表名复数」/ §6「新表须先在 §G 术语表登记」 | 复数需词库; §G 覆盖率实测 5/14 张表缺失。属文档 owner 职责。 |
+| §B Rust 标识符细则 | 需 AST, 交给 `clippy::naming`(见下)。 |
+
+#### 落档的 4 条真实规范偏离(**不阻断 CI, 需规范 owner 裁决**)
+
+1. **`messages.state` 应为 `delivery_state`** —— aux-01 §G「投递状态」行的单源词
+   是 `delivery_state`, 且「严禁同义词」列明确列出 `~~status, state, ack~~`。
+   而 `migrations/0005` 的列名是 `state`, 取值集
+   `('sent','delivered','read','recalled','deleted')` 与 §G 描述**逐字一致** ——
+   即语义完全对, 只是名字撞上了 §G 保留给 `users.state` 的那个词。
+   **改名 = schema + proto + Rust + wire 契约变更, 不是机械改名, 不擅自动。**
+2. **9 个索引名未拼出列名**(§D), 清单见上表。改名同样触及迁移历史(§H 规定
+   迁移「永远追加, 不改历史」)。
+3. **5/14 张表未在 §G 术语表登记**: `friend_requests` / `friendships` /
+   `dm_pairs` / `audit_logs` / `conversation_sequences`(部分)。§6 验收标准要求
+   「新表必须先在 §G 术语表登记」。
+4. **§E 响应类型不强制 `...Response` 后缀**: 5 个 rpc 用
+   `google.protobuf.Empty`(protobuf 自带类型, aux-01 管不到), 5 个直接把领域
+   类型返回(`SendMessage → Message`、`GetMe → User`、`ExchangeToken → TokenPair`、
+   `CreateConversation`/`GetConversation → Conversation`)。强制后缀要改 5 个
+   活 rpc 的 wire 契约。脚本因此**只检查返回类型确实存在**。
+
+#### 位置
+
+- `scripts/check-naming-convention.ps1`
+- `.github/workflows/ci.yml` lint job 的 `aux-01 naming check` 步骤
+- 变异测试装置在 `target/logs/mutation-test-naming-gate.ps1`(gitignored;
+  它是验证装置, 不是仓库资产 —— 结论与用例清单已完整抄录在本节)
+
+---
+
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
