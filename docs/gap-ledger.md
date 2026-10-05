@@ -2128,13 +2128,16 @@ WBS D-3 写「EventPublisher NATS JetStream 真实实现」;
 `/readyz` 里的 `"nats": "not_checked_stub_publisher"` 也随之改为
 `"not_checked"`: D-3 落地后 publisher 已不再是 stub, 留着旧值就是一句假话。
 
-#### **诚实声明: DLQ 未实装**
+#### ~~**诚实声明: DLQ 未实装**~~ → ✅ 已于 §1.31 实装
 
-`DetailedDesign §9.1` 要求「失败不阻塞 ack 但**写入 DLQ**」。当前失败路径是
-有界超时 / 服务端错误 → 计数 + `error!` + 返回 `Err(ServiceUnavailable)`,
-调用方(`MessageService`)只记日志不阻塞 ack。即失败**可见、可测量**, 但
-**不可恢复** —— 真实重试依赖 V1+ outbox(仓内既有注释也这么写)。本节不
-声称 DLQ 存在。
+`DetailedDesign §9.1` 要求「失败不阻塞 ack 但**写入 DLQ**」。本节交付时(D-3,
+2026-10-04)的失败路径是有界超时 / 服务端错误 → 计数 + `error!` + 返回
+`Err(ServiceUnavailable)`, 即失败**可见、可测量**, 但**不可恢复**。
+
+**2026-10-05 已实装**: 按 `aux-08` 加了重试(§C.3 的 3 次 / 500ms·1s·2s)与
+独立 `IM_DLQ` stream(§D.3 留存 7 天), 失败事件写入 `dlq.event.<topic>`(§D.2
+的 `DlqRecord` 逐字段)。见 **§1.31**。仍未做的部分是 `aux-08 §D.3` 的
+PG `audit_logs` sink。
 
 #### CI: `services.nats` **用不了**, 只能 `docker run`(两条实测理由)
 
@@ -2609,6 +2612,115 @@ CI 首次运行(run 37283006605)Integration 红, 两条失败**都是测试自�
 - `scripts/check-asyncapi.ps1` (静态门禁)
 - `crates/im-protocol/tests/ws_frames_contract.rs` (运行时契约)
 - `.github/workflows/ci.yml` (sast job 的 `check AsyncAPI drift` 步骤)
+
+---
+
+### 1.31 DLQ 实装: 事件发布失败从「永久丢失」变成「可恢复」(2026-10-05)
+
+`DetailedDesign §9.1` 要求「提交事务后发布事件(事务外, 失败不阻塞 ack 但**写入
+DLQ**)」, §1.27 交付 D-3 时这一半是缺的 —— 失败路径是有界超时 + `error!` +
+返回 `Err(ServiceUnavailable)`, 即**可见、可测量, 但不可恢复**。本次补上。
+
+按 `aux-08`:
+
+- **§C.3** 重试 3 次, 退避 500ms / 1s / 2s
+- **§D.1** 触发条件 = 重试耗尽
+- **§D.2** `DlqRecord` 逐字段
+- **§D.3** 独立 stream `IM_DLQ`(subject 过滤 `dlq.>`), 留存 7 天 / 上限 256MB
+
+#### 一处**刻意的偏离**: 加了墙钟总预算(aux-08 没有这条)
+
+照 §C.3 字面实现最坏要 **~15.5s**(3 次 x 3s ack 上界 + 3.5s 退避)。但
+`publish()` 是被 `MessageService::send_message` 在 `tx.commit()` **之后内联
+await** 的(`message/service.rs:232`), 于是这段耗时**直接变成客户端的响应
+延迟** —— 大量客户端与中间代理会先超时, 「为了不丢事件」反而制造了「请求
+超时」这个更常见的问题。
+
+故引入 `RetryPolicy::total_budget`(5s):
+
+| 场景 | 行为 |
+|---|---|
+| NATS 正常 | 第 1 次即成功, ~1ms, **零变化** |
+| 连接被拒(快速失败) | 退避 500ms/1s/2s 后重试, ~3.5s -> 恢复 |
+| NATS 变慢(每次撞上界) | 预算耗尽即转 DLQ, 硬钳在 5s 内 |
+
+这个 **+2s**(相对实装前的 3s)是拿「不丢事件」换的, 属显式取舍, 不是疏漏。
+
+#### 编排逻辑抽成**泛型函数**, 因为它本不该需要 NATS 才能测
+
+`orchestrate_publish` 用两个闭包注入 IO, 于是「第一次就失败」「预算耗尽要转
+DLQ」这类路径可以配 `tokio::time::pause()` **确定性**测试, 不碰 NATS ——
+而这类路径恰恰是 CI 里最难稳定复现的。
+
+7 个新用例(全部 `start_paused = true`): 首发成功 / 重试后成功 / 耗尽后恰好写
+**一条** DLQ / 非 JSON 载荷退化为字符串且原始字节不丢 / 写 DLQ 失败被计数
+且**不**被当成可恢复 / 预算装不下时提前转 DLQ / 预算充足时走满 3 档退避。
+
+#### 三个字段恒为 `null`, 这不是偷懒
+
+- **`error.stack`** —— 规范写「脱敏后」。本仓**没有**脱敏, 而把未脱敏 stack
+  写进一个**留存 7 天、运维要读**的队列是净风险。宁可为空。
+- **`context.trace_id` / `user_id` / `env_id`** —— `publish()` 在
+  `tx.commit()` 之后调用, 那里已经没有请求上下文。**编造**一个值会让排障被
+  错误信息带偏, 比空着更糟。
+
+#### 诚实声明: `aux-08 §D.3` 的 PG sink **仍未实装**
+
+§D.3 的 MVP 范围是「NATS DLQ subject **+** `audit_logs(action=dlq_record,
+detail=JSONB)`)」, 当前**只做了前者**。后果是可命名的: NATS **整体**不可用时
+连写 DLQ 也会失败, 那条事件仍然丢失。该情况由
+`im_events_dlq_write_failed_total` 计数并 `error!` —— 即**丢失是可见的**, 但
+它确实还是丢了。
+
+补 PG sink 的阻力是实的: `migrations/0006` 的 `audit_logs` 有
+`tenant_id UUID NOT NULL`, 且 `target_type` 是 6 值 CHECK(`user` /
+`conversation` / `environment` / `extension` / `secret` / `system`), 而事件发布
+路径**没有租户上下文**, 仓内也**无任何生产代码写 `audit_logs`**。补它要先决定
+事件如何携带租户 —— 这不是实现方能独自拍的板。
+
+#### 顺带: 指标输出一度在**说假话**
+
+`4535dc2` 发现 `im_events_publish_failed_total` 的 `# HELP` 仍写着「**当前无
+DLQ, 这些事件已丢失**」—— DLQ 实装后这句就是错的, 它会**主动**把运维引向
+错误结论。上一道门禁(`metrics_description_matches_the_live_exposition`,
+`8550995`)逐字比对 `# HELP` 却没抓到: 它比对的是 openapi.json 的 **`example`
+字段**, 而那个 example 只抄了 **2 条**(共 9 个指标)—— 逐字校验覆盖 2/9, 门禁
+是绿的但只守着五分之一。已补到 9 条, 并改为**由 `health.rs` 程序化生成**,
+消灭「手抄一份 HELP 文本」这个根因。
+
+顺带修正 `publisher.rs` 模块文档里一个过期行号(调用点是 `service.rs:232`,
+原写 231)。
+
+#### 顺带: 文档指着一个**不存在的节**
+
+写本节时发现 §1.27 的「DLQ 未实装」声明已改成「见 §1.31」, 而 **§1.31 当时
+并不存在** —— 一个悬空锚点。`publisher.rs` 模块文档里也有一处同样指向 §1.31
+的引用。两者都等着这一节; 本节补上, 引用随之生效。
+
+#### 验证
+
+- **CI 验收 (run 37291027856, head `db03ce8`): 4/4 job success**, Integration
+  **451 passed / 0 failed / 0 ignored**(基线 444 + 新增 7), Unit **163 passed**
+- 前一版 run 37289975390 是红的且**只剩 1 条**失败, 根因是
+  `std::time::Instant` 与 `tokio::time::sleep` **不是同一个时钟**: 后者推进
+  tokio 虚拟时钟, 前者在 paused-time 下几乎不动, 于是预算**永远花不完**。
+  生产下两者都是真实时钟所以线上不炸, 但「用 A 时钟度量、用 B 时钟操作」是
+  等着出事的一处隐患, 且失效时**静默**。已改用 `tokio::time::Instant`
+- `/metrics` 9 个指标的 `# HELP` 与 openapi.json example **逐字一致**(用独立
+  复核脚本重新解析 `health.rs` 再比一次, 不复用生成器)
+- `scripts/check-openapi.ps1` exit 0(24 routes / 24 ops / 21 aux-03 codes)
+- `cargo fmt --all -- --check` exit 0
+- 本机 cargo **未作为验证源**(共享 target 被其他项目占锁)
+
+#### 位置
+
+- `crates/im-core/src/event/publisher.rs` (全部 DLQ 实现 + 泛型编排)
+- `crates/im-core/src/message/service.rs` (调用点, 3 处 outbox 文案已改)
+- `crates/im-gateway/src/health.rs` (9 个指标)
+- `docs/api/openapi.json` (`/metrics` 的 description + example)
+- `migrations/0006_create_audit_logs.sql` (PG sink 目标表, **目前无人写**)
+
+Commits: `492b624` · `81b6500` · `db03ce8` · `4535dc2`
 
 ---
 

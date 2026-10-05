@@ -43,7 +43,7 @@
 //! ### 关键设计: 重试**必须有总预算**, 因为它在业务请求路径上
 //!
 //! `publish()` 是被 `MessageService::send_message` **内联 await** 的
-//! (`message/service.rs:231`, 在 `tx.commit()` 之后), 所以在这里同步重试会
+//! (`message/service.rs:232`, 在 `tx.commit()` 之后), 所以在这里同步重试会
 //! **直接变成客户端的响应延迟**。而 `DetailedDesign §9.1` 要求「失败不阻塞
 //! ack」。
 //!
