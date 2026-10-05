@@ -42,7 +42,7 @@ pub async fn healthz() -> HttpResponse {
 /// | 依赖 | 查不查 | 理由 |
 /// |---|---|---|
 /// | **PostgreSQL** | ✅ 查 | 唯一有**真实失败模式**的依赖: 网关每个业务端点都要它。查不到就等于「接了流量也全部 500」, 这正是 readiness 该拦下的情况 |
-/// | NATS | ❌ 不查 | `NatsEventPublisher` 目前是 stub(`_client: None`, 见 `im-core/src/event/publisher.rs`), **没有任何连接可查**。查一个永远「可达」的空壳只会让响应体多一个恒为 true 的字段, 给人虚假的安全感 |
+/// | NATS | ❌ 不查 | D-3 已实装(`event/publisher.rs` 真实 JetStream publish), 但**这个端点拿不到 publisher 实例**, 所以无法探测它。查一个拿不到的东西只能编一个恒为真的字段, 那比不查更糟 |
 /// | Valkey | ❌ 不查 | **D-4 未落地**, 配置里没有对应字段, 代码里没有客户端。`DetailedDesign §5` 要求「全部可达才 200」, 但 Valkey 尚不存在 —— 若强行查, readyz 永远返 503, 整个部署起不来。宁可少查并显式声明, 也不要把 Pod 永久判死 |
 ///
 /// NATS / Valkey 两项待 D-3 / D-4 落地后接上, 届时本函数的 `checks` 地图
@@ -76,7 +76,7 @@ pub async fn readyz(pool: web::Data<sqlx::PgPool>) -> HttpResponse {
     let mut checks = serde_json::Map::new();
     checks.insert("postgres".to_string(), detail);
     // 显式列出「没查」的依赖, 避免读响应的人以为「没提到就是查过了且通过」
-    checks.insert("nats".to_string(), json!("not_checked_stub_publisher"));
+    checks.insert("nats".to_string(), json!("not_checked"));
     checks.insert("valkey".to_string(), json!("not_implemented_D4"));
 
     if ok {
@@ -97,16 +97,21 @@ pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpRe
     // `ws::hub::Audience` 过滤后的实际投递为准。
     let subs = hub.subscriber_count();
 
-    // 被丢弃的领域事件数 (D-3)。
+    // 领域事件发布的三个计数 (D-3 实装于 2026-10-04)。
     //
-    // 2026-10-03 新增。这个指标的意义不是「监控一个正常运行的指标」, 而是
-    // **让一个架构性缺口可见**: `NatsEventPublisher` 仍是 stub, 每条
-    // `im.message.{created,recalled,deleted}` 都被丢弃。若这个数持续增长,
-    // 就说明「跨 pod 事件同步」根本没在工作 —— 而从日志或返回值上完全看不出来
-    // (stub 返回 `Ok(())`, 日志级别是默认不可见的 `debug`)。
+    // 2026-10-03 只有一个 `dropped`, 用来让「事件在静默消失」这件事可见。
+    // 2026-10-04 D-3 落地后必须**拆成三个**, 因为三种状态的处置完全不同:
     //
-    // 面板上把 `rate(im_events_dropped_total[5m])` 画出来, 应当恒为 0;
-    // 一旦 D-3 接线, 它会归零, 且之后任何非 0 都意味着真丢事件了。
+    //   published  正常增长                    —— 无需处理
+    //   failed     NATS 超时 / 服务端拒绝        —— 事件没出去, 需查 NATS;
+    //                                             当前无 DLQ, 丢了就是丢了
+    //   dropped    `kind=stub`, 显式选择不投递   —— 配置问题, 不是故障
+    //
+    // 把 failed 与 dropped 混成一个数, 会让「NATS 挂了」和「本来就配了 stub」
+    // 在面板上长得一样, 于是真正的故障反而看不见了 —— 这正是原设计要消灭的
+    // 那种「一切看起来都正常」。
+    let published = im_core::event::publisher::published_event_count();
+    let failed = im_core::event::publisher::failed_event_count();
     let dropped = im_core::event::publisher::dropped_event_count();
 
     HttpResponse::Ok()
@@ -116,7 +121,13 @@ pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpRe
              # HELP im_ws_broadcast_subscriptions 已订阅 WS 广播的连接数\n\
              # TYPE im_ws_broadcast_subscriptions gauge\n\
              im_ws_broadcast_subscriptions {subs}\n\
-             # HELP im_events_dropped_total 因 D-3 stub 被丢弃的领域事件数(实现 NATS 后应恒为 0)\n\
+             # HELP im_events_published_total 成功发布并拿到 JetStream ack 的领域事件数\n\
+             # TYPE im_events_published_total counter\n\
+             im_events_published_total {published}\n\
+             # HELP im_events_publish_failed_total 发布失败的事件数(NATS 超时/拒绝; 当前无 DLQ, 这些事件已丢失)\n\
+             # TYPE im_events_publish_failed_total counter\n\
+             im_events_publish_failed_total {failed}\n\
+             # HELP im_events_dropped_total 因 IM_EVENT_PUBLISHER_KIND=stub 被丢弃的领域事件数(配置问题, 非故障)\n\
              # TYPE im_events_dropped_total counter\n\
              im_events_dropped_total {dropped}\n"
         ))
@@ -195,7 +206,7 @@ mod tests {
     #[actix_web::test]
     async fn readyz_states_which_dependencies_were_not_checked() {
         let (_, body) = readyz_via_route().await;
-        assert_eq!(body.checks["nats"], "not_checked_stub_publisher");
+        assert_eq!(body.checks["nats"], "not_checked");
         assert_eq!(body.checks["valkey"], "not_implemented_D4");
     }
 
@@ -214,19 +225,21 @@ mod tests {
         );
     }
 
-    /// D-3 缺口必须**在 `/metrics` 里看得见**, 而不是只躺在日志里。
+    /// 事件发布的三个计数必须**分别**出现在 `/metrics` 里。
     ///
-    /// 先 publish 一次把计数推上去, 再断言 `/metrics` 文本里出现了它。
+    /// 先用 stub publish 一次把 dropped 推上去, 再断言文本里出现了它。
     /// 锁住两件事: ① `publish()` 确实在计数(没被悄悄改回 no-op);
     /// ② 计数真的被暴露了(加了计数器却忘了挂到指标上, 是同一种静默)。
+    ///
+    /// 同时锁住第三件事: published / failed / dropped **是三个不同的指标名**。
+    /// D-3 实装前只有一个 `dropped`; 若有人图省事把它们合回一个, 断言会红 ——
+    /// 因为「NATS 挂了」与「配置成 stub」在面板上必须是两种样子。
     #[actix_web::test]
     async fn metrics_expose_the_dropped_event_counter() {
-        use im_core::event::publisher::{EventPublisher, NatsEventPublisher};
+        use im_core::event::publisher::{EventPublisher, StubEventPublisher};
 
         let before = im_core::event::publisher::dropped_event_count();
-        let pubr = NatsEventPublisher::connect("nats://stub:4222")
-            .await
-            .expect("stub publisher 不会失败");
+        let pubr = StubEventPublisher::new();
         pubr.publish("im.message.created", b"{\"probe\":1}")
             .await
             .expect("stub 返回 Ok");
@@ -262,5 +275,16 @@ mod tests {
             "指标值必须是真实计数({}), 而非占位: {text}",
             before + 1
         );
+        // D-3 实装后另外两个指标必须**各自独立**存在。合并成一个会让
+        // 「NATS 不可用」与「显式配了 stub」在面板上无法区分。
+        for name in [
+            "im_events_published_total",
+            "im_events_publish_failed_total",
+        ] {
+            assert!(
+                text.contains(name),
+                "/metrics 必须同时暴露 {name}, 否则真实发布故障会与 stub 混为一谈: {text}"
+            );
+        }
     }
 }

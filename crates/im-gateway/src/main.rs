@@ -34,7 +34,7 @@ use im_common::config::{AppConfig, EventPublisherKind, SigningKeyConfig};
 use im_common::ids::EnvironmentId;
 use im_core::conversation::pg::PgConversationRepository;
 use im_core::conversation::service::ConversationService;
-use im_core::event::publisher::NatsEventPublisher;
+use im_core::event::publisher::{NatsEventPublisher, StubEventPublisher};
 use im_core::event::EventPublisher;
 use im_core::identity::pg::{PgDeviceSessionRepository, PgUserRepository};
 use im_core::identity::service::IdentityService;
@@ -111,15 +111,18 @@ async fn main() -> std::io::Result<()> {
     let device_repo = PgDeviceSessionRepository::new(pg_pool.clone());
 
     // 5. EventPublisher
+    //
+    // 2026-10-04 D-3 实装: 两条分支现在是**两种不同的类型**。
+    // 此前两者都调 `NatsEventPublisher::connect`, 而那个 connect 是 no-op,
+    // 于是 `kind=nats` 也不连任何东西 —— 配了 NATS 与没配, 行为一模一样。
     let event_publisher: Arc<dyn EventPublisher> = match cfg.event_publisher.kind {
         EventPublisherKind::Stub => {
-            tracing::info!("EventPublisher = Stub (MVP, no NATS connection)");
-            // NatsEventPublisher::connect 本身就是 no-op stub (per event/publisher.rs)
-            Arc::new(
-                NatsEventPublisher::connect("nats://stub:4222")
-                    .await
-                    .expect("NatsEventPublisher stub never fails"),
-            )
+            tracing::warn!(
+                "EventPublisher = Stub (IM_EVENT_PUBLISHER_KIND=stub): \
+                 events will NOT be delivered, cross-pod sync is OFF. \
+                 Set IM_EVENT_PUBLISHER_KIND=nats to enable it."
+            );
+            Arc::new(StubEventPublisher::new())
         }
         EventPublisherKind::Nats => {
             let url = cfg
@@ -127,10 +130,9 @@ async fn main() -> std::io::Result<()> {
                 .nats_url
                 .as_deref()
                 .unwrap_or("nats://localhost:4222");
-            tracing::info!(
-                nats_url = url,
-                "EventPublisher = Nats (MVP-stub: no real connect)"
-            );
+            // 连不上就**启动失败**, 不静默退化成 stub。理由: 运维显式配了
+            // nats, 却在 NATS 不可用时得到一个「看起来正常、事件全丢」的进程,
+            // 正是本仓反复修掉的那类假绿灯。`kind=stub` 仍然是可用的显式选择。
             Arc::new(
                 NatsEventPublisher::connect(url)
                     .await

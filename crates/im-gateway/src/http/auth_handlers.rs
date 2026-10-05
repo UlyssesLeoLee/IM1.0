@@ -716,7 +716,7 @@ mod tests {
     ) -> web::Data<AppState> {
         use im_core::conversation::pg::PgConversationRepository;
         use im_core::conversation::service::ConversationService;
-        use im_core::event::publisher::NatsEventPublisher;
+        use im_core::event::publisher::StubEventPublisher;
         use im_core::identity::pg::{PgDeviceSessionRepository, PgUserRepository};
         use im_core::identity::service::IdentityService;
         use im_core::identity::token::{SigningKey, TokenService};
@@ -728,11 +728,7 @@ mod tests {
         let message_service = Arc::new(MessageService::new(
             Arc::new(PgMessageRepository::new(p.clone())),
             Arc::new(PgSequenceAllocator::new(p.clone())),
-            Arc::new(
-                NatsEventPublisher::connect("")
-                    .await
-                    .expect("stub publisher"),
-            ),
+            Arc::new(StubEventPublisher::new()),
             conv_repo,
         ));
         let token_service = Arc::new(TokenService::new(

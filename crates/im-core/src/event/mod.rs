@@ -17,4 +17,4 @@ pub mod events;
 pub mod publisher;
 
 pub use events::MessageCreatedEvent;
-pub use publisher::{EventPublisher, NatsEventPublisher};
+pub use publisher::{EventPublisher, NatsEventPublisher, StubEventPublisher};

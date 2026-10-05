@@ -2083,6 +2083,123 @@ F-2/F-3 需要先起一个本地集群(k3d / kind), 属需批准装工具的范�
 
 ---
 
+### 1.27 D-3 实装: 事件总线从「静默 no-op」变成真 JetStream (2026-10-04)
+
+#### 缺口本体
+
+`NatsEventPublisher` 一直是 stub: `connect()` 不发起连接, `publish()` 丢弃
+全部事件并返回 `Ok(())`。aux-04 §B.4 把「转换必须 publish 事件供其他 pod
+同步」写成**不变量**, 而这条不变量从未被满足。§1.19(2026-10-03)已把它从
+「完全静默」改成「可见可测量」(`warn!` + `im_events_dropped_total`), 但
+**功能本身没实装**。
+
+本次实装。规范口径查证: `BasicDesign` 技术栈基线写「NATS JetStream」;
+WBS D-3 写「EventPublisher NATS JetStream 真实实现」;
+`ImplementationSpec §7.4.5` 写 `/* publish via NATS JetStream */`;
+`deploy/k3s/dev/nats.yaml` 也传了 `--jetstream`。四处一致, 无歧义。
+
+#### 三个刻意的设计决定
+
+1. **发布等 JetStream ack, 但有界超时(3s)。** `Context::publish()` 返回的是
+   要等服务端 ack 的 future, 不设上界的话 NATS 变慢会**顺着业务请求路径**
+   传导成延迟尖峰 —— 而 `DetailedDesign §9.1` 明确要求「失败不阻塞 ack」。
+2. **Stream 由程序幂等创建, 不依赖运维预置。** `nats.yaml` 只传了
+   `--jetstream --store_dir=/data`, **没有**任何 stream 配置; 安装包的
+   `install.sh` 也不建 stream。若假定 stream 已存在, 首次部署时每条事件都会
+   拿到 `no responders` —— 又一次静默失效。故 `connect()` 调
+   `create_or_update_stream`(内部先 update, `NotFound` 时 create)。
+   **第二个 pod 起不来**是这条设计的主要风险, 故专门有幂等用例守着。
+3. **`kind=stub` 与 `kind=nats` 拆成两种类型。** 此前两者都调
+   `NatsEventPublisher::connect` —— 于是「我要 stub」的实现是「去连
+   `nats://stub:4222」`, 而「我要 nats」也什么都不连。现在 `kind=nats`
+   连不上会**启动失败**; `kind=stub` 真的不连任何东西。配了 NATS 却静默
+   退化成 stub, 正是这个文件长期存在的那类缺陷。
+
+#### `/metrics` 从 1 个计数拆成 3 个
+
+| 指标 | 含义 | 处置 |
+|---|---|---|
+| `im_events_published_total` | 拿到 JetStream ack | 正常增长, 无需处理 |
+| `im_events_publish_failed_total` | 超时 / 服务端拒绝 | **事件没出去, 需查 NATS** |
+| `im_events_dropped_total` | `kind=stub`, 显式不投递 | 配置问题, 非故障 |
+
+把 failed 与 dropped 混成一个数, 会让「NATS 挂了」与「本来就配了 stub」在
+面板上长得一样 —— 于是真正的故障反而看不见, 这正是原设计要消灭的形态。
+`/readyz` 里的 `"nats": "not_checked_stub_publisher"` 也随之改为
+`"not_checked"`: D-3 落地后 publisher 已不再是 stub, 留着旧值就是一句假话。
+
+#### **诚实声明: DLQ 未实装**
+
+`DetailedDesign §9.1` 要求「失败不阻塞 ack 但**写入 DLQ**」。当前失败路径是
+有界超时 / 服务端错误 → 计数 + `error!` + 返回 `Err(ServiceUnavailable)`,
+调用方(`MessageService`)只记日志不阻塞 ack。即失败**可见、可测量**, 但
+**不可恢复** —— 真实重试依赖 V1+ outbox(仓内既有注释也这么写)。本节不
+声称 DLQ 存在。
+
+#### CI: `services.nats` **用不了**, 只能 `docker run`(两条实测理由)
+
+1. **GitHub Actions 的 `services.<id>` 不支持传 command/args。** 而
+   `nats:2.10-alpine` 的**默认配置既不开 JetStream 也不开 8222 monitoring**
+   —— 实测容器内 `netstat -ltn` 只有 `:::4222` 在 LISTEN, 日志也只有
+   `Listening for client connections on 0.0.0.0:4222`。没有 `--jetstream`,
+   `create_or_update_stream` 必然失败。
+2. 若同时保留一个默认配置的 service 条目, 它会与 `docker run` **抢 4222
+   端口**, 后者 bind 失败。
+
+故改为一个显式的 `start NATS (JetStream)` 步骤: `docker run ... --jetstream
+--store_dir=/data -m 8222`, 并以 **8222 monitoring 可达**为就绪判据(不是
+「容器起来了」), 30s 超时后打印 `docker logs` 再失败。
+
+#### 自审捉到的 2 处**我自己引入的**缺陷
+
+都是「只写不跑」必然漏掉的:
+
+1. **CI healthcheck 探 8222, 而 8222 根本没开** —— 第一版用
+   `services.nats` + 基于 8222 的 healthcheck。实跑容器才发现默认配置不开
+   monitoring, 该 healthcheck **永远不通过**, job 会卡住。改为 `docker run`
+   显式加 `-m 8222`(实测 `wget` 返回 200)。
+2. **保留了占位 service 条目会与 `docker run` 抢端口** —— 第一版改用
+   `docker run` 时, 我为了「让意图可读」留了个 service 声明, 那会造成端口
+   冲突。已删除。
+
+另修 2 处自己写错的 API 用法: `AppError::Internal` 的内层是
+`anyhow::Error` 而非 `String`; `Stream::info` 是**私有字段**, 公开的是返回
+Future 的 `info()` 方法。这两处都是编译期才发现的。
+
+#### 判别力: 4 个用例 + 变异测试(对照组 / 守卫组 / 跳过组)
+
+关键在于**决定性断言不查返回值, 而查服务端**: 断言的是「发完之后 JetStream
+stream 的消息计数确实增加了」, 这比「订阅者收到了」更强(证明被**持久化**),
+也比「publish 返回了 Ok」强得多(后者正是旧 stub 也能满足的)。
+
+四组实跑结果:
+
+| 组 | 条件 | exit | 结果 |
+|---|---|---|---|
+| 对照 | 未变异 + 有 NATS | 0 | 4 passed |
+| **变异** | `publish()` 改回「计数 + 返回 Ok」 | **101** | **2 failed —— 抓到了** |
+| **守卫** | `IM_REQUIRE_NATS=1` 但无 NATS | **101** | 3 failed —— panic 而非静默跳过 |
+| 跳过 | 无 NATS 且未要求 | 0 | 4 passed(本机不该全红) |
+
+源文件改前改后 SHA256 一致, 还原干净(`FINAL_RESTORE_OK=True`)。
+
+#### 仍未做
+
+- **DLQ**(见上, 诚实声明)。
+- **`/readyz` 仍不检查 NATS**: D-3 落地后已具备检查能力, 但该端点拿不到
+  publisher 实例, 故仍显式报 `not_checked` 而非编一个恒为真的字段。
+  需要把 publisher 放进 `AppState` 才能补上。
+
+#### 位置
+
+- `crates/im-core/src/event/publisher.rs` (主体)
+- `crates/im-core/tests/nats_publisher_integration.rs` (4 用例)
+- `crates/im-gateway/src/main.rs` (按 kind 分派; `kind=nats` 现在会启动失败)
+- `crates/im-gateway/src/health.rs` (3 个指标 + readyz 取值)
+- `.github/workflows/ci.yml` (integration job 的 NATS 步骤)
+
+---
+
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |

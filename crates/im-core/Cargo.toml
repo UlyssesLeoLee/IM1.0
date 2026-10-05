@@ -24,6 +24,11 @@ redis = { workspace = true }
 
 # Event bus
 async-nats = { workspace = true }
+# 2026-10-04 D-3: async_nats::jetstream::Context::publish 的 payload 形参是
+# `bytes::Bytes`(没有 `&[u8]` 重载)。`bytes` 早已是 workspace 依赖且已在
+# Cargo.lock 里(经 async-nats 等传递引入), 这里只是把它变成**直接**依赖,
+# 不新增任何 crate, 故不改变 `cargo audit` 的扫描面。
+bytes = { workspace = true }
 
 # Async / Serialization / ID
 tokio = { workspace = true }

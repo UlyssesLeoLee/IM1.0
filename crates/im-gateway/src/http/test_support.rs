@@ -200,11 +200,12 @@ pub async fn rest_fixture(p: &sqlx::PgPool) -> RestFixture {
     let message_repo: Arc<dyn MessageRepository> = Arc::new(PgMessageRepository::new(p.clone()));
     let sequencer: Arc<dyn im_core::message::sequence::SequenceAllocator> =
         Arc::new(PgSequenceAllocator::new(p.clone()));
-    let events: Arc<dyn im_core::event::publisher::EventPublisher> = Arc::new(
-        im_core::event::publisher::NatsEventPublisher::connect("nats://stub:4222")
-            .await
-            .expect("stub publisher"),
-    );
+    // 2026-10-04 D-3: 用**显式的** stub 类型, 不再借道 NatsEventPublisher。
+    // 旧写法 `NatsEventPublisher::connect("nats://stub:4222")` 之所以能工作,
+    // 正是因为那个 connect 根本不连 —— 一旦 D-3 让它真的去连, 这些用例就会
+    // 变成「等 5 秒连接超时」的假失败。stub 的选择应当是显式的。
+    let events: Arc<dyn im_core::event::publisher::EventPublisher> =
+        Arc::new(im_core::event::publisher::StubEventPublisher::new());
 
     let token_service = Arc::new(TokenService::new(
         vec![SigningKey {

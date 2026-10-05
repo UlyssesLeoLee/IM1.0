@@ -119,7 +119,7 @@ jobs:
         run: cargo test --workspace --lib --no-fail-fast
 
   test-integration:
-    name: Integration Tests (PG + migrations)
+    name: Integration Tests (PG + NATS + migrations)
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -134,10 +134,25 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      # 2026-10-04: NATS **不用 services 块**, 改由 `start NATS (JetStream)`
+      # 步骤用 `docker run` 拉起。两个原因都是实测的, 不是推断:
+      #   1. GitHub Actions 的 `services.<id>` **不支持传 command/args**,
+      #      而 `nats:2.10-alpine` 的**默认配置既不开 JetStream 也不开 8222
+      #      monitoring**(实测容器内 `netstat -ltn` 只有 4222 在 LISTEN)。
+      #      没有 `--jetstream`, `create_or_update_stream` 必然失败, 于是
+      #      `NatsEventPublisher::connect` 直接 Err —— 而断言「事件进了
+      #      JetStream」的那个用例本就要求 JetStream 必须开着。
+      #   2. 若同时保留一个默认配置的 service, 它会和 `docker run` 抢 4222
+      #      端口, 导致后者 bind 失败。故此处**不留** service 条目。
     env:
       DATABASE_URL: postgres://im:im@localhost:5432/im_test
       # 见 test-unit job 内同名校验: 少设这个变量, im-migrate 的 e2e 会静默跳过
       IM_POSTGRES_URL: postgres://im:im@localhost:5432/im_test
+      # 2026-10-04 新增, 与 IM_REQUIRE_PG 同构。D-3 的 NATS 集成测试靠它把
+      # 「连不上 NATS」变成硬失败; 少了它, 那几个用例会全部静默跳过而 job
+      # 照样报绿 —— 这正是本 job 已经为 PG 栽过一次的坑。
+      IM_NATS_URL: nats://localhost:4222
+      IM_REQUIRE_NATS: "1"
       # 2026-10-03 新增: 让「连不上 PG 就静默跳过」在 CI 里变成**硬失败**。
       # 本机没 PG 时跳过是合理的(否则无 PG 的开发机全红), 但 CI 明确挂了
       # PG service container —— 此时跳过意味着 job 配错了, 而「跳过」在
@@ -155,6 +170,32 @@ jobs:
         # 缺失会让 im-proto 的 build.rs 失败并击穿所有编译 workspace 的 job。
         run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: start NATS (JetStream)
+        # 2026-10-04 新增 (D-3)。见上方 services 区块的说明: 必须用
+        # `docker run` 而非 `services.nats`, 因为 service 块传不了 args,
+        # 而 JetStream 与 8222 monitoring 都要靠 args 打开。
+        #
+        # 就绪判据用 **8222 monitoring**, 不是「容器起来了」—— 容器起来
+        # 只说明进程在跑, 不说明 JetStream 已就绪。超时后打印 `docker logs`
+        # 再失败, 免得只留一句「连不上」。
+        run: |
+          set -euo pipefail
+          docker rm -f im10-nats-ci >/dev/null 2>&1 || true
+          docker run -d --name im10-nats-ci \
+            -p 4222:4222 -p 8222:8222 \
+            nats:2.10-alpine \
+            --jetstream --store_dir=/data -m 8222
+          for i in $(seq 1 30); do
+            if wget -q -O - http://localhost:8222/ >/dev/null 2>&1; then
+              echo "NATS JetStream ready after ${i}s"
+              docker exec im10-nats-ci wget -q -O - http://localhost:8222/jsz?streams=1 | head -20
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "::error::NATS did not become ready within 30s"
+          docker logs im10-nats-ci
+          exit 1
       - name: run migrations
         # 2026-10-03 改用仓内自己的 im-migrate 二进制(此前是 sqlx CLI)。
         #
