@@ -47,35 +47,85 @@ fn spec() -> Value {
     serde_json::from_str(SPEC_JSON).expect("docs/api/asyncapi.json 必须是合法 JSON")
 }
 
-/// 按 `properties.<tag>.const` 找 payload schema。
+/// 某一侧的 (wire 取值 -> schema) 映射。
 ///
-/// 按 tag 取值而不是按 schema 名, 是因为 spec 里 schema 名是文档作者的命名
-/// 决定, 而 tag 取值才是 wire 事实 —— 断言必须钉在 wire 事实上。
-fn schema_by_discriminator(tag: &str, value: &str) -> Value {
+/// 刻意**按方向分三张表**而不是一张全局表: `typing` 在上下行都存在
+/// (`ClientFrame::Typing` 与 `ServerFrame::Typing` 的 `properties.type.const`
+/// 都是 `"typing"`), 单张表里一条会静默覆盖另一条。本测试的第一版就是这么
+/// 写的, 于是 `ServerFrame::Typing` 被判成「对应 2 个 schema」。
+/// `scripts/check-asyncapi.ps1` 独立地踩了同一个坑并已修复 —— 同一处碰撞在
+/// 两个实现里各犯一次, 说明它是真实存在的, 不是某个语言的怪癖。
+///
+/// 上下行两张表取自 operation 的 message 列表(而非按 schema 名猜), 所以
+/// 「被文档登记」与「被 operation 引用」是同一件事。
+/// `MessageContent` 不在任何 operation 里, 单独按 `kind` + schema 名前缀取。
+fn discriminator_table(side: &str) -> std::collections::BTreeMap<String, Value> {
     let doc = spec();
-    let schemas = doc
-        .pointer("/components/schemas")
-        .and_then(Value::as_object)
-        .expect("规范必须含 components.schemas");
-    let mut found: Vec<(&str, &Value)> = Vec::new();
-    for (name, sc) in schemas {
-        if let Some(c) = sc
-            .pointer(&format!("/properties/{tag}/const"))
-            .and_then(Value::as_str)
-        {
-            if c == value {
-                found.push((name.as_str(), sc));
+    let mut out = std::collections::BTreeMap::new();
+    let operation = match side {
+        "client" => doc.pointer("/operations/clientToServer").cloned(),
+        "server" => doc.pointer("/operations/serverToClient").cloned(),
+        "content" => None,
+        other => panic!("unknown side {other:?}"),
+    };
+    match operation {
+        Some(op) => {
+            let msgs = op
+                .get("messages")
+                .and_then(Value::as_array)
+                .expect("operation 必须有 messages");
+            for mr in msgs {
+                let mname = mr
+                    .get("$ref")
+                    .and_then(Value::as_str)
+                    .and_then(|r| r.rsplit('/').next())
+                    .expect("message ref 必须有 $ref");
+                let payload = doc
+                    .pointer(&format!("/components/messages/{mname}/payload/$ref"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let sname = payload.rsplit('/').next().unwrap_or_default().to_string();
+                let sc = match doc.pointer(&format!("/components/schemas/{sname}")) {
+                    Some(s) => s.clone(),
+                    None => continue,
+                };
+                if let Some(c) = sc.pointer("/properties/type/const").and_then(Value::as_str) {
+                    out.insert(c.to_string(), sc);
+                }
+            }
+        }
+        None => {
+            let schemas = doc
+                .pointer("/components/schemas")
+                .and_then(Value::as_object)
+                .expect("规范必须含 components.schemas");
+            for (name, sc) in schemas {
+                if !name.starts_with("MessageContent") {
+                    continue;
+                }
+                if let Some(c) = sc.pointer("/properties/kind/const").and_then(Value::as_str) {
+                    out.insert(c.to_string(), sc.clone());
+                }
             }
         }
     }
-    assert_eq!(
-        found.len(),
-        1,
-        "tag={tag} value={value:?} 应当**恰好**对应 1 个 schema, 实际 {} 个: {:?}",
-        found.len(),
-        found.iter().map(|(n, _)| *n).collect::<Vec<_>>()
-    );
-    found[0].1.clone()
+    out
+}
+
+/// 在**指定方向内**按判别常量找 payload schema。
+///
+/// 按 tag 取值而不是按 schema 名, 是因为 spec 里 schema 名是文档作者的命名
+/// 决定, 而 tag 取值才是 wire 事实 —— 断言必须钉在 wire 事实上。
+fn schema_by_discriminator(side: &str, value: &str) -> Value {
+    let table = discriminator_table(side);
+    match table.get(value) {
+        Some(sc) => sc.clone(),
+        None => panic!(
+            "[{side}] 没有判别取值 {value:?} 的 schema。该方向的表里只有: {:?}",
+            table.keys().collect::<Vec<_>>()
+        ),
+    }
 }
 
 fn schema_property_names(sc: &Value) -> BTreeSet<String> {
@@ -110,8 +160,14 @@ fn actual_keys(v: &Value) -> BTreeSet<String> {
 /// 核心断言: 「所有 Option 取 None」的帧, 其 key 集合必须**恰好**是
 /// 规范声明的 `required` ∪ {tag}。
 #[track_caller]
-fn assert_all_none_frame_matches_required(label: &str, tag: &str, wire: &str, frame: &Value) {
-    let sc = schema_by_discriminator(tag, wire);
+fn assert_all_none_frame_matches_required(
+    label: &str,
+    side: &str,
+    tag: &str,
+    wire: &str,
+    frame: &Value,
+) {
+    let sc = schema_by_discriminator(side, wire);
     let actual = actual_keys(frame);
     let mut expected = schema_required(&sc);
     expected.insert(tag.to_string());
@@ -158,15 +214,10 @@ fn every_client_frame_with_none_options_matches_the_spec() {
     let id = Uuid::nil();
 
     let cases: Vec<(&str, &str, Value)> = vec![
-        (
-            "ClientFrame::Auth",
-            "auth",
-            serde_json::to_value(ClientFrame::Auth {
-                req_id: id,
-                access_token: "t".into(),
-            })
-            .unwrap(),
-        ),
+        // `auth` **不在**本表里 —— 见下方
+        // `first_frame_auth_is_not_the_im_protocol_variant` 单独说明:
+        // 规范里的 ClientAuthFrame 描述的是 im-gateway 私有的 AuthFrame,
+        // 不是这个枚举, 所以它不能靠序列化本枚举来验证。
         (
             "ClientFrame::SendMessage",
             "send_message",
@@ -237,12 +288,79 @@ fn every_client_frame_with_none_options_matches_the_spec() {
 
     assert_eq!(
         cases.len(),
-        8,
-        "ClientFrame 应有 8 个变体; 数量对不上说明本测试漏了或多了某个变体"
+        7,
+        "本表覆盖 ClientFrame 的 7 个**可由本枚举验证**的变体(auth 另有一条用例)。\
+         数量对不上说明本测试漏了或多了某个变体。"
     );
     for (label, wire, v) in cases {
-        assert_all_none_frame_matches_required(label, "type", wire, &v);
+        assert_all_none_frame_matches_required(label, "client", "type", wire, &v);
     }
+}
+
+/// 首帧 `auth` 的形状**不由 `im_protocol::ClientFrame::Auth` 决定**, 所以它
+/// 单独一条用例, 且断言的是「两个类型确实不同」这个事实本身。
+///
+/// ## 背景
+///
+/// 规范把 `ClientAuthFrame.req_id` 标成**可选**, 而本枚举里它是
+/// `req_id: Uuid`(非 Option), 序列化时恒出现。第一版把 `auth` 混在统一表里
+/// 跑, 于是本测试红了 —— 报「规范少要求了一个字段」。
+///
+/// 那不是规范错, 是**验证对象选错了**: 生产路径的 `handler.rs:331` 走私有的
+/// `AuthFrame`(Deserialize-only, `req_id` 是 `#[serde(default)] Option<Uuid>`),
+/// 从不用 `im_protocol::ClientFrame::Auth` 解析首帧。
+///
+/// ## 为什么不能简单豁免
+///
+/// 豁免掉就等于「不再验证 auth 的任何东西」。故这里反过来把差异**锁死**:
+/// ① 本枚举确实恒发 `req_id`; ② 规范确实标它可选; ③ 规范里必须写明原因。
+/// 三条任一被改动而另一方没跟上, 本用例就红。
+#[test]
+fn first_frame_auth_is_not_the_im_protocol_variant() {
+    // ① im_protocol 的枚举: req_id 是非 Option, 恒出现
+    let v = serde_json::to_value(ClientFrame::Auth {
+        req_id: Uuid::nil(),
+        access_token: "t".into(),
+    })
+    .unwrap();
+    assert_eq!(
+        v.as_object().unwrap().len(),
+        3,
+        "ClientFrame::Auth 恒有 3 个 key(type/req_id/access_token): {v}"
+    );
+    assert!(
+        v.get("req_id").is_some(),
+        "本枚举的 req_id 非 Option, 必然出现: {v}"
+    );
+
+    // ② 规范: req_id 可选
+    let sc = schema_by_discriminator("client", "auth");
+    let required = schema_required(&sc);
+    let properties = schema_property_names(&sc);
+    assert!(
+        !required.contains("req_id"),
+        "规范把首帧 req_id 标成可选, 因为生产路径走 handler.rs 的 AuthFrame"
+    );
+    assert!(
+        properties.contains("req_id"),
+        "req_id 仍必须被记录为属性(可选不等于不存在)"
+    );
+    assert!(
+        properties.contains("access_token") && required.contains("access_token"),
+        "access_token 必填且必被记录"
+    );
+
+    // ③ 规范必须把原因写进文档, 否则「为什么可选」就丢失了
+    let doc = spec();
+    let msg_desc = doc
+        .pointer("/components/messages/clientAuth/description")
+        .and_then(Value::as_str)
+        .expect("clientAuth message 必须有 description");
+    assert!(
+        msg_desc.contains("AuthFrame"),
+        "clientAuth 的 description 必须点名真正的解析类型 AuthFrame, \
+         理由: 读者会以为规范描述的是 im_protocol::ClientFrame::Auth。实际: {msg_desc}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +477,7 @@ fn every_server_frame_with_none_options_matches_the_spec() {
         "ServerFrame 应有 10 个变体; 数量对不上说明本测试漏了或多了某个变体"
     );
     for (label, wire, v) in cases {
-        assert_all_none_frame_matches_required(label, "type", wire, &v);
+        assert_all_none_frame_matches_required(label, "server", "type", wire, &v);
     }
 }
 
@@ -429,7 +547,7 @@ fn every_message_content_with_none_options_matches_the_spec() {
     );
     for (label, wire, c) in cases {
         let v = serde_json::to_value(&c).unwrap();
-        assert_all_none_frame_matches_required(label, "kind", wire, &v);
+        assert_all_none_frame_matches_required(label, "content", "kind", wire, &v);
     }
 }
 
