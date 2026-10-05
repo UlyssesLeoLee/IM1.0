@@ -36,9 +36,12 @@ $preflight = Join-Path $repo 'packaging\template\scripts\preflight.ps1'
 if (-not (Test-Path -LiteralPath $preflight)) { throw "找不到 $preflight" }
 
 $work = Join-Path $repo 'target\preflight-test'
+# 用 Remove-Item 而不是 mavis-trash: 这是在 `target/` 下的**一次性草稿目录**
+# (已被 .gitignore 覆盖, 内容每次重新生成), 走回收站没有意义。
+# 且本脚本要能在 **Linux CI runner** 上跑 —— 那里没有 mavis-trash,
+# 依赖它会让 12 个全过的用例在最后一步炸掉(run 37348672697 就是这么红的)。
 if (Test-Path -LiteralPath $work) {
-    & "$env:USERPROFILE\.minimax\bin\mavis-trash.cmd" -- $work
-    if ($LASTEXITCODE -ne 0) { throw "清理旧测试目录失败 (exit=$LASTEXITCODE)" }
+    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }
 New-Item -ItemType Directory -Path $work -Force | Out-Null
 
@@ -138,7 +141,7 @@ if ($allOutput -match [regex]::Escape($PROBE_PEPPER)) {
 else { Write-Host '  [ OK ] 泄露断言: pepper 原文未出现在任何输出里' -ForegroundColor Green }
 
 if (-not $KeepArtifacts -and (Test-Path -LiteralPath $work)) {
-    & "$env:USERPROFILE\.minimax\bin\mavis-trash.cmd" -- $work *> $null
+    Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host ''

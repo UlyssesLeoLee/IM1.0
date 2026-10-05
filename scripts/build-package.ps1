@@ -91,10 +91,12 @@ if (-not $SkipBuild) {
 
 # ---- 清空并建目录树 ----
 if (Test-Path -LiteralPath $pkgRoot) {
+    # 同 test-preflight: `dist/` 是 .gitignore 覆盖的构建产物目录, 整个重建,
+    # 走回收站没有意义。build-package 是 **Windows 专用**脚本, 但清理不该
+    # 依赖本机的可恢复删除工具 —— 那会让脚本在别的机器/CI 上跑不了。
     Write-Host ''
-    Write-Host "  已存在 $pkgName，正在覆盖（用 mavis-trash 保留可恢复性）" -ForegroundColor Yellow
-    & "$env:USERPROFILE\.minimax\bin\mavis-trash.cmd" -- $pkgRoot
-    if ($LASTEXITCODE -ne 0) { throw "清理旧包失败 (exit=$LASTEXITCODE)" }
+    Write-Host "  已存在 $pkgName，正在删除并重建" -ForegroundColor Yellow
+    Remove-Item -LiteralPath $pkgRoot -Recurse -Force -ErrorAction Stop
 }
 foreach ($d in @('bin', 'config', 'scripts', 'docs')) {
     New-Item -ItemType Directory -Path (Join-Path $pkgRoot $d) -Force | Out-Null
@@ -165,7 +167,7 @@ $sumLines = Get-ChildItem -LiteralPath $pkgRoot -Recurse -File |
 
 # ---- 压成 zip ----
 $zip = Join-Path $repo (Join-Path $OutDir "$pkgName.zip")
-if (Test-Path -LiteralPath $zip) { & "$env:USERPROFILE\.minimax\bin\mavis-trash.cmd" -- $zip }
+if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force -ErrorAction Stop }
 Compress-Archive -Path $pkgRoot -DestinationPath $zip -CompressionLevel Optimal
 $zipHash = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
 $zipInfo = Get-Item -LiteralPath $zip
