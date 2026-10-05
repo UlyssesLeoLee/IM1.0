@@ -5,7 +5,7 @@ title_zh: 协议帧样例集 (IM1.0)
 phase: 04-detailed-design-aux
 owners: Tech Lead
 status: Filled (v1.0.0)
-version: 1.1.1
+version: 1.1.2
 related_activities: 46 API 详细, 28 API 仕様, 29 IF 詳細
 patch_note: |
   2026-09-01 B-4 协议冻结补丁 [PROTOCOL-FROZEN-PATCH]:
@@ -66,7 +66,33 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 }
 ```
 
+> **首帧的 `req_id` 可以整个省略**(`"req_id": null` 亦可):生产路径的首帧由
+> gateway 私有 `AuthFrame` 解析,其 `req_id` 是
+> `#[serde(default)] Option<Uuid>`(`crates/im-gateway/src/ws/handler.rs:121-122`),
+> 而非 `ClientFrame::Auth` 里那个必填的 `Uuid`(`ws_frames.rs:32`)。省略时
+> 服务端回的 `auth_ok.req_id` 为 `null`。
+>
+> 鉴权**之后**再发 `auth` 会被判为重复鉴权并回错误帧(`handler.rs:416-425`),
+> 那种情况下走的是 `ClientFrame::Auth`,`req_id` 必填。
+>
+> 首帧不是 `auth` 时,服务端回 `VALIDATION_ERROR` 后关闭连接
+> (`handler.rs:400-409`)。
+
 #### 1.1.2 `send_message`(发消息)
+
+> **`content` 自带内层 `kind`**:`content` 是 `MessageContent` 标记枚举
+> (`#[serde(tag = "kind")]`,`crates/im-protocol/src/content.rs:12`),故 wire 上
+> **必然**有 `"kind"` 键。本文档早期版本写成 `"content": { "text": "你好" }`
+> (缺内层 tag),照抄会被服务端 `from_value::<MessageContent>` 拒为
+> `VALIDATION_ERROR`(`crates/im-core/src/message/service.rs:135`)。
+> 断言证据:`content.rs:170` 断言 `{"kind":"text","text":"hello"}`;
+> `crates/im-gateway/src/ws/hub.rs:590` 断言帧 tag(`"type":"message_new"`)与
+> content tag(`"kind":"text"`)两层共存。
+>
+> **外层 `kind` 与内层 `content.kind` 不互相校验**:外层是自由 `String`
+> (`ws_frames.rs:38`),服务端只按**内层** `content.kind` 校验 content,外层原样存库
+> 并原样下行。故 `"kind":"text"` 配 `"content":{"kind":"image",...}` **不会**被拒,
+> 且下行 `message_new` 会把这一对不一致的值一起广播。接入方应自行保证二者一致。
 
 ```json
 {
@@ -75,7 +101,7 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
   "conversation_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
   "idempotency_key": "33333333-3333-4333-8333-333333333333",
   "kind": "text",
-  "content": { "text": "你好" },
+  "content": { "kind": "text", "text": "你好" },
   "reply_to": null
 }
 ```
@@ -87,7 +113,7 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
   "type": "edit_message",
   "req_id": "44444444-4444-4444-8444-444444444444",
   "message_id": "8a7e6679-7425-40de-944b-e07fc1f90ae7",
-  "content": { "text": "你好(已编辑)" }
+  "content": { "kind": "text", "text": "你好(已编辑)" }
 }
 ```
 
@@ -145,6 +171,13 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 ```
 
 > 客户端每 30s 发一次,服务端 60s 未收到任何帧视为死连接主动断开(`IM_WS_HEARTBEAT_TIMEOUT_SECONDS=60`,见 `DetailedDesign.md §10`)。
+>
+> `ping` 是**唯一不带 `req_id` 的客户端帧**,故服务端**不回 `ack`**,只回 `pong`。
+> 其余 7 类客户端帧都必须带 `req_id`。
+>
+> `ts` 声明为 `#[serde(default)] Option<i64>` 而**无** `skip_serializing_if`
+> (`ws_frames.rs:67`),故 wire 上**恒出现**,未提供时为 `null` —— 客户端可以
+> 省略,服务端能解析,但回程 `pong.ts` 不会是「原样回传」(见 §1.2.11)。
 
 ### 1.2 服务端 → 客户端 帧
 
@@ -158,6 +191,11 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 ```
 
 > `session_id` = `device_sessions.id`,客户端可用于日志关联。
+>
+> **im-gateway 生产代码从不发送本帧** —— 鉴权成功后服务端实际回的是
+> `{"type":"auth_ok","req_id":...}`(见 §1.3 的 `auth_ok` 说明)。本变体只有
+> `im-testkit` 的 mock server 在用。接入方不应把等待 `connected` 帧写成
+> 「鉴权成功」的唯一判据。
 
 #### 1.2.2 `ack`(请求成功,带 req_id)
 
@@ -200,12 +238,31 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
   "error": {
     "code": "RATE_LIMITED",
     "message": "auth.rate_limit.send_message",
-    "trace_id": "tr_01HXY..."
+    "trace_id": "",
+    "ts": 1692528000000
   }
 }
 ```
 
 > `error.code` 取值见 `aux-03-error-code-registry.md` §B。
+>
+> **`ts` 是必填字段**,单位毫秒(`error_body.rs:17` 声明为 `ts: i64`,无
+> `Option`、无 `default`、无 `skip_serializing_if`)。早期版本只列
+> code/message/trace_id 三个键,接入方按该样例做严格校验会拒掉**所有**真实
+> 失败帧。
+>
+> **`trace_id` 在 WS 路径实际恒为空字符串**:im-gateway 构造 `ErrorBody` 时
+> 第三个参数写死 `""`(`crates/im-gateway/src/ws/handler.rs:148`)。本节原样例
+> 写的 `tr_01HXY...` 形态**不会**在 WS 路径出现 —— 那是 REST 路径的形态。
+> 接入方不可依赖 `trace_id` 做 WS 侧链路关联(该字段当前无实际内容)。
+>
+> **`details` 字段本节未列,因 WS 侧当前恒不填充**:它带
+> `skip_serializing_if = "Vec::is_empty"`(`error_body.rs:19`),为空时整个
+> key 消失而非 `[]`。仅 `VALIDATION_ERROR` 语义上可能出现
+> `[{ "field": ..., "reason": ... }]`。
+>
+> `ok=true` 时**不应**出现 `error` 键,`ok=false` 时**不应**出现 `data` 键。
+> 该互斥不变量 serde 无法表达,由构造方保证,故两个键都是可选。
 
 #### 1.2.5 `message_new`(广播新消息)
 
@@ -218,7 +275,7 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
     "sequence": 42,
     "sender_id": "1a2e6679-7425-40de-944b-e07fc1f90ae7",
     "kind": "text",
-    "content": { "text": "你好" },
+    "content": { "kind": "text", "text": "你好" },
     "reply_to": null,
     "state": "sent",
     "created_at": "2026-08-23T00:00:00Z",
@@ -228,16 +285,41 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 }
 ```
 
+> **`reactions` 当前恒为 `[]`** —— `hub.rs:423` 硬编码
+> `reactions: Vec::new()`,reaction 数据**不会**随新消息下行。接入方不应依赖
+> 该字段携带内容,也不应因收到空数组而认为「该消息无人 react」。
+> reaction 的实时下行是另一条路(§1.2.8 `reaction_added`),而该帧生产代码
+> **从不发送**(见其小节说明)。
+>
+> `WireMessage` 的 10 个字段在 wire 上**全部恒出现**(`ws_frames.rs:158-173`),
+> 其中 `sender_id` / `reply_to` / `edited_at` 可为 `null`。注意
+> `sender_id` 与 `reply_to` 虽带 `#[serde(default)]`,但**不带**
+> `skip_serializing_if`,故 `default` 只放宽反序列化,**不影响**序列化 ——
+> 接入方不可按「键可能消失」实现。
+>
+> `state` 取值域 `sent` / `delivered` / `read` / `recalled` / `deleted`
+> (字段本身是裸 `String`,但服务端只从 `MessageState::as_str()` 取值)。
+
 #### 1.2.6 `message_edited`
 
 ```json
 {
   "type": "message_edited",
   "message_id": "8a7e6679-7425-40de-944b-e07fc1f90ae7",
-  "content": { "text": "你好(已编辑)" },
+  "content": { "kind": "text", "text": "你好(已编辑)" },
   "edited_at": "2026-08-23T00:01:00Z"
 }
 ```
+
+> **生产代码从不发送本帧。** 形状只有 3 个字段,**没有 `conversation_id`**
+> (`ws_frames.rs:106-110` 即如此定义),广播中枢因此无从判断接收方是否该
+> 会话成员,`hub.rs:361-363` 把本帧归为 `Audience::Undeliverable` 并直接短路。
+> 后果: **编辑消息没有实时同步**,客户端只能靠
+> `GET /v1/conversations/{id}/messages`(§3.4)拉取。
+>
+> **补 `conversation_id` 属 wire 形状变更(协议变更),不由实现方拍板**,
+> 待规范所有者裁决。在此之前本节**如实保留当前形状**并标注「不发送」,
+> 不擅自加字段。接入方可照此形状实现解析分支,但不必等待该帧到来。
 
 #### 1.2.7 `message_recalled`
 
@@ -259,6 +341,13 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
   "emoji": "👍"
 }
 ```
+
+> **生产代码从不发送本帧**,原因同 §1.2.6:形状**没有 `conversation_id`**
+> (`ws_frames.rs:117-121`),`hub.rs:364-366` 归为 `Undeliverable`。发给别人
+> 即跨会话泄漏,故宁可不发。
+>
+> 客户端 `react` 帧仍会**落库并回 `ack`**(§1.1.5),只是**没有**实时下行
+> 通知。是否补 `conversation_id` 属协议变更,待规范所有者裁决。
 
 #### 1.2.9 `presence_update`
 
@@ -291,6 +380,24 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 }
 ```
 
+客户端 `ping` 省略 `ts`(或显式传 `null`)时:
+
+```json
+{
+  "type": "pong",
+  "ts": 0
+}
+```
+
+> **`ts` 不是严格回显**。实现是 `ts: ts.unwrap_or(0)`
+> (`crates/im-gateway/src/ws/handler.rs:437`),故客户端省略 `ts` 时服务端回
+> **`ts: 0`**,而不是把 `null` 或缺省原样送回。
+>
+> 接入方若用 `pong.ts` 做 RTT 计算,**必须**在 `ping` 里始终带 `ts`,并注意
+> `ts: 0` 是「客户端没带」与「客户端确实带了 0」无法区分的哨兵值。
+>
+> `pong.ts` 的类型是必填 `i64`(`ws_frames.rs:133`),无 `Option`,故该键恒出现。
+
 #### 1.2.12 `force_disconnect`
 
 ```json
@@ -308,10 +415,52 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 |---|---|
 | 帧编码 | JSON over WS Text Frame(UTF-8) |
 | 请求-响应配对 | 客户端写操作必带 `req_id`,服务端 `ack` 回带 |
-| 心跳 | 客户端 30s `ping`,服务端 60s 无帧超时 |
+| 心跳 | 客户端 30s `ping`,服务端 60s 无帧超时;`pong.ts` 在客户端省略 `ts` 时为 `0`(非严格回传,见 §1.2.11) |
 | 重连 | 客户端负责,使用 `after_sequence` 增量拉取(不在 WS 层做服务端补发) |
 | 顺序保证 | 同一会话内消息 `sequence` 单调递增;WS 帧顺序按服务端发送顺序 |
 | 错误语义 | `IDEMPOTENCY_CONFLICT` 走成功语义(详见 §1.2.3);其他错误 `ok=false` |
+| 未知字段 | **被静默忽略** —— `im-protocol` 全库无 `deny_unknown_fields`,多写的键通过校验(详见下) |
+
+### 1.4 接入方须知的三条实现事实
+
+以下三条是**代码事实**,与上文样例的「理想形状」不同。不写清楚,接入方会在
+联调时踩空。三条都**不**通过改代码消除 —— 属规范/实现裁决范围,见 §11。
+
+**1) 未知字段被静默忽略。** `crates/im-protocol` 全库无 `deny_unknown_fields`、
+无 `flatten`、无 `untagged`、无手写 `Serialize`(已 grep 确认),因此:
+
+```json
+{ "type": "send_message", "...": "...", "typo_field": 1 }
+```
+
+会**通过**校验,拼写错误不会在连接层被发现,而是在业务层以「字段没生效」的
+形式表现出来。接入方**不要**依赖服务端拒绝未知字段;严格校验须自己实现。
+反过来说,服务端未来增删字段不会打断旧客户端,这也是当前不加
+`deny_unknown_fields` 的代价。
+
+**2) 同一 wire `type:"auth"` 有两套形状,`req_id` 可选与否取决于发的是第几帧。**
+
+| 场景 | 解析类型 | `req_id` |
+|---|---|---|
+| 连接后**首帧**(鉴权) | gateway 私有 `AuthFrame`(`handler.rs:117-125`) | `#[serde(default)] Option<Uuid>` —— **可省略 / 可为 null** |
+| 鉴权**之后**再发 `auth` | `ClientFrame::Auth`(`ws_frames.rs:32`) | `Uuid` —— **必填** |
+
+生产路径的首帧只走前者(`handler.rs:331` 的 `from_str::<AuthFrame>`),故
+§1.1.1 的样例里 `req_id` **应当可以整个省略**;省略时服务端回的
+`auth_ok.req_id` 为 `null`。鉴权后再发 `auth` 会被判为重复鉴权
+(`handler.rs:416`)。
+
+**3) `auth_ok` 不在 `ServerFrame` 枚举里,本文档不给它 schema。**
+鉴权成功后服务端回的是 `{"type":"auth_ok","req_id":...}`,由
+`crates/im-gateway/src/ws/handler.rs:381-384` 的裸 `serde_json::json!`
+构造并直发,**绕过整个 `im_protocol` 类型体系** —— 它不是 `ServerFrame`
+的任何变体,本文档 §1.2 也从未定义它(§1.2.1 定义的是 `connected`)。
+因此本表**没有**它的规范文本可供校验,本文档**不**为它编造 schema,接入方
+**自行构造**并按「`type` 恒为 `auth_ok` + 回显 `req_id`(可 null)」处理即可。
+它是否本应是 `connected`(或某个新帧类型)属规范级裁决,见 §11。
+
+> 鉴权**失败**时服务端**不回** `auth_ok`,而是回一条 `ok=false` 的 `ack`
+> 帧(§1.2.4)并关闭连接。
 
 ## 2. gRPC 消息 (im-gateway ⇄ im-core, package `im.core.v1`)
 
@@ -613,7 +762,7 @@ Authorization: Bearer eyJ...
       "sequence": 43,
       "sender_id": "2b3e6679-...",
       "kind": "text",
-      "content": { "text": "你好" },
+      "content": { "kind": "text", "text": "你好" },
       "reply_to": null,
       "state": "sent",
       "created_at": "2026-08-23T00:00:00Z",
@@ -639,7 +788,7 @@ X-IM-Idempotency-Key: 33333333-3333-4333-8333-333333333333
 
 {
   "kind": "text",
-  "content": { "text": "你好" },
+  "content": { "kind": "text", "text": "你好" },
   "reply_to": null
 }
 ```
@@ -792,18 +941,46 @@ HTTP/1.1 204 No Content
 - `trace_id` 用于服务端日志查询(参见 `aux-09` 日志 cookbook)
 - `details` 仅 `VALIDATION_ERROR` 出现,定位具体字段错误
 
+> **REST 与 WS 的错误体字段集不同,不是笔误**。上表是 REST 形态
+> (`crates/im-gateway/src/http/error_response.rs`)。WS `ack.error` 用的是
+> `im_protocol::ErrorBody`(`error_body.rs:9`),**字段集与 REST 不同**,接入方
+> 不要拿本节去校验 WS 帧:
+>
+> | 通道 | 字段 |
+> |---|---|
+> | REST | `code` `message` `trace_id` `ts` `conversation_id`(无 `details`) |
+> | WS(`ack.error`) | `code` `message` `trace_id` `ts` `details`(无 `conversation_id`) |
+>
+> 两侧的 `trace_id` 取值形态也不同:WS 侧恒为 `""`
+> (`crates/im-gateway/src/ws/handler.rs:148` 传空串),REST 侧才有
+> `tr_01HXY...` 形态。WS 侧逐字段说明见 §1.2.4。
+
 ## 4. JSON Schema(消息 content 等)
 
 ### 4.1 `Message.content`(按 `kind`)
 
-| kind | content JSON 必填字段 | 可选字段 |
+**`content` 永远是带内层 `"kind"` 键的标记枚举**(`#[serde(tag = "kind", rename_all = "snake_case")]`,
+`crates/im-protocol/src/content.rs:12`)。下表的 `content JSON 必填字段` 一列**不含**
+`kind` 本身 —— 它是 6 种变体共有的判别键,必须恒出现。
+
+下表「可选字段」一列的字段在 wire 上**恒出现**,未提供时为 `null`:它们只带
+`#[serde(default)]` 而**无** `skip_serializing_if`,而 `default` 只影响反序列化,
+不影响序列化。接入方**不可**按「键可能消失」来实现。
+
+| kind | content JSON 必填字段 | 恒出现(未提供时为 `null`) |
 |---|---|---|
 | `text` | `text: string(1..=4000)` | — |
-| `image` | `media_id: uuid` | `width: int`, `height: int`, `thumbnail_media_id: uuid` |
+| `image` | `media_id: uuid`(Rust 是 `Uuid`,非字符串) | `width: int`, `height: int`, `thumbnail_media_id: uuid` |
 | `file` | `media_id: uuid`, `file_name: string(1..=255)`, `size_bytes: int(>0)` | `mime_type: string` |
 | `sticker` | `sticker_id: string(1..=64)` | — |
 | `system` | `event: string(join/leave/kicked/renamed/...)` | `actor_user_id: uuid`, `target_user_id: uuid` |
-| `custom` | `schema: string(1..=64)`, `data: object` | (Extension 定义) |
+| `custom` | `schema: string(1..=64)`, `data: 任意 JSON` | — |
+
+> `custom.data` 在 Rust 侧是 `serde_json::Value`(`content.rs:45`),**不强制是对象** ——
+> 数组 / 字符串 / 数字均可。早期版本写 `data: object`,属多余约束。
+>
+> `system.event` 服务端**只校验非空**(`content.rs:97-101`),不校验取值;
+> 上表括号内的取值是已知约定,不是受约束的枚举。
 
 ### 4.2 `Conversation.metadata` 命名空间约定
 
@@ -842,7 +1019,7 @@ curl -X POST https://api.{tenant}.example.com/v1/conversations/7c9e6679-.../mess
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H "X-IM-Idempotency-Key: $(uuidgen)" \
-  -d '{"kind":"text","content":{"text":"hello"}}'
+  -d '{"kind":"text","content":{"kind":"text","text":"hello"}}'
 ```
 
 ### 5.3 WebSocket 收发(wscat)
@@ -857,7 +1034,7 @@ wscat -c wss://gateway.{tenant}.example.com/ws \
 < { "type": "connected", "session_id": "..." }
 
 # 发消息
-> { "type": "send_message", "req_id": "22222222-...", "conversation_id": "7c9e6679-...", "idempotency_key": "33333333-...", "kind": "text", "content": {"text": "hi"} }
+> { "type": "send_message", "req_id": "22222222-...", "conversation_id": "7c9e6679-...", "idempotency_key": "33333333-...", "kind": "text", "content": {"kind": "text", "text": "hi"} }
 < { "type": "ack", "req_id": "22222222-...", "ok": true, "data": {"message_id": "8a7e6679-...", "sequence": 42} }
 ```
 
@@ -919,3 +1096,20 @@ grpcurl -plaintext -d '{"access_token":"eyJ..."}' \
 | 1.0.0 | YYYY-MM-DD | (模板初版) | 初版通用模板 |
 | 1.1.0 | 2026-08-23 | Mavis 辅助 | 填实 IM1.0:§1 WS 12 个帧(双向);§2 gRPC 4 个核心 RPC + proto 示例;§3 REST 7 个端点 + 错误通用格式;§4 JSON Schema 6 种 kind + Conversation metadata 命名空间;§5 调试命令 wscat/grpcurl/curl;§6 协议版本与冻结流程;全表命名从 `room_id`/`chat_rooms` 改为 `conversation_id`/`conversations` 对齐 aux-01 |
 | 1.1.1 | 2026-09-01 | 架构师 (Mavis 接手 agent per DEC-008) | **[PROTOCOL-FROZEN-PATCH]** B-4 补丁(aux-13 §7 流程豁免,理由:补缺失样例非新元素):新增 §2.5 gRPC `RespondFriendRequest` 样例 + proto 块(原错误映射表 §2.5 → §2.6);新增 §3.7 REST `POST /v1/friends/requests/{id}/respond` 接受/拒绝 curl + 204/404/403/409 错误样例(原通用错误格式 §3.7 → §3.8);修复 ImplementationSpec §16 P2-3 已知缺口;不新增协议元素,端点与 RPC 早在 2026-08-26 [PROTOCOL-FROZEN] (commit 12c7662) 冻结 |
+| 1.1.2 | 2026-10-06 | Mavis (lane/proto-doc-align) | **样例与代码对齐**(不改任何 Rust 代码, 帧集合仍为 8 + 10):①全部 `content` 样例补内层 `"kind"`(`MessageContent` 是标记枚举, 缺则被 `from_value::<MessageContent>` 拒为 `VALIDATION_ERROR`);②WS 错误体补必填 `ts`, `trace_id` 更正为恒空串(非 `tr_01HXY...`);③`pong.ts` 更正为非严格回显(省略时回 `0`);④标注 `message_new.reactions` 恒为 `[]`;⑤标注外层 `kind` 与 `content.kind` 不互相校验(外层只能声明 `type: string`);⑥新增 §1.4 三条实现事实(未知字段静默忽略 / `auth` 首帧 `req_id` 可选 / `auth_ok` 不在枚举内);⑦新增 §11 待裁决开放项;⑧标注 `message_edited`/`reaction_added`/`connected` 生产代码不发送。逐条依据见各小节内联的 `文件:行号` |
+
+## 11. 待规范所有者裁决的开放项
+
+以下 4 项**不是**实现缺陷,是规范与实现之间的未决分歧。实现方**未**擅自
+变更 wire 形状,仅在本文档中如实标注现状。
+
+| # | 开放项 | 现状(代码事实) | 为何不由实现方拍板 |
+|---|---|---|---|
+| 1 | `auth_ok` 是否应为 `connected`,或另立帧类型 | 生产回 `auth_ok`(`handler.rs:381-384`),`connected` 生产不发 | 改它变动客户端可见的 wire 形状 |
+| 2 | `message_edited` / `reaction_added` 是否补 `conversation_id` | 两帧无该字段,故 `Undeliverable`(`hub.rs:361-366`),生产不发送 | 补字段属 wire 形状变更(协议变更) |
+| 3 | 外层 `kind` 是否应校验与 `content.kind` 一致 | 外层是自由 `String`(`ws_frames.rs:38`),不校验,可不一致并原样下行 | 收紧会拒掉当前合法的既有客户端帧 |
+| 4 | WS 侧 `trace_id` 恒为空串 | `handler.rs:148` 写死 `""` | 补 trace 需引入链路追踪基建,非本表范围 |
+
+`docs/api/asyncapi.json` 已把上述事实(及 WS/REST 错误体字段集差异)逐字段
+建模为机器可读描述,接入方可直接引用。该文件经本次逐条复核**已与代码对齐**,
+故未作改动。
