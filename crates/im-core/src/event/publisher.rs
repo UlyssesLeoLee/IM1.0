@@ -83,12 +83,26 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::Utc;
 use uuid::Uuid;
 
 use im_common::AppError;
+
+// 预算必须用 **tokio 的** Instant, 不能用 `std::time::Instant`。
+//
+// 2026-10-05 实测踩到: 用 std Instant 时, `budget_caps_total_attempts_when_
+// each_attempt_is_slow` 在 `start_paused` 下观察到 **4 次**尝试(应为 2 次)
+// —— 因为 `tokio::time::sleep` 推进的是 tokio 的虚拟时钟, 而 `std::time::
+// Instant::now()` 几乎不动, 于是 `started.elapsed()` 恒为 ~0, 预算**永远
+// 花不完**。
+//
+// 生产下两者都是真实时钟, 所以线上不炸 —— 但「用 A 时钟度量、用 B 时钟操作」
+// 本来就是一处等着出事的隐患: 一旦有人在 paused-time 测试里断言预算, 或者
+// 将来引入时钟抽象, 就会得到「预算形同虚设」且不报错的错误行为。度量与操作
+// 必须同源。
+use tokio::time::Instant;
 
 // ---------------------------------------------------------------------------
 // 计数器 —— 三个语义不同的量, 混用一个会让「丢在哪」不可区分
