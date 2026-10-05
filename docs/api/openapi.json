@@ -49,7 +49,7 @@
         "tags": ["ops"],
         "operationId": "readyz",
         "summary": "就绪探针",
-        "description": "回答「能否接流量」。当前只探测 PostgreSQL; `checks` 里显式列出 `nats` 与 `valkey` 未被检查的原因, 避免读响应的人把「没提到」误解成「查过且通过」。\n\n`checks.nats` = `not_checked` (端点拿不到 publisher 实例), `checks.valkey` = `not_implemented_D4` (D-4 未落地)。",
+        "description": "回答「能否接流量」。探测 **PostgreSQL**(500ms 硬上界)与**事件发布器**; 任一不可用即返 503, 由编排器把本实例摘出 Service endpoints。\n\n`checks.nats` 取值: `ok`(JetStream 已连接) / `ok_stub_events_not_delivered`(`IM_EVENT_PUBLISHER_KIND=stub` —— **配置选择**不投递, 不阻断 readiness, 但事件确实一条都没发出去) / `disconnected` / `connecting`(正在重连; 不接流量, 但多半正在自愈)。\n\n`checks.valkey` = `not_implemented_D4`: D-4 未落地, 配置里没有该字段 —— 强行查会让 readyz 恒 503 把整个部署判死, 故显式声明「未查」而不是假装查过。",
         "x-error-codes": [],
         "responses": {
           "200": {
@@ -61,7 +61,7 @@
                   "status": "ready",
                   "checks": {
                     "postgres": "ok",
-                    "nats": "not_checked",
+                    "nats": "ok",
                     "valkey": "not_implemented_D4"
                   }
                 }
@@ -76,8 +76,8 @@
                 "example": {
                   "status": "not_ready",
                   "checks": {
-                    "postgres": "unreachable",
-                    "nats": "not_checked",
+                    "postgres": "ok",
+                    "nats": "disconnected",
                     "valkey": "not_implemented_D4"
                   }
                 }
@@ -1116,11 +1116,11 @@
           "status": { "type": "string", "enum": ["ready", "not_ready"] },
           "checks": {
             "type": "object",
-            "description": "逐依赖结果; 未检查的依赖显式列出, 避免「没提到」被读成「查过且通过」。",
+            "description": "逐依赖结果。`nats` 自 2026-10-05 起**真探测**(D-3 落地后拿得到 publisher); `valkey` 尚未落地, 显式标注为未查 —— 避免「没提到」被读成「查过且通过」。",
             "required": ["postgres", "nats", "valkey"],
             "properties": {
               "postgres": { "type": "string", "enum": ["ok", "unreachable", "timeout"] },
-              "nats": { "type": "string", "enum": ["not_checked"] },
+              "nats": { "type": "string", "enum": ["ok", "ok_stub_events_not_delivered", "disconnected", "connecting"] },
               "valkey": { "type": "string", "enum": ["not_implemented_D4"] }
             },
             "additionalProperties": false

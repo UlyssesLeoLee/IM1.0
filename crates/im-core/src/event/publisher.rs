@@ -366,6 +366,73 @@ impl DlqRecord {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 就绪判定 —— 供 `/readyz` 用(ImplementationSpec §3.1.7 + DetailedDesign §5:
+// 「PG/Valkey/NATS 全部可达才 200」)
+// ---------------------------------------------------------------------------
+
+/// 事件发布器的就绪结论
+///
+/// ## 为什么不是 `Result`
+///
+/// `Result` 只有「成功 / 失败」两种形状, 而这里有**四种**需要如实上报的状态。
+/// 若把「配置成 stub」也报成成功, `/readyz` 就会对集成方显示 `nats: ok`,
+/// 而实际上**每条领域事件都被丢弃** —— 这正是本仓反复修掉的那类「绿灯在
+/// 撒谎」(见 `health.rs` 的 `/metrics` 文案事故)。故用具名枚举, 让每一种
+/// 状态都能原样出现在响应里, 由读响应的人自己判断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublisherReadiness {
+    /// 事件可正常投递
+    Ready,
+    /// 显式配置为 stub (`IM_EVENT_PUBLISHER_KIND=stub`): 事件**有意**被丢弃,
+    /// 其余功能完全正常, 故**不**阻断 readiness
+    ///
+    /// 若把它判成 not-ready, 每一个本地/开发部署都会被永久判死 —— 那不是
+    /// 诚实, 是把「配置选择」当成「故障」。
+    StubByConfiguration,
+    /// NATS 连接不存在或已关闭
+    Disconnected,
+    /// NATS 正在(重)连接
+    ///
+    /// 与 `Disconnected` 一样不能接流量, 但**处置不同**: 前者多半是服务端
+    /// 重启 / 网络抖动, 客户端正在自愈, 很快会自己恢复。
+    Connecting,
+}
+
+impl PublisherReadiness {
+    /// 是否可以接流量
+    pub fn is_ready(self) -> bool {
+        matches!(self, Self::Ready | Self::StubByConfiguration)
+    }
+
+    /// `/readyz` 响应里 `checks.nats` 的取值
+    ///
+    /// 与 `docs/api/openapi.json` 的 `ReadyResponse.checks.nats` enum
+    /// **一一对应**。改这里必须同步改那里 —— 两侧串在 OpenAPI 契约门禁上。
+    pub fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ok",
+            Self::StubByConfiguration => "ok_stub_events_not_delivered",
+            Self::Disconnected => "disconnected",
+            Self::Connecting => "connecting",
+        }
+    }
+}
+
+/// 把 NATS 连接状态映射成就绪结论
+///
+/// 抽成**纯函数**是为了能脱离 NATS 测试: `State::Disconnected` 与
+/// `State::Pending` 在 CI 里稳定构造不出来 —— 前者需要一个真断开的连接,
+/// 后者只在首次连接/重连的那个窗口里出现。
+pub fn readiness_from_state(state: &async_nats::connection::State) -> PublisherReadiness {
+    use async_nats::connection::State;
+    match state {
+        State::Connected => PublisherReadiness::Ready,
+        State::Disconnected => PublisherReadiness::Disconnected,
+        State::Pending => PublisherReadiness::Connecting,
+    }
+}
+
 #[async_trait]
 pub trait EventPublisher: Send + Sync {
     /// 发布事件; `payload` 是**已序列化的字节**
@@ -385,6 +452,16 @@ pub trait EventPublisher: Send + Sync {
     /// 不用 `&serde_json::Value` 是因为规范明确写的是字节; 序列化在调用方做,
     /// 各事件自己选格式。
     async fn publish(&self, topic: &str, payload: &[u8]) -> Result<(), AppError>;
+
+    /// 当前能否投递事件 —— 供 `/readyz` 使用
+    ///
+    /// 2026-10-05 新增。`DetailedDesign §5` 与 `ImplementationSpec §3.1.7`
+    /// 都要求就绪判定覆盖 NATS, 但此前这个端点**拿不到 publisher 实例**,
+    /// 于是只能报一个恒定的 `not_checked`。
+    ///
+    /// **刻意不给默认实现**: 漏实现应当是**编译错误**, 而不是悄悄返回某个
+    /// 看起来正常的值 —— 那等于把「没人检查过」包装成「检查过且通过」。
+    fn readiness(&self) -> PublisherReadiness;
 }
 
 /// subject 合法性检查
@@ -701,6 +778,19 @@ impl EventPublisher for NatsEventPublisher {
 
         orchestrate_publish(topic, payload, &policy, &mut do_attempt, &mut do_dlq).await
     }
+
+    /// 读 `async_nats` 客户端内部的连接状态
+    ///
+    /// 这是**本地读**(`watch` channel), 不发网络请求, 所以 readiness 探针
+    /// 不会因为 NATS 慢而超时 —— 这正是它适合放进探针的原因。相比「发一条
+    /// 请求等回包」, 它不会给 NATS 增加探针流量, 也不会在 NATS 假死(TCP
+    /// 连着但不回包)时把探针一起拖住。
+    ///
+    /// 它同样不会**误报健康**: 连接一断, `connection_state()` 立刻变
+    /// `Disconnected`, 与服务端是否还在接受请求无关。
+    fn readiness(&self) -> PublisherReadiness {
+        readiness_from_state(&self.client.connection_state())
+    }
 }
 
 /// 显式选择的空实现 —— **只在 `event_publisher.kind=stub` 时使用**
@@ -736,6 +826,10 @@ impl EventPublisher for StubEventPublisher {
             "event DROPPED: event_publisher.kind=stub (no NATS). Cross-pod sync is OFF by configuration."
         );
         Ok(())
+    }
+
+    fn readiness(&self) -> PublisherReadiness {
+        PublisherReadiness::StubByConfiguration
     }
 }
 
@@ -830,6 +924,93 @@ mod tests {
             before + 2,
             "stub 必须逐条计数 —— 这正是它存在的理由"
         );
+    }
+
+    // ---- 就绪判定: 三个 NATS 状态 + stub 的诚实性 ----
+
+    use async_nats::connection::State;
+
+    #[test]
+    fn readiness_maps_every_nats_connection_state() {
+        // 三个变体逐个断言。若这里漏了任何一个, `/readyz` 就会对「正在重连」
+        // 或「已断开」报健康 —— 而这两种状态下事件正在进 DLQ。
+        assert_eq!(
+            readiness_from_state(&State::Connected),
+            PublisherReadiness::Ready
+        );
+        assert_eq!(
+            readiness_from_state(&State::Disconnected),
+            PublisherReadiness::Disconnected
+        );
+        assert_eq!(
+            readiness_from_state(&State::Pending),
+            PublisherReadiness::Connecting
+        );
+    }
+
+    /// 对照组 + 反例守卫: 映射**不能**退化成常量。
+    ///
+    /// 一个恒返回 `Ready` 的映射会让 `/readyz` 永远 200 —— 与本文件交付前
+    /// 「NATS 拿不到就报 `not_checked`」相比更糟: 那至少还诚实地承认没查。
+    /// 这里断言三个输入产出**三个不同的值**, 且只有 `Ready` 是 ready 的。
+    #[test]
+    fn readiness_mapping_is_not_constant_and_gates_on_the_right_side() {
+        let states = [State::Connected, State::Disconnected, State::Pending];
+        let mapped: Vec<PublisherReadiness> = states.iter().map(readiness_from_state).collect();
+
+        assert_ne!(
+            mapped[0], mapped[1],
+            "Connected 与 Disconnected 必须能区分, 否则探针在 NATS 挂掉时仍报健康"
+        );
+        assert_ne!(
+            mapped[1], mapped[2],
+            "Disconnected 与 Pending 必须能区分 —— 处置不同(前者要查, 后者在自愈)"
+        );
+        assert_eq!(
+            mapped.iter().filter(|r| r.is_ready()).count(),
+            1,
+            "只有 Connected 算 ready; 断线/重连都必须阻断流量"
+        );
+    }
+
+    /// stub **不是** ready 意义上的「正常投递」, 但也**不该**阻断流量。
+    #[test]
+    fn stub_is_ready_but_must_not_report_itself_as_healthy_nats() {
+        let r = StubEventPublisher::new().readiness();
+        assert!(
+            r.is_ready(),
+            "stub 是显式配置, 判成 not-ready 会让每个开发部署永久 503"
+        );
+        assert_eq!(
+            r.as_wire_str(),
+            "ok_stub_events_not_delivered",
+            "stub 绝不能报 `ok` —— 那等于告诉集成方 NATS 正常而事件其实全被丢弃"
+        );
+        assert_ne!(r, PublisherReadiness::Ready);
+    }
+
+    /// 四个取值都要满足「同一个值映射出同一个字符串」——
+    /// `as_wire_str` 会被探针反复调用, 不一致会让相邻两次探测给出不同结论。
+    #[test]
+    fn wire_strings_are_stable_and_distinct_where_they_must_be() {
+        let all = [
+            PublisherReadiness::Ready,
+            PublisherReadiness::StubByConfiguration,
+            PublisherReadiness::Disconnected,
+            PublisherReadiness::Connecting,
+        ];
+        for r in all {
+            assert_eq!(r.as_wire_str(), r.as_wire_str(), "{r:?} 的取值必须稳定");
+            assert!(
+                !r.as_wire_str().is_empty(),
+                "{r:?} 的取值不能是空串 —— 空串在 JSON 里读起来像「没报」。全部取值: {all:?}"
+            );
+        }
+        let mut names: Vec<&str> = all.iter().map(|r| r.as_wire_str()).collect();
+        let total = names.len();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), total, "四个取值必须互不相同: {names:?}");
     }
 
     #[tokio::test]

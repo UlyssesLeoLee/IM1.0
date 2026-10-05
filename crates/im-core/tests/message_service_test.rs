@@ -14,7 +14,7 @@ use im_common::ids::{ConversationId, EnvironmentId, MessageId, UserId};
 use im_common::AppError;
 use im_core::conversation::pg::PgConversationRepository;
 use im_core::conversation::repository::{ConversationKind, ConversationRepository, MemberRole};
-use im_core::event::publisher::EventPublisher;
+use im_core::event::publisher::{EventPublisher, PublisherReadiness};
 use im_core::message::pg::{PgMessageRepository, PgSequenceAllocator};
 use im_core::message::repository::MessageRepository;
 use im_core::message::sequence::SequenceAllocator;
@@ -154,6 +154,12 @@ impl EventPublisher for MockEventPublisher {
             return Err(AppError::Internal(anyhow::anyhow!("mock publish failure")));
         }
         Ok(())
+    }
+
+    /// mock 把事件**真的收下了**(存进 `received`), 所以它等价于一个可用的
+    /// publisher, 不是 stub —— 故报 `Ready` 而不是 `StubByConfiguration`。
+    fn readiness(&self) -> PublisherReadiness {
+        PublisherReadiness::Ready
     }
 }
 

@@ -16,7 +16,10 @@
 use actix_web::web;
 use actix_web::HttpResponse;
 use serde_json::json;
+use std::sync::Arc;
 use std::time::Duration;
+
+use im_core::event::publisher::EventPublisher;
 
 /// readiness 探测 PG 的**硬上界**
 ///
@@ -42,12 +45,30 @@ pub async fn healthz() -> HttpResponse {
 /// | 依赖 | 查不查 | 理由 |
 /// |---|---|---|
 /// | **PostgreSQL** | ✅ 查 | 唯一有**真实失败模式**的依赖: 网关每个业务端点都要它。查不到就等于「接了流量也全部 500」, 这正是 readiness 该拦下的情况 |
-/// | NATS | ❌ 不查 | D-3 已实装(`event/publisher.rs` 真实 JetStream publish), 但**这个端点拿不到 publisher 实例**, 所以无法探测它。查一个拿不到的东西只能编一个恒为真的字段, 那比不查更糟 |
+/// | **NATS** | ✅ 查 | `DetailedDesign §5` 与 `ImplementationSpec §3.1.7` 都明确要求。2026-10-05 起**真的能查了**: `AppState` 之外的 `readiness_publisher` 让本端点拿到 `EventPublisher`, 由 `PublisherReadiness::readiness()` 读 `async_nats` 客户端的本地连接状态。此前这里写的是「拿不到 publisher 实例」—— 那在 D-3 落地后已经不成立, 留着就是一句假话 |
 /// | Valkey | ❌ 不查 | **D-4 未落地**, 配置里没有对应字段, 代码里没有客户端。`DetailedDesign §5` 要求「全部可达才 200」, 但 Valkey 尚不存在 —— 若强行查, readyz 永远返 503, 整个部署起不来。宁可少查并显式声明, 也不要把 Pod 永久判死 |
 ///
-/// NATS / Valkey 两项待 D-3 / D-4 落地后接上, 届时本函数的 `checks` 地图
-/// 自然扩展, 契约不变。
-pub async fn readyz(pool: web::Data<sqlx::PgPool>) -> HttpResponse {
+/// ## 为什么 NATS 探针**不发网络请求**
+///
+/// `readiness()` 读的是 `async_nats::Client` 内部的 `watch` channel, 是**本地
+/// 读**。换成「发一条消息等回包」会有两个问题: 给 NATS 增加探针流量; NATS
+/// 假死(TCP 连着但不回包)时把探针一起拖到超时, 于是**依赖坏了反而让 readyz
+/// 超时**, 而超时与「判定为不健康」在 k8s 眼里是两件事。
+///
+/// 本地读还天然满足探针的硬约束: `im-gateway.yaml` 的 readinessProbe 没写
+/// `timeoutSeconds`(默认 **1s**), 任何一次带 IO 的检查都有被放大成 CrashLoop
+/// 的风险 —— 这正是 `PG_PING_TIMEOUT` 要显式压到 500ms 的同一个理由。
+///
+/// ## 什么时候 NATS 不阻断 readiness
+///
+/// `IM_EVENT_PUBLISHER_KIND=stub` 时事件是**配置决定**不投递, 不是故障。此时
+/// 报 `ok` 是撒谎(集成方会以为 NATS 正常), 报 503 是滥罚(每个开发部署都会
+/// 永远不健康)。故报 `ok_stub_events_not_delivered` —— 既不撒谎也不滥罚,
+/// 且读响应的人一眼能看出「事件没在发」。
+pub async fn readyz(
+    pool: web::Data<sqlx::PgPool>,
+    publisher: web::Data<Arc<dyn EventPublisher>>,
+) -> HttpResponse {
     // 上界由 `PG_PING_TIMEOUT` 强制, 不依赖 sqlx 自身的连接超时 ——
     // 后者可能因为池里已有坏连接而拖得比 1s 更久。
     let pg = tokio::time::timeout(
@@ -56,7 +77,7 @@ pub async fn readyz(pool: web::Data<sqlx::PgPool>) -> HttpResponse {
     )
     .await;
 
-    let (ok, detail) = match pg {
+    let (pg_ok, detail) = match pg {
         Ok(Ok(_)) => (true, json!("ok")),
         Ok(Err(e)) => {
             // 记日志而不是把错误原文返回给调用方: 探针响应会进 k8s 事件与
@@ -73,13 +94,22 @@ pub async fn readyz(pool: web::Data<sqlx::PgPool>) -> HttpResponse {
         }
     };
 
+    // NATS —— 本地读连接状态, 无 IO, 无超时。
+    let pub_state = publisher.readiness();
+    if !pub_state.is_ready() {
+        tracing::warn!(
+            state = pub_state.as_wire_str(),
+            "readiness: event publisher not connected; 事件正在进 DLQ"
+        );
+    }
+
     let mut checks = serde_json::Map::new();
     checks.insert("postgres".to_string(), detail);
+    checks.insert("nats".to_string(), json!(pub_state.as_wire_str()));
     // 显式列出「没查」的依赖, 避免读响应的人以为「没提到就是查过了且通过」
-    checks.insert("nats".to_string(), json!("not_checked"));
     checks.insert("valkey".to_string(), json!("not_implemented_D4"));
 
-    if ok {
+    if pg_ok && pub_state.is_ready() {
         HttpResponse::Ok().json(json!({"status": "ready", "checks": checks}))
     } else {
         // 503: k8s 见到非 2xx 即把该 Pod 摘出 Service endpoints
@@ -97,15 +127,20 @@ pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpRe
     // `ws::hub::Audience` 过滤后的实际投递为准。
     let subs = hub.subscriber_count();
 
-    // 领域事件发布的三个计数 (D-3 实装于 2026-10-04)。
+    // 领域事件发布的五个计数 (D-3 实装于 2026-10-04, DLQ 增量于 2026-10-05)。
     //
     // 2026-10-03 只有一个 `dropped`, 用来让「事件在静默消失」这件事可见。
     // 2026-10-04 D-3 落地后必须**拆成三个**, 因为三种状态的处置完全不同:
     //
     //   published  正常增长                    —— 无需处理
     //   failed     NATS 超时 / 服务端拒绝        —— 事件没出去, 需查 NATS;
-    //                                             当前无 DLQ, 丢了就是丢了
+    //                                             **含每次重试**, 故大于 DLQ 数
     //   dropped    `kind=stub`, 显式选择不投递   —— 配置问题, 不是故障
+    //
+    // 2026-10-05 补 DLQ 后再加两个 —— 它们回答「事件去哪了」:
+    //
+    //   dlq                 重试耗尽, 已落到可恢复的地方(待人工重放)
+    //   dlq_write_failed    连写 DLQ 都失败 —— 事件**真的永久没了**
     //
     // 把 failed 与 dropped 混成一个数, 会让「NATS 挂了」和「本来就配了 stub」
     // 在面板上长得一样, 于是真正的故障反而看不见了 —— 这正是原设计要消灭的
@@ -176,6 +211,7 @@ pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use im_core::event::publisher::StubEventPublisher;
 
     /// 响应体的最小契约 —— 只在测试里用, 故随测试走(不放在模块顶层,
     /// 否则非测试构建会因「从未构造」而触发 dead_code)。
@@ -200,13 +236,19 @@ mod tests {
             .expect("connect_lazy 不会发起连接")
     }
 
-    /// 把 readyz 挂到真实路由上跑 —— 顺带验证 `web::Data<PgPool>` 的接线,
+    /// 把 readyz 挂到真实路由上跑 —— 顺带验证 `web::Data` 的两项接线,
     /// 而不只是「函数本身返回了什么」。直接调 handler 会漏掉「忘记注册
-    /// app_data」这类错误(那种错误在编译期完全看不出来)。
-    async fn readyz_via_route() -> (actix_web::http::StatusCode, ReadyBody) {
+    /// app_data」这类错误(那种错误在编译期完全看不出来, 只在运行期变成 500)。
+    ///
+    /// `publisher` 显式传参而不是写死 stub: 这样同一个 helper 既能覆盖
+    /// 「stub 部署」也能覆盖「NATS 断线」, 而后者才是这次改动的重点。
+    async fn readyz_via_route_with(
+        publisher: Arc<dyn EventPublisher>,
+    ) -> (actix_web::http::StatusCode, ReadyBody) {
         let app = actix_web::test::init_service(
             actix_web::App::new()
                 .app_data(web::Data::new(dead_pool()))
+                .app_data(web::Data::new(publisher))
                 .route("/readyz", web::get().to(readyz)),
         )
         .await;
@@ -226,6 +268,29 @@ mod tests {
         )
     }
 
+    /// 默认走 stub —— 与本地/开发部署的真实形态一致。
+    async fn readyz_via_route() -> (actix_web::http::StatusCode, ReadyBody) {
+        readyz_via_route_with(Arc::new(StubEventPublisher::new())).await
+    }
+
+    /// 一个**永远不 ready**的发布器, 用于验证 503 那条分支。
+    ///
+    /// 不去真连一个坏 NATS: 那要么等连接超时(让每个用例都变慢), 要么依赖
+    /// 一个「连不上」的 DNS/端口(在别的机器上可能反而连上了)。把这个状态
+    /// 做成**显式的实现**, 是为了让「NATS 断线 -> 503」这条性质被**确定性**
+    /// 地测到, 而不是寄希望于环境里恰好有个坏服务。
+    struct UnreachablePublisher;
+
+    #[async_trait::async_trait]
+    impl EventPublisher for UnreachablePublisher {
+        async fn publish(&self, _topic: &str, _payload: &[u8]) -> Result<(), im_common::AppError> {
+            unreachable!("readiness 用例不应触发 publish")
+        }
+        fn readiness(&self) -> im_core::event::publisher::PublisherReadiness {
+            im_core::event::publisher::PublisherReadiness::Disconnected
+        }
+    }
+
     /// 端口 1 上不会有 PG。连接会被拒或超时, 两种都算「不可达」。
     #[actix_web::test]
     async fn readyz_is_503_when_postgres_is_unreachable() {
@@ -242,12 +307,66 @@ mod tests {
     /// 「没查的依赖」必须**显式**出现在响应里。
     ///
     /// 少了它, 读 `/readyz` 的人(运维或未来的健康检查脚本)会把「没提到」
-    /// 误读成「查过了且通过」—— 而实际上 NATS 是 stub、Valkey 根本不存在。
+    /// 误读成「查过了且通过」—— 而实际上 Valkey 根本不存在。
     #[actix_web::test]
     async fn readyz_states_which_dependencies_were_not_checked() {
         let (_, body) = readyz_via_route().await;
-        assert_eq!(body.checks["nats"], "not_checked");
+        // Valkey 仍未查(D-4 未落地)。NATS **已查**, 由下一批用例覆盖 ——
+        // 它曾经在这里被断言成 `not_checked`, 而那个断言本身就是过期的。
         assert_eq!(body.checks["valkey"], "not_implemented_D4");
+    }
+
+    /// NATS 断线必须让 readyz 返 503。
+    ///
+    /// 这是本次改动的**全部意义**: 此前这个端点报 `not_checked` 且恒返
+    /// 「NATS 没问题」, 于是 NATS 挂掉时 k8s 继续往这个实例送流量, 而每条
+    /// 领域事件都在重试后进 DLQ —— 集群看起来健康, 事件在悄悄积压。
+    #[actix_web::test]
+    async fn readyz_is_503_when_the_event_publisher_is_not_ready() {
+        let (status, body) = readyz_via_route_with(Arc::new(UnreachablePublisher)).await;
+        assert_eq!(
+            status,
+            actix_web::http::StatusCode::SERVICE_UNAVAILABLE,
+            "NATS 断线时必须 503 —— 继续接流量只会让事件继续往 DLQ 里积压"
+        );
+        assert_eq!(body.status, "not_ready");
+        assert_eq!(body.checks["nats"], "disconnected");
+    }
+
+    /// stub 部署**不**该被判成不健康, 但也**不能**报成 `nats: ok`。
+    ///
+    /// 两个方向的错都有人会踩: 报 `ok` 让集成方以为事件在发(其实全被丢弃),
+    /// 报 503 让每个本地开发部署永远起不来。
+    #[actix_web::test]
+    async fn readyz_does_not_fail_the_pod_for_a_deliberate_stub_publisher() {
+        // `_status` 是**刻意**不用的: PG 在这个用例里是 `dead_pool`, 所以
+        // 响应必然是 503, 而那个 503 是 PG 造成的 —— 断言它等于把两件事混在
+        // 一起, 分不清是「stub 放行了」还是「PG 挡住了」。
+        //
+        // 要验「stub 本身不阻断 readiness」, 需要一个 **PG 可达**的池, 那属于
+        // 集成层(要真 PG), 不在本文件。`PublisherReadiness::is_ready()` 的
+        // 单测锁住了判定本身; 这里锁住的是「响应里那串字」。
+        let (_status, body) = readyz_via_route().await;
+        assert_eq!(body.checks["nats"], "ok_stub_events_not_delivered");
+        assert_ne!(
+            body.checks["nats"], "ok",
+            "stub 报 `ok` 等于对集成方撒谎: 事件其实一条都没发出去"
+        );
+    }
+
+    /// 两个原因要能**分别**从响应里读出来。
+    ///
+    /// 只有一个 `status: not_ready` 时, 运维无法区分「数据库挂了」与
+    /// 「NATS 挂了」—— 而两者的处置完全不同(前者查 PG, 后者查 NATS)。
+    #[actix_web::test]
+    async fn readyz_reports_pg_and_publisher_failures_independently() {
+        let (status, body) = readyz_via_route_with(Arc::new(UnreachablePublisher)).await;
+        assert_eq!(status, actix_web::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.checks["postgres"], "unreachable",
+            "PG 不可达时必须如实报 postgres, 不能被 NATS 的失败掩盖"
+        );
+        assert_eq!(body.checks["nats"], "disconnected");
     }
 
     /// 探针超时上界必须显著小于 k8s 默认 `timeoutSeconds: 1`。

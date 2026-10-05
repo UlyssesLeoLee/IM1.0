@@ -23,7 +23,7 @@
 //! 只可能是 job 配错了。
 
 use im_core::event::publisher::{
-    published_event_count, EventPublisher, NatsEventPublisher, EVENT_STREAM,
+    published_event_count, EventPublisher, NatsEventPublisher, PublisherReadiness, EVENT_STREAM,
 };
 
 /// 取 NATS 地址; 连不上时按 `IM_REQUIRE_NATS` 决定跳过还是 panic
@@ -170,6 +170,59 @@ async fn connect_to_dead_endpoint_fails_instead_of_silently_stubbing() {
     assert!(
         elapsed < std::time::Duration::from_secs(20),
         "connect 失败必须有界, 实际耗时 {elapsed:?} —— 无限等待会把网关启动卡住"
+    );
+}
+
+/// 真连上 NATS 时, 就绪判定必须是 `Ready`
+///
+/// 这条是 `/readyz` 纳入 NATS 之后**唯一**能把「读本地连接状态」和「NATS 真的
+/// 接受了连接」对上的地方。`publisher.rs` 的单测只能验映射函数, 验不了
+/// `connection_state()` 在真实连接后确实变成 `Connected` —— 而那正是
+/// 「`/readyz` 会一直报 503」这种故障的唯一可能来源。
+///
+/// 守卫方向: 若有人把 `NatsEventPublisher::readiness` 写成恒返回 `Disconnected`,
+/// 网关会**永远**不 ready, 而这类故障在所有其他测试里都看不出来。
+#[tokio::test]
+async fn connected_publisher_reports_ready() {
+    let Some(p) = connect_or_skip("connected_publisher_reports_ready").await else {
+        return;
+    };
+
+    assert_eq!(
+        p.readiness(),
+        PublisherReadiness::Ready,
+        "真连上 NATS 的 publisher 必须报 Ready —— 否则 /readyz 会恒 503, \
+         k8s 把所有实例都摘出 Service endpoints, 表现为「服务完全起不来」"
+    );
+    assert!(
+        p.readiness().is_ready(),
+        "同一个结论也必须能从 is_ready() 得到 —— 探针用的是它"
+    );
+}
+
+/// 就绪判定**不发网络请求** —— 它必须瞬时返回
+///
+/// `im-gateway.yaml` 的 readinessProbe 没写 `timeoutSeconds`(默认 **1s**)。
+/// 若这个检查带 IO, NATS 一慢就把探针拖到超时, 而探针超时与「判定为不健康」
+/// 在 k8s 眼里是两件事(前者会累计 failureThreshold, 后者只是摘流量)。
+///
+/// 故断言它是**本地读**: 连上以后连续 128 次判定必须远快于 1s。
+#[tokio::test]
+async fn readiness_check_is_local_and_not_io_bound() {
+    let Some(p) = connect_or_skip("readiness_check_is_local_and_not_io_bound").await else {
+        return;
+    };
+
+    let started = std::time::Instant::now();
+    for _ in 0..128 {
+        let _ = p.readiness();
+    }
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_millis(500),
+        "128 次就绪判定耗时 {elapsed:?} —— 这不该是 IO。若它变慢, 说明有人把 \
+         网络请求塞进了探针路径"
     );
 }
 

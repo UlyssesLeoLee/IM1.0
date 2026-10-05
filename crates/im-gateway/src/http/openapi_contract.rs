@@ -317,6 +317,14 @@ fn openapi_app() -> actix_web::App<
         .app_data(web::Data::new(state))
         .app_data(web::Data::new(pool))
         .app_data(web::Data::new(ws_hub))
+        // `/readyz` 自 2026-10-05 起要读 publisher 的就绪状态。漏注册这一项,
+        // 编译照过, 但该路由在运行期变成 500 —— 与「规范漏写了路由」长得
+        // 一模一样。这里用 stub: 本函数只验证**路由与 operationId**, 不需要
+        // 真 NATS。
+        .app_data(web::Data::new(std::sync::Arc::new(
+            im_core::event::publisher::StubEventPublisher::new(),
+        )
+            as std::sync::Arc<dyn im_core::event::publisher::EventPublisher>))
         .service(web::scope("/v1").configure(crate::http::configure))
         .route("/healthz", web::get().to(crate::health::healthz))
         .route("/readyz", web::get().to(crate::health::readyz))
@@ -973,5 +981,82 @@ async fn metrics_gate_rejects_mutated_specs() {
     assert!(
         compare_metric_names(&backticked_metric_names(&reordered), &live_names).is_clean(),
         "去掉 (gauge)/(counter) 标注不应被判成漂移 —— 指标名集合没变"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 测试 5: /readyz 的 `checks.nats` 取值必须与代码里发的一致
+// ---------------------------------------------------------------------------
+
+/// 取规范里 `ReadyResponse.checks.nats.enum` 的全部取值。
+///
+/// 指针取不到就 panic —— 一个「规范里没这个 enum」的返回值若被当成空集,
+/// 测试会安静地通过, 于是**规范漏写**与「规范写错」看起来一模一样。
+fn readyz_nats_enum() -> Vec<String> {
+    spec_value()
+        .pointer("/components/schemas/ReadyResponse/properties/checks/properties/nats/enum")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| {
+            panic!(
+                "规范里 ReadyResponse 缺少 checks.nats.enum。少了它, 本测试会退化成 \
+                 「两边都是空集所以相等」的空转断言。"
+            )
+        })
+        .iter()
+        .map(|v| v.as_str().unwrap_or("<非字符串>").to_string())
+        .collect()
+}
+
+/// 规范里的 4 个取值必须与 `PublisherReadiness::as_wire_str()` **逐个**对上
+///
+/// 2026-10-05 新增。此前 `/readyz` 的 `checks.nats` 恒为 `not_checked`, 没有任何
+/// 东西约束它与代码的关系 —— 于是「代码发 `ok_stub_events_not_delivered`、规范里
+/// 还写着 `not_checked`」这种漂移可以完全无声地发生。
+///
+/// 集成方是按**规范**写探针解析代码的: 规范少一个取值, 客户端就会在真实响应上
+/// 走进未匹配分支。这个集合相等断言把那类漂移变成编译期就红。
+#[test]
+fn readyz_nats_values_match_the_code() {
+    use im_core::event::publisher::PublisherReadiness::*;
+
+    let from_code: Vec<String> = [Ready, StubByConfiguration, Disconnected, Connecting]
+        .iter()
+        .map(|r| r.as_wire_str().to_string())
+        .collect();
+
+    let mut sorted_code = from_code.clone();
+    sorted_code.sort();
+    let mut sorted_spec = readyz_nats_enum();
+    sorted_spec.sort();
+
+    assert_eq!(
+        sorted_code, sorted_spec,
+        "代码发的 checks.nats 取值与规范 enum 不一致。\n\
+         代码: {sorted_code:?}\n规范: {sorted_spec:?}\n\
+         集成方按规范解析响应 —— 规范少一个取值, 客户端就会走进未匹配分支。"
+    );
+}
+
+/// 对照组 + 变异守卫: 两侧都非空, 且集合相等**不能**是「都空」
+///
+/// 若 `readyz_nats_enum()` 因指针写错而返回空集, 上面的相等断言会因为
+/// 「代码侧也恰好为空」而通过 —— 实际上代码侧有 4 个, 所以那条断言会红。
+/// 但反过来: 若有人把 `as_wire_str` 的调用从测试里删掉, 两侧就都空了。
+/// 故显式钉住「各 4 个」。
+#[test]
+fn readyz_nats_enum_is_not_empty_on_either_side() {
+    use im_core::event::publisher::PublisherReadiness::*;
+
+    let code_count = [Ready, StubByConfiguration, Disconnected, Connecting].len();
+    let spec_count = readyz_nats_enum().len();
+
+    assert_eq!(
+        code_count, 4,
+        "PublisherReadiness 的变体数变了 —— 请同时更新规范 enum 与本测试"
+    );
+    assert_eq!(
+        spec_count, 4,
+        "规范里 ReadyResponse.checks.nats.enum 的取值数变成了 {spec_count}。\
+         两侧都空会让「集合相等」变成一句空话。"
     );
 }

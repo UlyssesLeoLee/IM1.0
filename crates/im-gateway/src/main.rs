@@ -171,7 +171,7 @@ async fn main() -> std::io::Result<()> {
     let message_service = Arc::new(MessageService::new(
         message_repo,
         sequence_allocator,
-        event_publisher,
+        event_publisher.clone(),
         conversation_repo,
     ));
     let identity_service = Arc::new(IdentityService::new(
@@ -237,6 +237,19 @@ async fn main() -> std::io::Result<()> {
     // 流量打过去, 而那个实例的每个业务端点都会 500。
     let readiness_pool = web::Data::new(pg_pool.clone());
 
+    // 2026-10-05: NATS 也纳入就绪判定 —— `DetailedDesign §5` 与
+    // `ImplementationSpec §3.1.7` 都要求, 而 D-3 落地后 publisher 已经
+    // 拿得到了(此前 `/readyz` 报的是恒定的 `not_checked`)。
+    //
+    // 单独注入而不是塞进 `AppState`: `AppState` 服务于 `/v1` 的业务
+    // handler, 而探针只需要 publisher 一个字段; 让探针依赖整个 AppState
+    // 会使任何构造 AppState 的测试都必须先凑齐 7 个 service。
+    //
+    // 漏掉这一行, 编译仍会通过(extract 器是运行期解析的), 但每个
+    // `/readyz` 请求都会 500 —— 故在此显式注册, 与 `ws_hub` 同一理由。
+    let readiness_publisher: web::Data<Arc<dyn EventPublisher>> =
+        web::Data::new(event_publisher.clone());
+
     let http_port = cfg.http_port;
     tracing::info!(http_port, "im-gateway binding HTTP server");
 
@@ -245,6 +258,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(app_state.clone()))
             .app_data(ws_hub.clone())
             .app_data(readiness_pool.clone())
+            .app_data(readiness_publisher.clone())
             .service(web::scope("/v1").configure(http::configure))
             .route("/healthz", web::get().to(health::healthz))
             .route("/readyz", web::get().to(health::readyz))
