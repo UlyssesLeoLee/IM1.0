@@ -214,12 +214,31 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
   "error": {
     "code": "RATE_LIMITED",
     "message": "auth.rate_limit.send_message",
-    "trace_id": "tr_01HXY..."
+    "trace_id": "",
+    "ts": 1692528000000
   }
 }
 ```
 
 > `error.code` 取值见 `aux-03-error-code-registry.md` §B。
+>
+> **`ts` 是必填字段**,单位毫秒(`error_body.rs:17` 声明为 `ts: i64`,无
+> `Option`、无 `default`、无 `skip_serializing_if`)。早期版本只列
+> code/message/trace_id 三个键,接入方按该样例做严格校验会拒掉**所有**真实
+> 失败帧。
+>
+> **`trace_id` 在 WS 路径实际恒为空字符串**:im-gateway 构造 `ErrorBody` 时
+> 第三个参数写死 `""`(`crates/im-gateway/src/ws/handler.rs:148`)。本节原样例
+> 写的 `tr_01HXY...` 形态**不会**在 WS 路径出现 —— 那是 REST 路径的形态。
+> 接入方不可依赖 `trace_id` 做 WS 侧链路关联(该字段当前无实际内容)。
+>
+> **`details` 字段本节未列,因 WS 侧当前恒不填充**:它带
+> `skip_serializing_if = "Vec::is_empty"`(`error_body.rs:19`),为空时整个
+> key 消失而非 `[]`。仅 `VALIDATION_ERROR` 语义上可能出现
+> `[{ "field": ..., "reason": ... }]`。
+>
+> `ok=true` 时**不应**出现 `error` 键,`ok=false` 时**不应**出现 `data` 键。
+> 该互斥不变量 serde 无法表达,由构造方保证,故两个键都是可选。
 
 #### 1.2.5 `message_new`(广播新消息)
 
@@ -805,6 +824,20 @@ HTTP/1.1 204 No Content
 - `message` 是 i18n key,**非最终用户文案**(前端按当前 locale 翻译)
 - `trace_id` 用于服务端日志查询(参见 `aux-09` 日志 cookbook)
 - `details` 仅 `VALIDATION_ERROR` 出现,定位具体字段错误
+
+> **REST 与 WS 的错误体字段集不同,不是笔误**。上表是 REST 形态
+> (`crates/im-gateway/src/http/error_response.rs`)。WS `ack.error` 用的是
+> `im_protocol::ErrorBody`(`error_body.rs:9`),**字段集与 REST 不同**,接入方
+> 不要拿本节去校验 WS 帧:
+>
+> | 通道 | 字段 |
+> |---|---|
+> | REST | `code` `message` `trace_id` `ts` `conversation_id`(无 `details`) |
+> | WS(`ack.error`) | `code` `message` `trace_id` `ts` `details`(无 `conversation_id`) |
+>
+> 两侧的 `trace_id` 取值形态也不同:WS 侧恒为 `""`
+> (`crates/im-gateway/src/ws/handler.rs:148` 传空串),REST 侧才有
+> `tr_01HXY...` 形态。WS 侧逐字段说明见 §1.2.4。
 
 ## 4. JSON Schema(消息 content 等)
 
