@@ -2451,15 +2451,164 @@ skip, 而 skip 在 libtest 眼里等于通过)。
 
 #### 仍未做(诚实声明)
 
-- **AsyncAPI 仍缺**: WS 帧协议无机器可读描述。逐个数 aux-13 的小节标题:
-  客户端 §1.1.1–§1.1.8 共 **8** 类, 与 `ClientFrame` 的 8 个变体 1:1 对齐;
-  服务端 §1.2.1–§1.2.12 共 **12 个小节**, 但 `ack` 占了 3 个(成功 / 幂等冲突 /
-  真错误), 去重后是 **10 个不同帧类型**, 与 `ServerFrame` 的 10 个变体
-  **1:1 完全对应**。OpenAPI 3.1 无原生 WebSocket 支持, `/v1/ws` 只登记了
-  101 握手与首帧 `auth`。这是「主要用于集成」下**剩余的最大接入障碍** ——
-  WS 客户端目前只能读 `im_protocol` 的 Rust 源码反推帧形状。
+- ~~**AsyncAPI 仍缺**~~ —— ✅ **已于 §1.30 交付**(AsyncAPI 3.1.0, 19 message /
+  34 schema, 静态门禁 + 运行时契约双层)。
+  附: 逐个数 aux-13 的小节标题 —— 客户端 §1.1.1–§1.1.8 共 **8** 类, 与
+  `ClientFrame` 的 8 个变体 1:1 对齐; 服务端 §1.2.1–§1.2.12 共 **12 个小节**,
+  但 `ack` 占了 3 个(成功 / 幂等冲突 / 真错误), 去重后是 **10 个不同帧类型**,
+  与 `ServerFrame` 的 10 个变体 1:1 完全对应。
 - §1.18 的 `/readyz` 仍**不检查 NATS**(publisher 不在 `AppState` 里),
   也不检查 Valkey(D-4 不存在)。
+
+---
+
+### 1.30 AsyncAPI 3.1.0: WS 帧协议首次有机器可读描述 + 双层漂移门禁 (2026-10-05)
+
+#### 缺口本体
+
+`openapi.json` 覆盖 HTTP 面, 但 WebSocket 面此前**完全没有**机器可读描述。
+接入方要自己读 `im-protocol` 的 Rust 源码, 反推 8 类上行 / 10 类下行帧的 JSON
+形状。OpenAPI 3.1 无原生 WebSocket 支持, `/v1/ws` 在规范里只登记了 101 握手
+与首帧 `auth`。对一个定位为「主要用于集成」的产品, 这是最大的接入障碍。
+
+#### 交付物
+
+- `docs/api/asyncapi.json` —— AsyncAPI **3.1.0**, 1 channel / 2 operations /
+  **19 message** / **34 schema**。
+- `scripts/check-asyncapi.ps1` —— 静态门禁, 接入 `ci.yml` 的 sast job。
+- `crates/im-protocol/tests/ws_frames_contract.rs` —— 运行时契约测试(8 个用例)。
+
+字段的**名字 / 可空性 / 必填性全部逐个取自 serde 派生**, 不取自 aux-13 的样例
+JSON(`ImplementationSpec` 处于 `[PROTOCOL-FROZEN]`, 样例与代码在 `content`
+内层 `kind`、`ErrorBody.ts` 等多处冲突, 以代码为准)。与 `openapi.json` 同一口径。
+
+#### 规范里最容易被写错、因而必须被机器核对的一条规则
+
+serde 给 `Option<T>` 有**三种**行为, 产生三种不同的 JSON:
+
+| Rust 写法 | wire 上的表现 |
+|---|---|
+| 无属性 | 恒序列化, `None` 时 `"f": null` |
+| **仅** `#[serde(default)]` | **同样恒序列化** —— `default` 只影响反序列化 |
+| `default + skip_serializing_if` | key **整个消失** |
+
+中间那条最坑: 很多人以为 `default` 让字段可省略, 于是标成非必填 —— 那是在
+描述一个服务端**永远不会发出**的形状, 且不产生任何运行期错误。故规范里
+`required` 的含义被显式写成「**wire 上一定出现**」, 门禁第 3 项逐字段核对它。
+
+#### 双层门禁: 静态从源码推导, 运行时真序列化
+
+静态门禁从 **Rust 源码文本**读 `skip_serializing_if` 属性 —— 那是一条关于
+serde **行为**的断言, 不是对本仓 serde 实际行为的观测。运行时契约测试把每个
+变体用「所有 Option 取 None」构造, 真跑 `to_string`, 要求 key 集合**恰好**
+等于规范声明的 `required` ∪ {tag}。
+
+必须双向相等: 只断言「required 里的字段都出现了」会漏掉「本该 skip 却恒出现
+为 `null`」的那一半。24 个变体(8 + 10 + 6)逐个覆盖。
+
+#### 门禁判别力: 13 个变异用例 0 失败
+
+1 对照组 + 8 注入缺陷(删 / 加字段、skip 字段标 required、恒序列化字段标可选、
+改判别常量、从 operation 删 message、悬空 `$ref`、破坏 message 数基线)
++ 2 反例守卫(`auth_ok` 豁免仍放行; 注释里长得像变体的文本必须被忽略)
++ 2 解析退化(Rust 括号坏掉 / JSON 坏掉, 均 `exit 2` 而非当成通过)。
+源文件改前改后 SHA256 一致。
+
+#### 门禁**第一次跑**报了 52 条, 其中 51 条是门禁自己的 bug
+
+这条值得单列, 因为它是最容易犯错的判断:
+
+1. **全局 discriminator 索引在 `typing` 上撞车**。`ClientFrame::Typing` 与
+   `ServerFrame::Typing` 的 `properties.type.const` 都是 `"typing"`, 单个字典
+   里一条静默覆盖另一条 —— 19 个 schema 被索引成 18 个, 然后门禁把上行的
+   `typing` 拿去比对下行 schema 的字段。改为**按方向分别建索引**, 来源是
+   operation 的 message 列表。
+2. **字段正则的终止符只认逗号**。单行变体
+   (`RecallMessage { req_id: Uuid, message_id: Uuid }`)的**最后一个**字段没有
+   逗号 —— 那个逗号属于变体列表。改为「逗号**或** body 结束」的分支。
+3. **把 serde tag 当成普通字段**。`type` 是 `#[serde(tag = "type")]` 注入的,
+   不是结构体字段, 却拿去和 Rust 字段表比对 `required`。
+
+**真实漂移总是零星几条; 一次跑出几十条, 几乎必然是门禁自己的解析或索引逻辑
+出了问题。** 若照着违规逐条改规范, 会把一份对的规范改坏。
+
+#### 同一处 `typing` 碰撞在两个独立实现里各犯一次
+
+PowerShell 门禁与 Rust 运行时测试是两份独立代码, 各自踩了同一个坑。这说明
+它是**协议形状里的真实歧义**, 不是某个语言的怪癖, 值得当设计问题修
+(按方向分索引) 而不是随手补。
+
+#### 首帧 `auth`: 规范是对的, 验证对象选错了
+
+CI 首次运行(run 37283006605)Integration 红, 两条失败**都是测试自身缺陷**:
+
+- 报错「规范少要求了一个字段」: 规范把 `ClientAuthFrame.req_id` 标成可选, 而
+  序列化 `im_protocol::ClientFrame::Auth` 必然带 `req_id`。
+- **规范是对的。** 生产路径 `handler.rs:331` 走私有的 `AuthFrame`
+  (Deserialize-only, `req_id` 是 `#[serde(default)] Option<Uuid>`), **从不用**
+  `im_protocol::ClientFrame::Auth` 解析首帧。同一 wire 形状, 两个 Rust 类型,
+  只有一个是活的。第一版拿 A 类型的输出去验 B 类型的文档。
+
+**没有豁免。** 豁免等于 auth 的任何东西都不再被验证, 而它恰恰是最容易漂的
+一帧(裸 `json!` 构造, 不受类型系统保护)。改为单独一条用例, 把差异**锁成三条
+断言**: ① 本枚举确实恒发 `req_id` ② 规范确实标它可选且仍记为属性
+③ 规范的 description **必须点名** `AuthFrame`。任一被改而另一方没跟上就红。
+
+静态门禁里也有一条对应例外(`$RequiredFieldExceptions`), 同样写明理由并
+**断言条目数为 1**(照 §1.28 里 `IDEMPOTENCY_CONFLICT` 的先例)。
+
+#### 结构合法性由官方工具独立验证
+
+用官方 `@asyncapi/parser` 实测: 声明 3.0.0 时有 1 条 warning(建议升 3.1.0),
+改为 **3.1.0** 后**零错误零警告**, 且 1 channel / 2 operations / 19 messages /
+34 schema 的结构与 3.0.0 完全一致(本仓用到的 3.1.0 特性集是 3.0.0 的超集,
+无需改结构)。对「商业产品标准」的交付物, 声明最新版本优于声明次新版本。
+
+**两个独立工具**(本仓门禁 + 官方 parser)对同一份文档给出一致的结构判断 ——
+互为对照, 不是单方自证。
+
+#### 规范里显式记录的已知偏差(一律不擅自修)
+
+- `auth_ok` **不在** `ServerFrame` 枚举里, 由 `handler.rs:381` 的裸
+  `serde_json::json!` 构造, aux-13 §1.2 也未定义。按代码事实登记, 标
+  `x-im-spec-status: undeclared`, **不**裁决它是否本应是 `connected`。
+- 5 个下行帧登记但标 `x-im-implementation-status: reserved-not-emitted`
+  (`connected` / `message_edited` / `reaction_added` / `presence_update` /
+  `force_disconnect`)—— 让接入方知道协议预留了这些形状, 而不是让人去等它们。
+- **REST 与 WS 的错误信封字段集不同**: REST 有 `conversation_id` 无 `details`
+  (`error_response.rs::json_response`), WS 反之(`ErrorBody`)。规范里给了对照表。
+- `message_new.reactions` 当前恒为 `[]`(`hub.rs:423` 硬编码)。
+- 未知字段被静默忽略(全库无 `deny_unknown_fields`), 故所有 schema 的
+  `additionalProperties` 显式为 **`true`** —— 标 `false` 会让严格校验的客户端
+  拒掉服务端实际接受的帧, 那比不校验更坏。
+- 上行 `send_message.kind` 与内层 `content.kind` **互不校验**, 客户端可发一对
+  不一致的值且不被拒; 下行会把这对不一致一起广播。规范按代码事实记录, 不收紧。
+
+#### 顺带纠正的一处错数
+
+`ws_frames.rs:3` 的模块文档写「aux-13 §1.2 服务端 11 类」。逐个数小节标题:
+§1.2.1–§1.2.12 共 12 个小节, `ack` 占 3 个, 去重后 **10 个不同帧类型**, 与枚举
+10 个变体 1:1 对应。已改并写明推导。**别把「11」理解成「缺 1 类」**: aux-13
+**没有**定义已读回执下行帧, 该需求来自另一份文档(aux-04 §B.4), 属规范级遗漏。
+
+#### 验证
+
+- `check-asyncapi.ps1` exit 0(client 8 / server 11 discriminator, 106 个 `$ref`
+  全部可解析, 19 message / 34 schema)
+- 变异测试 13/13 通过, SHA256 还原一致
+- 官方 parser: `OK: valid AsyncAPI 3.1.0`, 零 warning
+- **CI 验收 (run 37284406272, head `03549f2`): 4/4 job success, Integration
+  **444 passed / 0 failed / 0 ignored**(基线 436 + 新增 8), 8 条新契约测试逐条
+  `ok`; 门禁在 Linux 上输出 `OK: asyncapi.json matches the im-protocol serde
+  definitions`; `lint-ps1-encoding` 判新脚本 `NO-BOM ascii-only`**
+- 本机 cargo **未作为验证源**(共享 target 被其他项目占锁)
+
+#### 位置
+
+- `docs/api/asyncapi.json` (规范)
+- `scripts/check-asyncapi.ps1` (静态门禁)
+- `crates/im-protocol/tests/ws_frames_contract.rs` (运行时契约)
+- `.github/workflows/ci.yml` (sast job 的 `check AsyncAPI drift` 步骤)
 
 ---
 
