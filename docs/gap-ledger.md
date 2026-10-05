@@ -2301,7 +2301,49 @@ actix 的 `scope("X")` 只在**它所在的括号组**内有效, 但源码是流
 
 - `docs/api/openapi.json` (规范)
 - `scripts/check-openapi.ps1` (门禁)
+- `crates/im-gateway/src/http/openapi_contract.rs` (运行时契约测试)
 - `.github/workflows/ci.yml` (sast job 的 `check OpenAPI drift` 步骤)
+
+#### 第二层: 运行时契约测试(与静态门禁互补)
+
+`check-openapi.ps1` 是**静态**的 —— 从源码正则推导路由表。它挡得住「改了
+代码忘了改文档」, 但它本身是个解析器, 而解析器可能解析错。故补一层
+**运行时**对拍: `crates/im-gateway/src/http/openapi_contract.rs` 真搭一个
+actix App, 对规范里每条 (method, path) 发**真请求**, 让 actix 自己的匹配逻辑
+回答「这条路由存在吗」。
+
+判别式: `404 且 body 为空` = 路由未命中。依据是本仓形状事实 —— actix 未命中
+返回 `404 + 空 body`, 而 handler 的一切错误(含 404)都走
+`error_response.rs::json_response`, 它**总是** `.json(body)`。
+
+该判别式会退化(有人给 actix 装自定义 404 页, 或某个 handler 返回裸
+`NotFound().finish()`), 故 `undocumented_path_is_not_routed` 是它的报警器。
+
+不需要数据库: 用 `connect_lazy` 指向连不上的端口, `AppState` 的 7 个 service
+全都能构造而不碰网络; 刻意**不**复用 `test_support::e2e_pool()`(它连不上就静默
+skip, 而 skip 在 libtest 眼里等于通过)。
+
+**CI 验收 (run 37274616003, head 032cb70): 4/4 job success, Integration
+427 passed / 0 failed**(基线 424 + 新增 3), 三个契约测试逐条 `ok`。
+
+#### 该测试在 CI 上暴露的 4 个缺陷(全部已修, 过程记录)
+
+子代理产出的初版编译都过不去, 且**其中两个的报错完全指错了地方**:
+
+| # | 现象 | 真因 |
+|---|---|---|
+| 1 | `E0308: expected Vec<u8>, found Bytes` | `test::read_body` 返回 `web::Bytes` 而非 `Vec<u8>` |
+| 2 | `the async keyword is missing from the function declaration`, 指向一个**函数体里没有 `.await`** 的同步函数 | 裸 `use actix_web::{test, ...}` 把宏命名空间也导入了, `#[test]` 解析到 `actix_web::test` 属性宏(它要求 `async fn`)。**全仓 15 个 .rs 里只有这一个文件这么做** |
+| 3 | 24 条 operation **全部** 404, 连根级 `/healthz` 也不中 | 规范里 method 是小写, `Method::from_str("get")` 匹配不上标准方法时**不报错**, 而是造一个**小写的自定义 method**; 路由表注册的是 `GET` -> method 不匹配 |
+| 4 | —— | 装配代码写成宏, `App::new()` 的类型参数没被钉住。改成与本仓 `friends.rs::tests::friends_app` 一致的带显式返回类型的 `fn` |
+
+第 3 项另有一个教训值得单列: **真实漂移总是零星几条, 「24/24 全中」只可能是
+探针侧或装配侧的系统性问题**。当时没把「全中」当信号, 先去查了 App 的类型
+参数(第 4 项), 白走一轮。现已加断言: 若全部 operation 都未命中, 报错直接说
+「这不是规范漂移, 而是本测试 App 没提供任何可命中的路由, 先怀疑本文件」。
+
+同理, 第 2 项的定位靠的不是盯报错行, 而是**全仓对照** —— 找出唯一一个偏离
+邻近惯例的写法。
 
 ---
 
