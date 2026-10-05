@@ -2347,6 +2347,120 @@ skip, 而 skip 在 libtest 眼里等于通过)。
 
 ---
 
+### 1.29 WS 投递按会话索引 + /metrics 契约闭环 (2026-10-05)
+
+#### 一、WS 广播: fan-out-then-filter → 按会话索引 (commit `fc3715d`)
+
+用户把本项目定位为「主要用于集成, RUST 特有的性能设计要足够完善」。WS 广播
+是热路径上最贵的一处: 旧实现是 `broadcast` 单通道 + **先发给所有人再在接收侧
+过滤**, 于是每发一条消息的成本是 **O(全部在线连接)**, 而其中 99% 的工作
+(序列化、拷贝、入队) 花在**马上要被丢弃**的帧上。
+
+新实现把过滤提前到发送侧:
+
+| 旧 | 新 |
+|---|---|
+| 单个 `broadcast` 通道 | per-connection `mpsc` 通道, `PER_CONN_CAPACITY = 128` |
+| 无索引 | `Index { sinks, by_conversation: HashMap<ConversationId, HashSet<ConnId>>, all_authed }` |
+| 收件人过滤在接收侧 | 投递索引是**主过滤**, 接收侧 `should_deliver` 保留为纵深防御 |
+| 每帧序列化 N 次 | `to_string` **只做一次**, 结果包进 `Arc<str>` 共享 |
+| `Undeliverable` 仍遍历后丢弃 | **立即返回 0**, 一次索引都不碰 |
+
+成本降到 **O(实际收件人)**。
+
+容量 128 是算出来的, 不是拍的: 1 万连接 × 1024 帧 × 约 40B ≈ **400MB**,
+不可接受; 128 约 50MB, 且 tokio mpsc 按块惰性分配, 小容量不预付满额内存。
+
+**一处诚实声明**: 索引与 `should_deliver` 读的是**同一份鉴权快照**, 所以两者
+并存**救不了**「会话期间被移出群」—— 那个缺口仍需基于事件的成员变更通知
+(见 §2 表内 `ws/hub.rs` 那行)。保留接收侧过滤的价值是纵深防御, 不是修复。
+
+`Lagged` 消失后**丢帧会完全静默**(没有 broadcast 就没有 `RecvError::Lagged`),
+故补 `im_ws_broadcast_dropped_total` 把这份可观测性捡回来; 另加
+`im_ws_authenticated_connections`(区分「连上」与「鉴权通过」)与
+`im_ws_indexed_conversations`(索引规模)。
+
+**性能断言不用计时**: `large_fleet_does_not_fan_out_to_non_members` 建 1000 连接
+/ 500 会话, 只投递给 2 人, 然后断言**其余 998 个通道里确实什么都没有**。
+计时断言必然 flaky, 「通道是空的」是结构事实。
+
+`detach` 收敛到 `ws_handler` 循环返回后的**唯一出口**, 而不是散在各 `return`
+分支 —— 漏一处就是一条永久泄漏的索引项。
+
+**CI 验收 (run 37276522198, head `fc3715d`): 4/4 job success, Integration
+433 passed / 0 failed**, 8 条 hub 新用例与 e2e
+`broadcast_reaches_other_members_but_never_a_non_member` 全 ok。
+
+#### 二、**自捕**: `/metrics` 的 description 是一份无人看管的散文 (commit `8550995`)
+
+上面加的 3 个指标要写进 `openapi.json` 的 `/metrics` description, 才能让集成方
+知道它们存在。写的时候才意识到: **那份 description 是手写的散文, 逐字复制
+`health.rs` 里的 `# HELP` 文本, 而没有任何东西守着它。**
+
+两道既有门禁都看不见它:
+
+- `check-openapi.ps1` 比对**路由表**与**错误码**, 不看散文
+- `openapi_contract.rs` 覆盖的是 (method, path) 是否命中, 也不看散文
+
+即: 以后每加一个指标就必然产生一次漂移(代码里有、规范里没有), 集成方按规范
+接进来就少一个可用指标, 而**没有任何测试会红**。这与「规范里写了路由但代码没
+注册」是同一类缺陷, 只是方向是**散文 → 代码**, 正落在两道门禁的盲区。
+
+补第三道门(测试 4), 三条通路各配对照, 判别力靠「换掉被测物, 结果必须变」:
+
+| 通路 | 阳性对照 | 反例 |
+|---|---|---|
+| 指标名集合**双向**比较 | `EXPECTED_METRIC_COUNT = 7` 基线 | 变异 A 少写 / B 多写 / C 改名 |
+| example 的 `# HELP` **逐字**核对 | 未变异时必须全对 | 变异 D 只改一个字 |
+| 抽取规则 | 2 条真实形态 | 4 条坏输入 |
+
+三个设计点值得单列:
+
+1. **双向而非单向**。只做「文档 ⊆ 实际」会漏掉「代码加了指标、规范没写」——
+   而那恰好是集成方真正会踩的方向(规范是他们唯一的依据, 没写就等于不存在)。
+2. **空集合恒等是这个设计最容易出的假绿灯**: 两边都空就「相等」。故计数基线
+   断言刻意排在集合比较**之前**, 且变异用例先自证「未变异时是干净的」——
+   否则「变异被抓」可能只是因为它本来就常红。
+3. **变异守卫做成常驻测试, 不用完即扔**。「门禁在注入缺陷时会红」若只在本机
+   跑一次就丢, 下次改动它照样能悄悄退化。变异全部作用在**从 `SPEC_JSON` 读出的
+   真实字符串**上, 不另造样本 —— 造样本只能证明「比较函数对假数据成立」。
+
+抽取规则的第 3 条(字符集限制)不是冗余: 真实 description 里同时存在
+`` `IM_EVENT_PUBLISHER_KIND` ``(大写环境变量名)与
+`` `GET /v1/conversations/{id}/messages` ``(含斜杠与花括号)。两条**不是**假想敌,
+此刻就写在同一段散文里。
+
+**刻意不做**: 不把 description 里的中文散文也做成逐字校验 —— 那是给人读的,
+强行机器化会导致改个措辞就红, 开发者随即绕过测试, 那比漏检更糟。逐字校验只
+施加在 example 的 `# HELP` 行上(那本就是代码的抄本)。同理, 排版变化(去掉
+`(gauge)` / `(counter)` 标注)明确**不得**被判成漂移, 已写成反例。
+
+#### 验证
+
+- 静态门禁 `check-openapi.ps1` exit 0(code routes 24 / spec operations 24 /
+  spec paths 21 / aux-03 codes 21 / operationIds 24)
+- `cargo fmt --all -- --check` exit 0; 无 U+FFFD; 行尾未被改写
+- **CI 验收 (run 37279300456, head `8550995`): 4/4 job success, Integration
+  436 passed / 0 failed / 0 ignored**(基线 433 + 新增 3), 6 条契约测试逐条 `ok`:
+  `every_documented_operation_routes` / `undocumented_path_is_not_routed` /
+  `route_table_baseline` / `metrics_description_matches_the_live_exposition` /
+  `metric_extraction_rejects_non_metrics_and_uppercase` /
+  `metrics_gate_rejects_mutated_specs`
+- 本机 cargo **未作为验证源**: 共享 target 被其他项目长期占住 package/build 锁,
+  连续三轮单次编译 >4min 仍未出结果, 故以 CI 为权威
+
+#### 仍未做(诚实声明)
+
+- **AsyncAPI 仍缺**: WS 帧协议无机器可读描述 —— `im_protocol::ws_frames` 实际有
+  **8 类 `ClientFrame`**(aux-13 §1.1 称 8 类, 对齐)与 **10 类 `ServerFrame`**
+  (§1.2 称 11 类, 缺的是已读回执帧, 见 §1.12)。OpenAPI 3.1 无原生 WebSocket
+  支持, `/v1/ws` 只登记了 101 握手与首帧 `auth`。这是「主要用于集成」下**剩余的
+  最大接入障碍** —— WS 客户端目前只能读 `im_protocol` 的 Rust 源码反推帧形状。
+- §1.18 的 `/readyz` 仍**不检查 NATS**(publisher 不在 `AppState` 里),
+  也不检查 Valkey(D-4 不存在)。
+
+---
+
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
