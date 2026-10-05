@@ -1060,3 +1060,108 @@ fn readyz_nats_enum_is_not_empty_on_either_side() {
          两侧都空会让「集合相等」变成一句空话。"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 测试 6: `GET /v1/ws` 声明的 4 个错误码, 握手阶段一个都不会出现
+// ---------------------------------------------------------------------------
+
+/// `/v1/ws` 的非 101 响应必须**恰好**是 `{400}`
+///
+/// ## 依据是代码, 不是直觉
+///
+/// `ws_handler` 的第一件事就是 `actix_ws::handle()`; 它失败时返 400
+/// (`ws/handler.rs:170-176`), 成功时返 101。期间它**不查任何东西**:
+///
+/// - `/v1` scope 没有统一鉴权层(鉴权是逐路由加的), 也没有资源查找 → 无 404
+/// - 鉴权在**第一帧** `auth` 帧完成, 失败以 WS 帧回报 → 无 401/403
+/// - 仓内没有任何限流实现 → 无 429
+///
+/// 而原规范在 `x-error-codes` 里列了那 4 个码, 却**一个响应形状都没给**,
+/// 同时**没写**唯一真会发生的 400。集成方照着规范写的 401/429 处理是死代码,
+/// 真实会拿到的 400 反而无据可查。
+///
+/// 这个断言把「400 是唯一的非 101 状态」钉住。若将来把鉴权移到握手阶段,
+/// 集合会变大 —— 那时**改规范**, 不要改这条断言。
+#[test]
+fn ws_handshake_declares_exactly_the_one_status_it_can_return() {
+    let spec = spec_value();
+    let responses = spec
+        .pointer("/paths/~1v1~1ws/get/responses")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("规范里 /v1/ws 缺少 responses"));
+    let mut non_101: Vec<&String> = responses.keys().filter(|k| k.as_str() != "101").collect();
+    non_101.sort();
+
+    assert_eq!(
+        non_101,
+        vec!["400"],
+        "/v1/ws 的非 101 响应集合变成了 {non_101:?}。若代码改动让握手能返别的状态码 \
+         (例如把鉴权移到握手阶段), 请**同步更新规范** —— 而不是让规范继续缺这一个形状"
+    );
+}
+
+/// 那 4 个声明的错误码必须**明确写成带内帧错误**
+///
+/// 它们是真的, 只是不作为 HTTP 状态码出现。规范里若不写明这一点, 读的人
+/// 只能默认「列在 `x-error-codes` 里 = 会有对应的 HTTP 响应」—— 而事实相反。
+///
+/// 断言 description 真的把这件**具体**的事说了出来, 而不是笼统地提一句。
+#[test]
+fn ws_declared_error_codes_are_marked_as_in_band() {
+    let spec = spec_value();
+    let desc = spec
+        .pointer("/paths/~1v1~1ws/get/description")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("规范里 /v1/ws 缺少 description"));
+
+    for needle in ["带内", "第一帧", "400"] {
+        assert!(
+            desc.contains(needle),
+            "/v1/ws 的 description 没提到「{needle}」。\
+             缺了它, 读规范的人无法知道那 4 个错误码出现在 WS 帧里而不是 HTTP 状态码里"
+        );
+    }
+    // 反例守卫: 不能只写「400」而把 4 个码的去向留白。
+    assert!(
+        desc.contains("不会作为 HTTP 状态码返回"),
+        "description 必须**明确否定**「这些码是 HTTP 状态码」这个读法, \
+         而不只是列出它们"
+    );
+}
+
+/// 反过来: 400 不是虚构的 —— 真打一次不带 upgrade 头的 GET
+///
+/// 上面两条都是**读规范**。若代码某天改成对非 upgrade 请求也返 101 或 404,
+/// 规范会立刻变成假话。这条把它钉在**运行时**上。
+///
+/// 不需要 PG: `app_parts()` 用的是 `connect_lazy` 死池, 而握手在任何查询之前
+/// 就已经失败。
+#[actix_web::test]
+async fn plain_get_on_the_ws_endpoint_really_returns_400() {
+    let app = actix_web::test::init_service(openapi_app()).await;
+    let resp = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::get()
+            .uri("/v1/ws")
+            .to_request(),
+    )
+    .await;
+    let status = resp.status();
+
+    // 对照组: 必须**先**证明路由存在(404 说明打错路径, 那是另一回事)。
+    assert_ne!(
+        status,
+        actix_web::http::StatusCode::NOT_FOUND,
+        "打到了 404 —— 说明 /v1/ws 路由没注册, 那是一条完全不同的缺陷"
+    );
+    assert_ne!(
+        status,
+        actix_web::http::StatusCode::SWITCHING_PROTOCOLS,
+        "不带 upgrade 头的普通 GET 不可能升级成 WS; 返 101 说明 actix_ws 的校验被绕过"
+    );
+    assert_eq!(
+        status,
+        actix_web::http::StatusCode::BAD_REQUEST,
+        "普通 GET 打 WS 端点必须 400 —— 规范把这个形状写进了 /v1/ws 的 400 响应"
+    );
+}
