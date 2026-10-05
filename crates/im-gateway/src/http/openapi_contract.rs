@@ -44,7 +44,6 @@
 
 #![cfg(test)]
 
-use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -370,16 +369,32 @@ impl Probe {
 /// **没关系**: 本测试要证明的是「路由命中了」, 不是「业务成功」。业务语义由各
 /// handler 自己的 e2e 负责。
 ///
-/// 写成宏而非 `async fn`: 那个签名得写出 actix 的请求类型
-/// (`impl Service<actix_http::Request, ..>`), 而本 crate **没有**直接依赖
-/// `actix_http`, 写出来编译不过。宏在调用点就地展开, 类型自然推导得出。
+/// ## 必须先把 method 转成大写 —— 否则 24 条 operation 会「全部未命中」
+///
+/// 规范里 method 写作小写 (`get` / `post`), 而 `http::Method::from_str` 对
+/// 标准方法是**大小写敏感**的。匹配不上时它**不报错**, 而是按
+/// `Method::from_bytes` 造出一个**小写的自定义 method**。于是:
+///
+/// - 请求带的是自定义 method `get`
+/// - 路由表里注册的是标准 method `GET`
+/// - actix 判为 method 不匹配 -> `404 + 空 body`
+///
+/// 结果是 **24 条 operation 一条不中, 连 `/healthz` 这种直接注册在 App 根上的
+/// 路由也不中**。而这个现象与「规范漏写了路由」长得一模一样, 极易误判成漂移。
+///
+/// 顺带说明: `undocumented_path_is_not_routed` 用的是字面量 `Method::GET` /
+/// `Method::POST`(本身就是大写常量), 所以它**不受**此影响, 在 App 为空时也照样
+/// 通过 —— 它守的是判别式的退化, 守不了 method 拼写。
 macro_rules! probe {
     ($app:expr, $method:expr, $uri:expr) => {{
-        let method = Method::from_str($method).unwrap_or_else(|e| {
+        // 规范里是小写; 必须在 from_bytes **之前**转大写。
+        let upper = $method.to_ascii_uppercase();
+        let method = Method::from_bytes(upper.as_bytes()).unwrap_or_else(|e| {
             panic!("规范里的 method {:?} 不是合法 HTTP method: {e}", $method)
         });
-        // 必须在 `.method(method)` 之前取好: 那是按值传参, 之后 `method` 已被移走。
-        let method_name = method.as_str().to_ascii_lowercase();
+        // 展示用: 规范里的原始小写形态。必须在 `.method(method)` 之前取好 ——
+        // 那是按值传参, 之后 `method` 已被移走。
+        let method_name = $method.to_string();
         let req = actix_web::test::TestRequest::default()
             .method(method)
             .uri($uri)
@@ -420,6 +435,25 @@ async fn every_documented_operation_routes() {
     }
 
     let unrouted: Vec<&Probe> = probes.iter().filter(|p| p.unrouted()).collect();
+
+    // 阳性对照: 若**全部** operation 都未命中, 那几乎不可能是「规范漏写了路由」——
+    // 真实漂移总是零星几条。更可能的是这个 App 本身没把任何路由装上(method 拼写
+    // 错了、装配没生效等)。这两种失败在探测结果上**长得一模一样**, 2026-10-05
+    // 就因为没区分它们, 把一个测试自身的缺陷误读成了「规范与代码全面漂移」,
+    // 白白排查了 App 的类型参数。分开报, 下一个人不必重走这条路。
+    assert!(
+        unrouted.len() != probes.len(),
+        "全部 {n} 条 operation 都未命中 —— 这**不是**规范漂移, 而是这个测试 App \
+         没能提供任何可命中的路由(请求的 method/path 没匹配上, 或装配未生效)。\
+         先怀疑本文件, 再怀疑规范。\n全部探测结果:\n{all}",
+        n = probes.len(),
+        all = probes
+            .iter()
+            .map(|p| p.describe())
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+
     assert!(
         unrouted.is_empty(),
         "OpenAPI 与 actix 路由表漂移: 规范里 {total} 条 operation, 其中 {bad} 条在代码里**不存在**\n\
