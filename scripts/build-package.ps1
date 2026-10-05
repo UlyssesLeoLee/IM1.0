@@ -123,6 +123,43 @@ function Get-PackageTarget {
     }
 }
 
+# ---- 探测当前 OS（唯一读运行环境的地方, 与上面的纯函数分开）----
+# ## 为什么不用 RuntimeInformation.OSPlatform 这个静态属性
+#
+# 它**不是稳定的 API 面**: 在本机 pwsh 7.6.6 上反射列出的静态成员只有
+# FrameworkDescription / OSArchitecture / OSDescription / ProcessArchitecture /
+# RuntimeIdentifier —— `OSPlatform` 那个属性**已经不存在**, 直接写
+# `[RuntimeInformation]::OSPlatform` 会当场抛「在此对象上找不到属性 OSPlatform」。
+# (这不是我推测的: 上一版接线就是这么写的, 打包在第一步就炸了, 纯函数的 26 条
+# 断言一条都没能抓到它 —— 因为它们从不接触真实运行环境。)
+#
+# 同一版本里 `OSPlatform` 也从 struct + 静态**方法**(OSPlatform::Windows()) 变成
+# readonly record struct + 静态**属性**(OSPlatform::Windows), 且 macOS 的名字从
+# OSX 变成 MacOS —— 也就是说 `OSPlatform::MacOS()` 在本机也是「找不到方法」。
+#
+# 故此处只依赖两个**在 .NET Core 3.0 到当前版本里都存在**的成员:
+#   OSPlatform::Create(string)                     静态方法, 两边都在
+#   RuntimeInformation::IsOSPlatform(OSPlatform)   静态方法, 从 3.0 起未变
+# CI 的 ubuntu-latest 与本机 pwsh 版本本来就不一样, 只在一种上验证过的写法就是埋雷。
+function Get-CurrentOSPlatform {
+    $ri = [System.Runtime.InteropServices.RuntimeInformation]
+    # macOS 试两个拼写: 运行时自报的名字在不同 .NET 版本里是 OSX 或 MacOS,
+    # 都映射到 Get-PackageTarget 契约里的 'macOS'。**本机未验证**(本机是 Windows)。
+    foreach ($candidate in @(
+        @{ Create = 'Windows'; Contract = 'Windows' }
+        @{ Create = 'Linux';   Contract = 'Linux' }
+        @{ Create = 'OSX';     Contract = 'macOS' }
+        @{ Create = 'MacOS';   Contract = 'macOS' }
+    )) {
+        $probe = [System.Runtime.InteropServices.OSPlatform]::Create($candidate.Create)
+        if ($ri::IsOSPlatform($probe)) { return $candidate.Contract }
+    }
+    # 到这里说明跑在一个 Get-PackageTarget 没覆盖的 OS 上(如 FreeBSD)。
+    # 明确报错, 绝不猜一个包名 —— 猜出来的包会以「平台没做」的形式误导接入方。
+    throw ("无法判定当前操作系统: $($ri::OSDescription)。" +
+           "已实现 Windows / Linux / macOS; 其它平台请显式扩展 Get-PackageTarget。")
+}
+
 # ---- 被 dot-source 时只取函数, 不执行下面的打包流程 ----
 # 单测要 import 上面的函数, 而本脚本余下部分是**有副作用的**(Set-Location /
 # cargo build / 删目录 / 写 zip)。不设这道闸, 测一个纯函数就会顺手把
@@ -134,12 +171,8 @@ if ($MyInvocation.InvocationName -eq '.') { return }
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
-# ---- 当前平台 ----
-# 用 RuntimeInformation 而不是 $IsWindows: 后者是 PowerShell 7.0+ 才有的
-# 自动变量, 在 5.1 下是 $null, 而「在 5.1 下静默当成非 Windows」正是本脚本
-# 此前最坏的形态。RuntimeInformation 来自 .NET, 与宿主 shell 版本无关。
 $target = Get-PackageTarget `
-    -OSPlatform  ([System.Runtime.InteropServices.RuntimeInformation]::OSPlatform) `
+    -OSPlatform  (Get-CurrentOSPlatform) `
     -Architecture ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)
 $exeExt = $target.Extension
 
@@ -194,9 +227,12 @@ if (Test-Path -LiteralPath $pkgRoot) {
     Write-Host "  已存在 $pkgName，正在删除并重建" -ForegroundColor Yellow
     Remove-Item -LiteralPath $pkgRoot -Recurse -Force -ErrorAction Stop
 }
-# 非 Windows 包不装 .ps1 助手(见下方「平台说明」一节的取舍), 但目录树保持
-# 四个子目录, 免得两套布局让下游脚本/文档各写一份。
-foreach ($d in @('bin', 'config', 'scripts', 'docs')) {
+# scripts/ 只在真的装了 .ps1 助手时才建: 非 Windows 包里留一个空目录, 装不进
+# 任何东西, 也不会出现在 SHA256SUMS.txt 里(它只覆盖文件), 纯属让 operator
+# 以为「助手漏了」。
+$pkgDirs = @('bin', 'config', 'docs')
+if ($target.IsWindows) { $pkgDirs += 'scripts' }
+foreach ($d in $pkgDirs) {
     New-Item -ItemType Directory -Path (Join-Path $pkgRoot $d) -Force | Out-Null
 }
 
@@ -290,8 +326,8 @@ if (-not $target.IsWindows) {
     $pf += '**.env 读失败是静默的**(dotenvy 的返回值被丢弃), 变量不全时你只会看到'
     $pf += '`config load failed: internal error` —— 这句话不包含任何真实原因。'
     $pf += '根因与取舍见 INSTALL.md 第 5 节: 修复它会把密钥打到 stderr, 故本仓选择'
-    $pf += '把问题拦在进进程之前。包内的 Windows 版 preflight.ps1 做了这件事,'
-    $pf += '但它读的是 bin\im-gateway.exe, 在本包不存在 —— 所以**配置必须手工核对**。'
+    $pf += '把问题拦在进进程之前。Windows 包里由 preflight.ps1 做这件事, 但它读的是'
+    $pf += 'bin\im-gateway.exe, 在本包不存在 —— 故本包**不带**该脚本, **配置必须手工核对**。'
     $pf += ''
     $pf += '## 5. 运维 CLI'
     $pf += ''

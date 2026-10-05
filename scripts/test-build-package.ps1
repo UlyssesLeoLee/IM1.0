@@ -149,6 +149,31 @@ catch { $threwArch = $true; $archMsg = $_.Exception.Message }
 Assert-True '未知架构抛异常 (RiscV64)' $threwArch '  静默回落了'
 Assert-True '未知架构的异常消息点出该架构' ($archMsg -like '*RiscV64*') "  消息: $archMsg"
 
+# ---- 4. 真实平台探测 → 契约名 ----
+# 这一组是为一个**真实踩到的 bug** 写的: 接线时用了
+# `[RuntimeInformation]::OSPlatform`, 而在 pwsh 7.6.6(.NET 10) 上那个静态属性
+# 已经不存在, 脚本在第一步就抛「找不到属性 OSPlatform」。
+#
+# 纯函数那 26 条断言**抓不到**这个 bug —— 它们从不接触真实运行环境。所以这里断言
+# 「探测出来的名字必须能被 Get-PackageTarget 接受」: 探测与映射之间一旦对不上
+# (大小写、改名、新 .NET 换了 API 面), 打包就在第一行炸掉, 而那种失败与
+# 「平台没做」看起来完全一样。
+Write-Host ''
+Write-Host '--- 4. 当前平台探测与映射契约一致 ---'
+
+$detected = $null
+$detectThrew = $false
+try { $detected = Get-CurrentOSPlatform } catch { $detectThrew = $true }
+Assert-True 'Get-CurrentOSPlatform 不抛异常' (-not $detectThrew)
+if (-not $detectThrew) {
+    Write-Host ("       (本机探测结果: {0})" -f $detected)
+    Assert-True '探测结果属于契约名 {Windows,Linux,macOS}' ($detected -in @('Windows', 'Linux', 'macOS')) `
+        "  实际: [$detected]"
+    $probeOk = $true
+    try { $null = Get-PackageTarget -OSPlatform $detected -Architecture 'X64' } catch { $probeOk = $false }
+    Assert-True '探测结果能被 Get-PackageTarget 接受' $probeOk
+}
+
 # ---- 汇总 ---------------------------------------------------------------------
 Write-Host ''
 Write-Host ("通过 {0} 条, 失败 {1} 条" -f $script:pass, $script:fail.Count)
