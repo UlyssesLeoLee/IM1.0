@@ -175,26 +175,58 @@ jobs:
         # `docker run` 而非 `services.nats`, 因为 service 块传不了 args,
         # 而 JetStream 与 8222 monitoring 都要靠 args 打开。
         #
-        # 就绪判据用 **8222 monitoring**, 不是「容器起来了」—— 容器起来
-        # 只说明进程在跑, 不说明 JetStream 已就绪。超时后打印 `docker logs`
-        # 再失败, 免得只留一句「连不上」。
+        # ## 为什么把 pull 和 run 拆成两步 (run 37260950792 教训)
+        #
+        # 第一次写成 `docker run -d ...` 然后 30s 内轮询 8222。CI 上失败,
+        # 根因是日志里那句 `Unable to find image 'nats:2.10-alpine' locally`
+        # —— runner 首次拉镜像, **拉取耗时吃掉了整个就绪窗口**, 于是就绪判据
+        # 根本没机会被认真检查。本机之所以 1s 就绪, 只是因为镜像早就在本地缓存。
+        #
+        # 拆开后: ① 拉取失败可归因(而不是伪装成就绪超时); ② 就绪窗口只用来
+        # 等 NATS 自己起来, 不含拉取; ③ 循环里检查容器**是否还活着** ——
+        # 容器若已退出, 立刻打印 logs 并失败, 而不是干等 30s 才报一个
+        # 掩盖真因的「did not become ready」。
         run: |
           set -euo pipefail
           docker rm -f im10-nats-ci >/dev/null 2>&1 || true
+          echo "::group::pull nats:2.10-alpine"
+          # 有界重试: Docker Hub 的 manifest 拉取会偶发 EOF(本机实测到过
+          # `failed to copy: httpReadSeeker ... EOF`)。这是**注册表网络抖动**,
+          # 不是代码问题, 故重试而不是把 job 判红 —— 但仍是有限次, 且最后一次
+          # 失败会把 docker 的原始错误原样抛出(`|| true` 不吞)。
+          for attempt in 1 2 3; do
+            if docker pull nats:2.10-alpine; then
+              break
+            fi
+            if [ "$attempt" = "3" ]; then
+              echo "::error::docker pull nats:2.10-alpine failed after 3 attempts"
+              exit 1
+            fi
+            echo "pull attempt ${attempt} failed; retrying in 10s"
+            sleep 10
+          done
+          echo "::endgroup::"
           docker run -d --name im10-nats-ci \
             -p 4222:4222 -p 8222:8222 \
             nats:2.10-alpine \
             --jetstream --store_dir=/data -m 8222
-          for i in $(seq 1 30); do
+          for i in $(seq 1 45); do
+            # 容器已退出 => 立刻拿到真因, 不要用「超时」掩盖它
+            if [ "$(docker inspect -f '{{.State.Running}}' im10-nats-ci 2>/dev/null || echo false)" != "true" ]; then
+              echo "::error::NATS container exited during startup"
+              docker logs im10-nats-ci || true
+              exit 1
+            fi
+            # 就绪判据: 8222 monitoring 可达(它证明进程在监听, 而不只是容器在跑)
             if wget -q -O - http://localhost:8222/ >/dev/null 2>&1; then
               echo "NATS JetStream ready after ${i}s"
-              docker exec im10-nats-ci wget -q -O - http://localhost:8222/jsz?streams=1 | head -20
+              docker exec im10-nats-ci wget -q -O - 'http://localhost:8222/jsz?streams=1' | head -12
               exit 0
             fi
             sleep 1
           done
-          echo "::error::NATS did not become ready within 30s"
-          docker logs im10-nats-ci
+          echo "::error::NATS did not become ready within 45s (container still running)"
+          docker logs im10-nats-ci || true
           exit 1
       - name: run migrations
         # 2026-10-03 改用仓内自己的 im-migrate 二进制(此前是 sqlx CLI)。

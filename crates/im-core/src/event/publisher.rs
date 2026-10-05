@@ -262,7 +262,12 @@ impl EventPublisher for NatsEventPublisher {
         match sent.await {
             Ok(_ack) => {
                 let n = EVENTS_PUBLISHED.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::debug!(topic, bytes = payload.len(), published_total = n, "event published");
+                tracing::debug!(
+                    topic,
+                    bytes = payload.len(),
+                    published_total = n,
+                    "event published"
+                );
                 Ok(())
             }
             Err(e) => {

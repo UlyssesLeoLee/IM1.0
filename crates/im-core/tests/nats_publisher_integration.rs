@@ -144,7 +144,9 @@ async fn connect_is_idempotent_across_restarts() {
     // 第二次连接: stream 已存在, create_or_update_stream 必须走 update 分支
     match NatsEventPublisher::connect(&url).await {
         Ok(_) => {}
-        Err(e) => panic!("stream 已存在时第二次 connect 必须成功(create_or_update_stream 幂等): {e}"),
+        Err(e) => {
+            panic!("stream 已存在时第二次 connect 必须成功(create_or_update_stream 幂等): {e}")
+        }
     }
 }
 
