@@ -1703,6 +1703,7 @@ dependencies = [
  "argon2",
  "async-nats",
  "async-trait",
+ "bytes",
  "chrono",
  "figment",
  "hex",
