@@ -49,7 +49,25 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use actix_web::http::{Method, StatusCode};
-use actix_web::{test, web, App};
+// **刻意不写** `use actix_web::test`。
+//
+// `actix_web::test` 既是模块也是**属性宏**(`#[actix_web::test]`), 而 `use`
+// 会把被导入项所占的**所有**命名空间一并带进来 —— 包括宏命名空间。于是本文件里
+// 的 `#[test]` 不再解析到 Rust 内置属性, 而是解析到 `actix_web::test`, 而后者
+// **要求函数体是 `async fn`**。于是出现一条极难定位的报错:
+//
+//     error: the async keyword is missing from the function declaration
+//      --> openapi_contract.rs:459:1
+//       |
+//     459 | fn route_table_baseline() {
+//       | ^^
+//
+// 它指向一个**函数体里根本没有 `.await`** 的同步函数, 且把函数体换成
+// `let _ = 1 + 1;` 之后照报不误 —— 与函数体无关, 纯粹是属性解析到了错误的宏。
+//
+// 本仓其余 14 个 .rs 全部用全限定的 `actix_web::test::...` 且从不裸导入 `test`,
+// 所以只有这个文件中招。此处同样改用全限定形式, 与其余文件保持一致。
+use actix_web::{web, App};
 use serde_json::Value;
 
 use super::state::AppState;
@@ -344,16 +362,16 @@ macro_rules! probe {
         });
         // 必须在 `.method(method)` 之前取好: 那是按值传参, 之后 `method` 已被移走。
         let method_name = method.as_str().to_ascii_lowercase();
-        let req = test::TestRequest::default()
+        let req = actix_web::test::TestRequest::default()
             .method(method)
             .uri($uri)
             // 统一发 application/json 的 {}: 让所有 handler 都走到「已命中」的
             // 业务分支, 而不是死在 extract 阶段。
             .set_json(serde_json::json!({}))
             .to_request();
-        let resp = test::call_service(&$app, req).await;
+        let resp = actix_web::test::call_service(&$app, req).await;
         let status = resp.status();
-        let body = test::read_body(resp).await;
+        let body = actix_web::test::read_body(resp).await;
         Probe {
             method: method_name,
             uri: $uri.to_string(),
@@ -375,7 +393,7 @@ async fn every_documented_operation_routes() {
         "规范里一条 operation 都没有 —— openapi.json 的 paths 是不是被清空了?"
     );
 
-    let app = test::init_service(openapi_router!()).await;
+    let app = actix_web::test::init_service(openapi_router!()).await;
 
     // 逐条探测; 收集全部结果而不是遇错即停 —— 一次跑完才知道漂移是 1 条还是 12 条。
     let mut probes = Vec::with_capacity(ops.len());
@@ -423,7 +441,7 @@ async fn undocumented_path_is_not_routed() {
         "对照组失效: 规范里出现了探针路径 {CONTROL_PATH}。换个探针路径。"
     );
 
-    let app = test::init_service(openapi_router!()).await;
+    let app = actix_web::test::init_service(openapi_router!()).await;
 
     for method in [Method::GET, Method::POST] {
         let p = probe!(&app, method.as_str(), CONTROL_PATH);
@@ -480,5 +498,44 @@ fn route_table_baseline() {
         op_count, EXPECTED_OPERATION_COUNT,
         "规范里 operation 总数从 {EXPECTED_OPERATION_COUNT} 变成了 {op_count}。\
          数量不变但内容变了是**更危险**的漂移(总数对得上) —— 那由 every_documented_operation_routes 兜。"
+    );
+
+    // 把 24 的算式**钉在代码里**: 21 条 path 里究竟哪几条是双 method。
+    // 只断言总数的话, 「多一条单 method + 少一条双 method」这种对冲能蒙混过关。
+    let mut dual: Vec<&str> = Vec::new();
+    for (path, item) in paths {
+        let n = item
+            .as_object()
+            .map(|o| o.keys().filter(|k| is_operation_key(k)).count())
+            .unwrap_or(0);
+        if n > 1 {
+            dual.push(path.as_str());
+        }
+    }
+    dual.sort_unstable();
+    let expected_dual: Vec<&str> = EXPECTED_DUAL_METHOD_PATHS.to_vec();
+    let expected_dual_sorted = {
+        let mut v = expected_dual;
+        v.sort_unstable();
+        v
+    };
+    assert_eq!(
+        dual, expected_dual_sorted,
+        "双 method 的 path 集合变了(3 条 x 2 + 其余 18 条 x 1 = 24)。当前: {dual:?}"
+    );
+
+    // 顺带把「根级 3 条 + 其余都在 /v1 下」这个装配事实钉住(main.rs:243-252):
+    // 规范若把 /healthz 挪进 /v1, 说明它与实际装配结构已经各说各话。
+    let mut root: Vec<&str> = paths
+        .keys()
+        .filter(|p| !p.starts_with("/v1/"))
+        .map(String::as_str)
+        .collect();
+    root.sort_unstable();
+    let mut expected_root: Vec<&str> = EXPECTED_ROOT_PATHS.to_vec();
+    expected_root.sort_unstable();
+    assert_eq!(
+        root, expected_root,
+        "规范里 /v1 之外的 path 应恰好是 main.rs 挂在 App 根的那三条"
     );
 }
