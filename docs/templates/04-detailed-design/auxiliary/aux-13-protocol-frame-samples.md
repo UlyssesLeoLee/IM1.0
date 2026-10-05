@@ -179,6 +179,11 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 ```
 
 > `session_id` = `device_sessions.id`,客户端可用于日志关联。
+>
+> **im-gateway 生产代码从不发送本帧** —— 鉴权成功后服务端实际回的是
+> `{"type":"auth_ok","req_id":...}`(见 §1.3 的 `auth_ok` 说明)。本变体只有
+> `im-testkit` 的 mock server 在用。接入方不应把等待 `connected` 帧写成
+> 「鉴权成功」的唯一判据。
 
 #### 1.2.2 `ack`(请求成功,带 req_id)
 
@@ -268,6 +273,21 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 }
 ```
 
+> **`reactions` 当前恒为 `[]`** —— `hub.rs:423` 硬编码
+> `reactions: Vec::new()`,reaction 数据**不会**随新消息下行。接入方不应依赖
+> 该字段携带内容,也不应因收到空数组而认为「该消息无人 react」。
+> reaction 的实时下行是另一条路(§1.2.8 `reaction_added`),而该帧生产代码
+> **从不发送**(见其小节说明)。
+>
+> `WireMessage` 的 10 个字段在 wire 上**全部恒出现**(`ws_frames.rs:158-173`),
+> 其中 `sender_id` / `reply_to` / `edited_at` 可为 `null`。注意
+> `sender_id` 与 `reply_to` 虽带 `#[serde(default)]`,但**不带**
+> `skip_serializing_if`,故 `default` 只放宽反序列化,**不影响**序列化 ——
+> 接入方不可按「键可能消失」实现。
+>
+> `state` 取值域 `sent` / `delivered` / `read` / `recalled` / `deleted`
+> (字段本身是裸 `String`,但服务端只从 `MessageState::as_str()` 取值)。
+
 #### 1.2.6 `message_edited`
 
 ```json
@@ -278,6 +298,16 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
   "edited_at": "2026-08-23T00:01:00Z"
 }
 ```
+
+> **生产代码从不发送本帧。** 形状只有 3 个字段,**没有 `conversation_id`**
+> (`ws_frames.rs:106-110` 即如此定义),广播中枢因此无从判断接收方是否该
+> 会话成员,`hub.rs:361-363` 把本帧归为 `Audience::Undeliverable` 并直接短路。
+> 后果: **编辑消息没有实时同步**,客户端只能靠
+> `GET /v1/conversations/{id}/messages`(§3.4)拉取。
+>
+> **补 `conversation_id` 属 wire 形状变更(协议变更),不由实现方拍板**,
+> 待规范所有者裁决。在此之前本节**如实保留当前形状**并标注「不发送」,
+> 不擅自加字段。接入方可照此形状实现解析分支,但不必等待该帧到来。
 
 #### 1.2.7 `message_recalled`
 
@@ -299,6 +329,13 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
   "emoji": "👍"
 }
 ```
+
+> **生产代码从不发送本帧**,原因同 §1.2.6:形状**没有 `conversation_id`**
+> (`ws_frames.rs:117-121`),`hub.rs:364-366` 归为 `Undeliverable`。发给别人
+> 即跨会话泄漏,故宁可不发。
+>
+> 客户端 `react` 帧仍会**落库并回 `ack`**(§1.1.5),只是**没有**实时下行
+> 通知。是否补 `conversation_id` 属协议变更,待规范所有者裁决。
 
 #### 1.2.9 `presence_update`
 
