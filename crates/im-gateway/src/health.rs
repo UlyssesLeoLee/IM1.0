@@ -270,9 +270,28 @@ mod tests {
             text.contains("im_events_dropped_total"),
             "/metrics 必须暴露丢弃计数, 否则 D-3 缺口继续隐身: {text}"
         );
+        // 只断言「> before」而不是「== before+1」。
+        //
+        // 这个计数器是**进程级全局**(`publisher.rs` 里的 static AtomicU64), 而
+        // libtest 在同一进程内并行跑用例 —— 本二进制里那 26 个 e2e 都经
+        // `test_support::e2e_pool` 持有 `StubEventPublisher`, 发消息时也会
+        // 递增它。所以精确相等是一个**必然 flaky** 的断言(本机全绿、CI 上偶发
+        // 红的典型形态)。`value > before` 仍然锁住了要锁的性质: 计数真的动过,
+        // 且不是一个占位常量。
+        let line = text
+            .lines()
+            .find(|l| l.starts_with("im_events_dropped_total "))
+            .unwrap_or_else(|| panic!("/metrics 里没有 im_events_dropped_total 的数据行: {text}"));
+        let value: u64 = line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or_else(|| panic!("无法解析指标值: {line}"))
+            .parse()
+            .unwrap_or_else(|e| panic!("指标值不是整数({line}): {e}"));
         assert!(
-            text.contains(&format!("im_events_dropped_total {}", before + 1)),
-            "指标值必须是真实计数({}), 而非占位: {text}",
+            value > before,
+            "指标值必须至少增长到 {}(实测 {value}) —— 说明计数真的被接到了 /metrics, \
+             而非占位: {text}",
             before + 1
         );
         // D-3 实装后另外两个指标必须**各自独立**存在。合并成一个会让

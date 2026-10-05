@@ -382,10 +382,29 @@ mod tests {
         assert_eq!(e.code(), im_common::ErrorCode::InternalError);
     }
 
+    // ---- 计数相关用例: 必须串行 ----
+    //
+    // 三个计数是**进程级全局** `static AtomicU64`(生产上 `/metrics` 就要这个
+    // 进程级视图), 而 libtest 在**同一进程内并行跑测试**。若两个用例都断言
+    // 「delta == N」而不加锁, 彼此的 publish 会插进对方的 before/assert 之间,
+    // 把 `before + 2` 变成 `before + 3`。
+    //
+    // 实测踩过: run 37261532690 在 GitHub runner 上
+    // `stub_counts_every_dropped_event` 失败于 publisher.rs:388, 而本机
+    // 424 passed 全绿 —— 纯时序差异。故凡断言全局计数 delta 的用例都必须
+    // 先拿这把锁。
+    //
+    // 用 `tokio::sync::Mutex` 而非 `std::sync::Mutex`: 锁要**跨 `.await`**
+    // 持有(`publish` 是 async), 而 `clippy::await_holding_lock` 会把
+    // 「std Mutex 的 guard 跨 await」判为 correctness 问题 —— 在多线程
+    // runtime 上那确实可能死锁, 且 `-D warnings` 下直接编译失败。
+    static COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     // ---- stub: 计数必须真的累加(防"改回静默 no-op") ----
 
     #[tokio::test]
     async fn stub_counts_every_dropped_event() {
+        let _guard = COUNTER_LOCK.lock().await;
         let before = dropped_event_count();
         let p = StubEventPublisher::new();
         p.publish("im.message.created", b"{\"a\":1}").await.unwrap();
@@ -399,6 +418,7 @@ mod tests {
 
     #[tokio::test]
     async fn stub_does_not_touch_the_real_publisher_counters() {
+        let _guard = COUNTER_LOCK.lock().await;
         // 三种语义必须分开, 否则「配了 stub」与「NATS 挂了」在指标上无法区分
         let pub_before = published_event_count();
         let fail_before = failed_event_count();
