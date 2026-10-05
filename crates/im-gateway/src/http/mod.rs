@@ -17,9 +17,9 @@ pub mod me;
 pub mod members;
 pub mod message_actions;
 pub mod messages;
-pub mod state;
 #[cfg(test)]
 pub mod openapi_contract;
+pub mod state;
 #[cfg(test)]
 pub mod test_support;
 

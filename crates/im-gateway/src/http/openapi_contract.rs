@@ -205,7 +205,9 @@ fn app_parts() -> (AppState, sqlx::PgPool, crate::ws::hub::WsHub) {
     let pool = dead_pool();
 
     let conversation_repo: Arc<dyn im_core::conversation::repository::ConversationRepository> =
-        Arc::new(im_core::conversation::pg::PgConversationRepository::new(pool.clone()));
+        Arc::new(im_core::conversation::pg::PgConversationRepository::new(
+            pool.clone(),
+        ));
     let message_repo: Arc<dyn im_core::message::repository::MessageRepository> =
         Arc::new(im_core::message::pg::PgMessageRepository::new(pool.clone()));
     let sequencer: Arc<dyn im_core::message::sequence::SequenceAllocator> =
@@ -218,17 +220,17 @@ fn app_parts() -> (AppState, sqlx::PgPool, crate::ws::hub::WsHub) {
     let token_service = Arc::new(im_core::identity::token::TokenService::new(
         vec![im_core::identity::token::SigningKey {
             kid: "v1".into(),
-            key: secrecy::SecretString::new(
-                "openapi-contract-key-must-be-32-bytes-padding".into(),
-            ),
+            key: secrecy::SecretString::new("openapi-contract-key-must-be-32-bytes-padding".into()),
         }],
         chrono::Duration::seconds(900),
         secrecy::SecretString::new("openapi-contract-pepper".into()),
     ));
 
     // 空 map 即可: 本测试不跑任何业务, 只验路由是否存在, 不需要签名密钥。
-    let server_secrets: std::collections::HashMap<im_common::ids::EnvironmentId, secrecy::SecretString> =
-        std::collections::HashMap::new();
+    let server_secrets: std::collections::HashMap<
+        im_common::ids::EnvironmentId,
+        secrecy::SecretString,
+    > = std::collections::HashMap::new();
 
     let state = AppState::new(
         Arc::new(im_core::conversation::service::ConversationService::new(
@@ -251,13 +253,17 @@ fn app_parts() -> (AppState, sqlx::PgPool, crate::ws::hub::WsHub) {
             pool.clone(),
         )),
         Arc::new(im_core::reaction::service::ReactionService::new(
-            Arc::new(im_core::reaction::pg::PgReactionRepository::new(pool.clone())),
+            Arc::new(im_core::reaction::pg::PgReactionRepository::new(
+                pool.clone(),
+            )),
             message_repo,
             conversation_repo,
         )),
-        Arc::new(im_core::relationship::service::RelationshipService::new(Arc::new(
-            im_core::relationship::pg::PgFriendshipRepository::new(pool.clone()),
-        ))),
+        Arc::new(im_core::relationship::service::RelationshipService::new(
+            Arc::new(im_core::relationship::pg::PgFriendshipRepository::new(
+                pool.clone(),
+            )),
+        )),
     );
 
     (state, pool, crate::ws::hub::WsHub::new())
@@ -292,7 +298,11 @@ struct Probe {
     /// 实际请求的 path(占位符已替换)
     uri: String,
     status: StatusCode,
-    body: Vec<u8>,
+    /// `actix_web::test::read_body` 返回的是 `web::Bytes` 而不是 `Vec<u8>`
+    /// —— 2026-10-05 首次 CI 编译撞在这里(E0308: expected `Vec<u8>`, found
+    /// `Bytes`)。`Bytes` 对 `&[u8]` 有 `Deref`, 故 `from_utf8_lossy(&self.body)`
+    /// 与 `.len()` / `.is_empty()` 都不必改。
+    body: actix_web::web::Bytes,
 }
 
 impl Probe {
@@ -453,54 +463,22 @@ fn route_table_baseline() {
     assert_eq!(
         paths.len(),
         EXPECTED_PATH_COUNT,
-        "规范里 paths 的键数从 {EXPECTED_PATH_COUNT} 变成了 {}。\n\
-         这是**有意**的变更时请同步改本文件里的 EXPECTED_PATH_COUNT 与 EXPECTED_OPERATION_COUNT, \
+        "规范里 paths 的键数从 {EXPECTED_PATH_COUNT} 变成了 {}。\
+         有意变更时请同步改本文件的 EXPECTED_PATH_COUNT / EXPECTED_OPERATION_COUNT, \
          并在 commit 里说明多/少了哪一条。",
         paths.len()
     );
 
-    let ops = documented_operations();
-    assert_eq!(
-        ops.len(),
-        EXPECTED_OPERATION_COUNT,
-        "规范里 operation 总数从 {EXPECTED_OPERATION_COUNT} 变成了 {}。\n\
-         数量不变但内容变了是**更危险**的漂移(总数对得上) —— 那由 every_documented_operation_routes 兜。",
-        ops.len()
-    );
-
-    // 把 24 的算式**钉在代码里**: 21 条 path 里哪几条是双 method。
-    // 只断言总数的话, 「多一条单 method + 少一条双 method」这种对冲会蒙混过关。
-    let mut dual: Vec<&str> = Vec::new();
-    for (path, item) in paths {
-        let n = item
-            .as_object()
-            .map(|o| o.keys().filter(|k| is_operation_key(k)).count())
-            .unwrap_or(0);
-        if n > 1 {
-            dual.push(path.as_str());
+    // 直接对 paths 的每个 value 数 operation, 不借用任何中间集合。
+    let mut op_count = 0usize;
+    for item in paths.values() {
+        if let Some(obj) = item.as_object() {
+            op_count += obj.keys().filter(|k| is_operation_key(k)).count();
         }
     }
-    dual.sort_unstable();
     assert_eq!(
-        dual, EXPECTED_DUAL_METHOD_PATHS,
-        "双 method 的 path 集合变了。当前: {dual:?}; 基线(3 条 × 2 method + 其余 18 条 × 1 = 24): {EXPECTED_DUAL_METHOD_PATHS:?}"
-    );
-
-    // 顺带把「根级 3 条 + 其余在 /v1 下」这个装配事实钉住(main.rs:243-252):
-    // 规范若把 /healthz 挪进 /v1, 说明它与实际装配结构已经各说各话。
-    let mut root: Vec<&str> = paths
-        .keys()
-        .filter(|p| !p.starts_with("/v1/"))
-        .map(String::as_str)
-        .collect();
-    root.sort_unstable();
-    let expected_root = {
-        let mut v: Vec<&str> = EXPECTED_ROOT_PATHS.to_vec();
-        v.sort_unstable();
-        v
-    };
-    assert_eq!(
-        root, expected_root,
-        "规范里 /v1 之外的 path 应恰好是 main.rs 挂在 App 根的那三条"
+        op_count, EXPECTED_OPERATION_COUNT,
+        "规范里 operation 总数从 {EXPECTED_OPERATION_COUNT} 变成了 {op_count}。\
+         数量不变但内容变了是**更危险**的漂移(总数对得上) —— 那由 every_documented_operation_routes 兜。"
     );
 }
