@@ -68,6 +68,20 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 
 #### 1.1.2 `send_message`(发消息)
 
+> **`content` 自带内层 `kind`**:`content` 是 `MessageContent` 标记枚举
+> (`#[serde(tag = "kind")]`,`crates/im-protocol/src/content.rs:12`),故 wire 上
+> **必然**有 `"kind"` 键。本文档早期版本写成 `"content": { "text": "你好" }`
+> (缺内层 tag),照抄会被服务端 `from_value::<MessageContent>` 拒为
+> `VALIDATION_ERROR`(`crates/im-core/src/message/service.rs:135`)。
+> 断言证据:`content.rs:170` 断言 `{"kind":"text","text":"hello"}`;
+> `crates/im-gateway/src/ws/hub.rs:590` 断言帧 tag(`"type":"message_new"`)与
+> content tag(`"kind":"text"`)两层共存。
+>
+> **外层 `kind` 与内层 `content.kind` 不互相校验**:外层是自由 `String`
+> (`ws_frames.rs:38`),服务端只按**内层** `content.kind` 校验 content,外层原样存库
+> 并原样下行。故 `"kind":"text"` 配 `"content":{"kind":"image",...}` **不会**被拒,
+> 且下行 `message_new` 会把这一对不一致的值一起广播。接入方应自行保证二者一致。
+
 ```json
 {
   "type": "send_message",
@@ -75,7 +89,7 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
   "conversation_id": "7c9e6679-7425-40de-944b-e07fc1f90ae7",
   "idempotency_key": "33333333-3333-4333-8333-333333333333",
   "kind": "text",
-  "content": { "text": "你好" },
+  "content": { "kind": "text", "text": "你好" },
   "reply_to": null
 }
 ```
@@ -87,7 +101,7 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
   "type": "edit_message",
   "req_id": "44444444-4444-4444-8444-444444444444",
   "message_id": "8a7e6679-7425-40de-944b-e07fc1f90ae7",
-  "content": { "text": "你好(已编辑)" }
+  "content": { "kind": "text", "text": "你好(已编辑)" }
 }
 ```
 
@@ -218,7 +232,7 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
     "sequence": 42,
     "sender_id": "1a2e6679-7425-40de-944b-e07fc1f90ae7",
     "kind": "text",
-    "content": { "text": "你好" },
+    "content": { "kind": "text", "text": "你好" },
     "reply_to": null,
     "state": "sent",
     "created_at": "2026-08-23T00:00:00Z",
@@ -234,7 +248,7 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 {
   "type": "message_edited",
   "message_id": "8a7e6679-7425-40de-944b-e07fc1f90ae7",
-  "content": { "text": "你好(已编辑)" },
+  "content": { "kind": "text", "text": "你好(已编辑)" },
   "edited_at": "2026-08-23T00:01:00Z"
 }
 ```
@@ -613,7 +627,7 @@ Authorization: Bearer eyJ...
       "sequence": 43,
       "sender_id": "2b3e6679-...",
       "kind": "text",
-      "content": { "text": "你好" },
+      "content": { "kind": "text", "text": "你好" },
       "reply_to": null,
       "state": "sent",
       "created_at": "2026-08-23T00:00:00Z",
@@ -639,7 +653,7 @@ X-IM-Idempotency-Key: 33333333-3333-4333-8333-333333333333
 
 {
   "kind": "text",
-  "content": { "text": "你好" },
+  "content": { "kind": "text", "text": "你好" },
   "reply_to": null
 }
 ```
@@ -796,14 +810,28 @@ HTTP/1.1 204 No Content
 
 ### 4.1 `Message.content`(按 `kind`)
 
-| kind | content JSON 必填字段 | 可选字段 |
+**`content` 永远是带内层 `"kind"` 键的标记枚举**(`#[serde(tag = "kind", rename_all = "snake_case")]`,
+`crates/im-protocol/src/content.rs:12`)。下表的 `content JSON 必填字段` 一列**不含**
+`kind` 本身 —— 它是 6 种变体共有的判别键,必须恒出现。
+
+下表「可选字段」一列的字段在 wire 上**恒出现**,未提供时为 `null`:它们只带
+`#[serde(default)]` 而**无** `skip_serializing_if`,而 `default` 只影响反序列化,
+不影响序列化。接入方**不可**按「键可能消失」来实现。
+
+| kind | content JSON 必填字段 | 恒出现(未提供时为 `null`) |
 |---|---|---|
 | `text` | `text: string(1..=4000)` | — |
-| `image` | `media_id: uuid` | `width: int`, `height: int`, `thumbnail_media_id: uuid` |
+| `image` | `media_id: uuid`(Rust 是 `Uuid`,非字符串) | `width: int`, `height: int`, `thumbnail_media_id: uuid` |
 | `file` | `media_id: uuid`, `file_name: string(1..=255)`, `size_bytes: int(>0)` | `mime_type: string` |
 | `sticker` | `sticker_id: string(1..=64)` | — |
 | `system` | `event: string(join/leave/kicked/renamed/...)` | `actor_user_id: uuid`, `target_user_id: uuid` |
-| `custom` | `schema: string(1..=64)`, `data: object` | (Extension 定义) |
+| `custom` | `schema: string(1..=64)`, `data: 任意 JSON` | — |
+
+> `custom.data` 在 Rust 侧是 `serde_json::Value`(`content.rs:45`),**不强制是对象** ——
+> 数组 / 字符串 / 数字均可。早期版本写 `data: object`,属多余约束。
+>
+> `system.event` 服务端**只校验非空**(`content.rs:97-101`),不校验取值;
+> 上表括号内的取值是已知约定,不是受约束的枚举。
 
 ### 4.2 `Conversation.metadata` 命名空间约定
 
@@ -842,7 +870,7 @@ curl -X POST https://api.{tenant}.example.com/v1/conversations/7c9e6679-.../mess
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -H "X-IM-Idempotency-Key: $(uuidgen)" \
-  -d '{"kind":"text","content":{"text":"hello"}}'
+  -d '{"kind":"text","content":{"kind":"text","text":"hello"}}'
 ```
 
 ### 5.3 WebSocket 收发(wscat)
@@ -857,7 +885,7 @@ wscat -c wss://gateway.{tenant}.example.com/ws \
 < { "type": "connected", "session_id": "..." }
 
 # 发消息
-> { "type": "send_message", "req_id": "22222222-...", "conversation_id": "7c9e6679-...", "idempotency_key": "33333333-...", "kind": "text", "content": {"text": "hi"} }
+> { "type": "send_message", "req_id": "22222222-...", "conversation_id": "7c9e6679-...", "idempotency_key": "33333333-...", "kind": "text", "content": {"kind": "text", "text": "hi"} }
 < { "type": "ack", "req_id": "22222222-...", "ok": true, "data": {"message_id": "8a7e6679-...", "sequence": 42} }
 ```
 
