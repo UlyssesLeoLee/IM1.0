@@ -2724,6 +2724,106 @@ Commits: `492b624` · `81b6500` · `db03ce8` · `4535dc2`
 
 ---
 
+### 1.32 `/readyz` 对一件正在发生的事说「一切正常」—— 它报的是恒定的 `not_checked` (2026-10-05)
+
+`DetailedDesign §5`、`ImplementationSpec §3.1.7`、`deploy/k3s-dev-preflight-checklist.md`
+**三处**都写着同一件事: 就绪检查覆盖 **PG/Valkey/NATS, 任一不可用返 503**。
+
+而实现里写的是:
+
+> | NATS | ❌ 不查 | ...但**这个端点拿不到 publisher 实例**, 所以无法探测它
+
+这条理由在 2026-10-04(D-3)之后**已经不成立** —— publisher 早就真连 NATS 了,
+只是没注入这个端点。于是 NATS 挂掉时的实际行为是:
+
+- k8s 认为 Pod 仍然 ready, 继续送流量
+- 每条领域事件重试 5s 后进 DLQ
+- 集群**看起来完全健康**, 事件在一批批积压
+
+`/readyz` 是编排器**唯一**的摘流量依据。它对一件正在发生的事说「正常」, 于是
+集群没有可观测的降级信号。
+
+#### 改动
+
+- **`EventPublisher` 新增 `fn readiness(&self) -> PublisherReadiness`**,
+  **刻意不给默认实现** —— 漏实现应当是编译错误, 而不是悄悄返回某个看起来正常
+  的值。三个实现者(`Nats` / `Stub` / 测试里的 `Mock`)全部显式实现。
+- **`PublisherReadiness` 四态枚举** 而非 `Result`: stub 若报成功, 集成方会以为
+  NATS 正常而事件其实一条都没发出去。用枚举让每种状态都能**原样**出现在响应里。
+- **`readiness_from_state()` 纯函数**: `Disconnected` 与 `Pending` 在 CI 里稳定
+  构造不出来(前者需要一个真断开的连接, 后者只在重连窗口出现), 故把映射抽出来测。
+- `main.rs` 注入 `web::Data<Arc<dyn EventPublisher>>`。**单独注入**而非塞进
+  `AppState`: 探针只需要这一个字段, 让它依赖整个 AppState 会使任何构造
+  AppState 的测试都得先凑齐 7 个 service。
+- openapi.json 同步: description、200/503 两个 example、
+  `ReadyResponse.checks.nats` 的 enum(原为 `["not_checked"]` 单值)。
+
+#### 探针**不发网络请求**, 这是硬要求不是偏好
+
+`readiness()` 读 `async_nats::Client` 内部的 `watch` channel, 是本地读。换成
+「发消息等回包」会有两个问题: 给 NATS 加探针流量; NATS 假死(TCP 连着但不回包)
+时把探针一起拖到超时 —— 而 `im-gateway.yaml` 的 readinessProbe **没写**
+`timeoutSeconds`(默认 1s), 探针超时会累计 `failureThreshold`, 那与「判定为
+不健康」在 k8s 眼里完全是两件事。
+
+#### stub 不阻断 readiness, 但也不许报 `ok`
+
+`IM_EVENT_PUBLISHER_KIND=stub` 时事件不投递是**配置决定**。报 `ok` 是撒谎(集成
+方会以为事件在发), 报 503 是滥罚(每个本地开发部署都会永远不健康)。故报
+`ok_stub_events_not_delivered`。
+
+#### 补了一道此前**不存在**的门禁
+
+`checks.nats` 的取值来自代码的 `as_wire_str()`, 规范里是
+`ReadyResponse.checks.nats.enum`。此前这两者之间**没有任何东西**。集成方是按
+**规范**写探针解析代码的 —— 规范少一个取值, 客户端就会在真实响应上走进未匹配
+分支。新增两条断言把两侧集合钉成相等, 并用对照组排除「两侧都空」的空转。
+
+门禁鉴别力**实测喂过 3 次失败输入**: 少一个取值 / 拼错一个字 / 多一个幽灵取值
+→ 三次全红; 还原后 SHA256 与变异前逐字节一致, 2 passed。
+
+> 第一条变异最初报「RED(0 failed)」—— 返回码非零却一条 FAILED 都没有。那是我
+> 统计方式的假象, 单独重跑看完整输出后确认是 2 failed。**红灯也要问一句「我的
+> 量具有效吗」**, 与绿灯同理。
+
+#### 验证
+
+- **CI 验收 (run 37295084289, head `83252bc`): 4/4 job success**, Integration
+  **462 passed / 0 failed / 0 ignored**(451 + 新增 11), Unit **167 passed**
+  (163 + 新增 4)
+- 新增 11 个用例: im-core 映射 4 / health 路由级 3 / openapi 契约 2 /
+  NATS 集成 2
+- 本机 `cargo test -p im-core --lib` **50 passed**、`-p im-gateway --bins`
+  **137 passed**(本机抢到了共享 target 锁, 故两条命令都**实跑**了而非只靠 CI)
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` **EXIT=0**
+  (CI 同一条命令; 过程中抓到并修掉 2 处 `unused import` 与 1 处
+  `unused variable`, 它们都会让 CI 变红)
+- `scripts/check-openapi.ps1` exit 0(24 routes / 24 ops / 21 aux-03 codes)
+
+#### 一个已拍板但**值得记下来**的取舍
+
+NATS 不可用即 503 是规范原话, 本次照规范实现。但 §1.31 的 DLQ 落地后, NATS 已
+从「事件丢失」降级为「事件积压」—— 用一个硬 503 把「降级但仍能服务」变成「全站
+不可用」, 在可用性上是一次**可争议的**交换。
+
+2026-10-05 已就此问过规范所有者, 选择**保持现状**(符合三处规范原文)。记在此处
+是因为: 将来若有人问「NATS 抖动为什么导致全站 503」, 答案不是「没人想过」, 而是
+「想过、问过、拍板了」。另一条更稳的形态是加宽限期(连续断线超过 N 秒才 503)、
+或改为不断流只靠 `im_events_dlq_total` 告警, 两者都需要先改规范。
+
+#### 位置
+
+- `crates/im-core/src/event/publisher.rs` (`PublisherReadiness` +
+  `readiness_from_state` + trait 方法)
+- `crates/im-gateway/src/health.rs` (`readyz` 真探 NATS)
+- `crates/im-gateway/src/main.rs` (`readiness_publisher` 注入)
+- `crates/im-gateway/src/http/openapi_contract.rs` (新增门禁「测试 5」)
+- `docs/api/openapi.json` (`/readyz` 契约)
+
+Commit: `83252bc`
+
+---
+
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
