@@ -22,7 +22,7 @@ related_activities: 15 数据要件, 31 ER 图, 47 DB 详细, 17 安全要件
 
 ## 2. 适用范围 (Scope)
 
-- 全部 PostgreSQL 表(`tenants` / `games` / `environments` / `users` / `device_sessions` / `friend_requests` / `friendships` / `conversations` / `conversation_sequences` / `dm_pairs` / `conversation_members` / `messages` / `message_reactions` / `audit_logs`)
+- 全部 PostgreSQL 表(共 15 张:`tenants` / `games` / `environments` / `users` / `device_sessions` / `friend_requests` / `friendships` / `conversations` / `conversation_sequences` / `dm_pairs` / `conversation_members` / `messages` / `message_reactions` / `audit_logs` / `dlq_records`)。清单以 `migrations/*.sql` 的 `CREATE TABLE` 实数为准,不是本节自述。
 - 全部 REST API 入参 / 出参字段
 - 全部 WebSocket 帧字段(详细见 `aux-13-protocol-frame-samples.md`)
 
@@ -310,6 +310,46 @@ Tech Lead(架构) + DBA(物理模型、性能、安全)。字段新增/删除/�
 | `detail` | 详情 | JSONB | N | NULL | — | | | 内部(按 key) | 敏感字段脱敏 | 同上 | SRE | 写入前过滤 `password`/`token`/`secret` |
 | `created_at` | 创建时间 | TIMESTAMPTZ | Y | now() | — | | idx | 内部 | — | 同上 | SRE | |
 
+### F.15 `dlq_records`
+
+> 本表 2026-10-06 补录(`migrations/0008_create_dlq_records.sql` 落地时**漏了**本字典,
+> 于是 §F 只有 14 个子表而仓里实际有 15 张表)。字段与约束逐条转写自该迁移,
+> 不做推断。
+
+| 物理名 | 中文名 | 类型 | 必填 | 默认 | 范围 | 主/外键 | 索引 | 隐私 | 脱敏 | 留存 | 引用方 | 备注 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `dlq_id` | DLQ 记录 ID | UUID | Y | — | — | PK | PK | 内部 | — | 长留存 | jobctl / SRE | **由写入方生成**,非 `gen_random_uuid()` |
+| `original_task` | 原始任务 | TEXT | Y | — | — | | idx(复合,part1) | 内部 | — | 长留存 | jobctl | 事件语境下即 NATS subject |
+| `original_payload` | 原始载荷 | JSONB | Y | — | JSON 对象或 JSON 字符串 | | | **敏感** | 展示层须截断 | 长留存 | jobctl | 形状由 `aux-08` §D.2 冻结;解析失败时写 JSON 字符串 |
+| `error_code` | 错误码 | TEXT | Y | — | 见 `aux-03` §B | | | 内部 | — | 长留存 | jobctl | |
+| `error_message` | 错误信息 | TEXT | Y | — | — | | | **敏感** | 可能含载荷片段 | 长留存 | jobctl / SRE | |
+| `error_stack` | 错误栈 | TEXT | N | NULL | — | | | 内部 | **恒为 NULL** | 长留存 | SRE | 仓内无脱敏,宁空着不写未脱敏栈 |
+| `error_http_response_code` | HTTP 响应码 | SMALLINT | Y | — | 100–599 | | | 内部 | — | 长留存 | jobctl | 列名**刻意避开** `status` 词段(`aux-01` §I 保留);wire 侧仍叫 `http_status` |
+| `context_trace_id` | 上下文 trace | TEXT | N | NULL | — | | | 内部 | — | 长留存 | SRE | **恒为 NULL**:`tx.commit()` 后已无请求上下文 |
+| `context_user_id` | 上下文用户 | TEXT | N | NULL | — | | | 内部 | — | 长留存 | SRE | **恒为 NULL**:同上,编造值会误导排障 |
+| `context_env_id` | 上下文环境 | TEXT | N | NULL | — | | | 内部 | — | 长留存 | SRE | **恒为 NULL**:同上 |
+| `context_attempt_count` | 已尝试次数 | INTEGER | Y | — | — | | | 内部 | — | 长留存 | jobctl | 来自 `aux-08` §D.2 `context` |
+| `context_first_attempt_at` | 首次尝试时间 | TIMESTAMPTZ | Y | — | — | | | 内部 | — | 长留存 | jobctl | |
+| `context_last_attempt_at` | 末次尝试时间 | TIMESTAMPTZ | Y | — | — | | | 内部 | — | 长留存 | jobctl | |
+| `failed_at` | 失败时间 | TIMESTAMPTZ | Y | — | — | | idx×2 | 内部 | — | 长留存 | jobctl | 排障主查询排序键 |
+| `dlq_destination` | DLQ 目标 | TEXT | Y | — | 形如 `dlq.event.im.message.created` | | | 内部 | — | 长留存 | jobctl | |
+| `replay_attempts` | 重放次数 | INTEGER | Y | 0 | ≥ 0 | | | 内部 | — | 长留存 | jobctl | `chk_dlq_records_replay_attempts` |
+| `replayed_at` | 重放时间 | TIMESTAMPTZ | N | NULL | — | | partial | 内部 | — | 长留存 | jobctl | 与 `discarded_at` 互斥语义 |
+| `discarded_at` | 丢弃时间 | TIMESTAMPTZ | N | NULL | — | | partial | 内部 | — | 长留存 | jobctl | **无 `discarded_by` 列**,审批流程未实装 |
+| `created_at` | 创建时间 | TIMESTAMPTZ | Y | now() | — | | | 内部 | — | 长留存 | SRE | |
+
+索引(3 个,与 `aux-01` §D 逐字拼全列名):
+`idx_dlq_records_original_task_failed_at` / `idx_dlq_records_failed_at` /
+`idx_dlq_records_pending_replay_failed_at`(partial:`replayed_at IS NULL AND discarded_at IS NULL`)。
+
+**已知缺口(不在本字典能力范围内,需 owner 裁决)**:
+
+1. `discarded_by` —— 丢弃是破坏性操作,却没有记录**谁**丢弃的;`aux-08` §K GAP-12
+   要求的「二次确认 + 双人审批」因此无法落地。补列需开 `0009` 迁移。
+2. `original_payload` 的 JSON 形状被 `aux-08` §D.2 冻结;非 UTF-8 载荷在写入时
+   经 `String::from_utf8_lossy` **不可逆改写**(见台账 §1.37)。
+3. 留存期只写了「长留存」,**没有具体期限**;`aux-08` §D.3 也只说「V1+ 加专表」。
+
 ## G. 隐私 / 合规映射
 
 | 法规 | 涉及字段 | IM1.0 落地策略 |
@@ -321,7 +361,7 @@ Tech Lead(架构) + DBA(物理模型、性能、安全)。字段新增/删除/�
 
 ## 6. 验收标准 (Acceptance Criteria)
 
-- [ ] 每张表上线前必须填完本字典对应子表
+- [ ] 每张表上线前必须填完本字典对应子表(2026-10-06 复检:15 张表已全部有 §F 子表)
 - [ ] 隐私字段 100% 标注脱敏规则(§A 必填项)
 - [ ] 字段变更必须留 PR 链接 + 触发 CI 中的 schema diff 检查
 - [ ] Core Schema(§F.4 `users` / §F.8 `conversations` / §F.12 `messages`)**不得**出现 `guild_id` / `match_id` / `party_id` 等游戏专有字段(由 `aux-01` §I + `aux-07` SQL 优化 checklist 联合校验)
@@ -343,3 +383,4 @@ Tech Lead(架构) + DBA(物理模型、性能、安全)。字段新增/删除/�
 | 1.0.0 | YYYY-MM-DD | (模板初版) | 初版通用模板 |
 | 1.1.0 | 2026-08-23 | Mavis 辅助 | 填实 IM1.0 全部 14 张表(§F.1-F.14);§D 枚举值与 BasicDesign §4 严格对齐;§E on delete 行为按业务语义细化;§G 合规映射 GDPR/中国个保法/等保/COPPA;§C 字段变更控制补充 INDEX CONCURRENTLY;验收标准加 Core Schema 纯净性校验 |
 | 1.1.1 | 2026-08-26 | 架构师 (Mavis) | **Day 2 GATE 复检**:① 14 张表与 `migrations/0001-0006` SQL 实际定义严格一致(3+2+2+4+2+1=14);② 关键字段抽查 5 个(`users.external_identity` JSONB+UNIQUE / `conversations.metadata` JSONB+chk / `messages.idempotency_key` UNIQUE NULLS NOT DISTINCT / `dm_pairs.user_a < user_b` CHECK / `audit_logs.target_type` ENUM CHECK)SQL 与 aux-02 表对齐;③ 引用方 grep 验证: `crates/im-common/src/ids.rs:3` 1 处 + `migrations/0001-0006` 6 处注释引用 + `crates/im-gateway/src/error.rs:3` 引 aux-03,**im-core 各 service / repository 0 处直接引用 aux-02 §F 字段名**——ImSpec §12.3 验收项"im-core 各 service / repository 至少 3 处引用 aux-02"未达成(已记入 Project-Status §1.1.1 遗留工程债,V1 实装 service 时补) |
+| 1.2.0 | 2026-10-06 | Mavis (代技术负责人) | **补录 `dlq_records`(§F.15)**:`migrations/0008` 已建该表但本字典漏登,导致「§F 子表数 14 ≠ 仓内 `CREATE TABLE` 实数 15」,而 README 曾据此声称本字典覆盖 15 张表 —— 属**未验证的数字引用**。本次按 0008 迁移逐列转写(19 列 + 2 CHECK + 3 索引),同步修 §2 适用范围表清单,并在 §F.15 末尾列出 3 项**已知缺口**(缺 `discarded_by` / `original_payload` 形状冻结致非 UTF-8 静默改写 / 留存期无具体期限)与验收标准第 1 条。表数以迁移实数为准,不再采信文档自述 |

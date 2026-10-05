@@ -310,6 +310,24 @@ jobs:
         # 纯 PowerShell, 不需要 cargo, 故与上面的 aux-03 检查并列。
         shell: pwsh
         run: pwsh -NoProfile -File ./scripts/check-openapi.ps1
+      - name: check API quickstart drift (端点表 vs openapi.json)
+        # 2026-10-06 新增。接入方**只看 quickstart**, 不看 openapi.json ——
+        # 所以 quickstart 会独立腐烂: 加了端点没更新文档、或改了 path 没更新
+        # 文档, 都没有任何东西会红, 直到某个接入方照着文档打过去拿到 404。
+        #
+        # 本门禁对**两个方向**都判: 文档写了而 spec 没有(= 文档在骗人),
+        # 以及 spec 有而文档漏了(= 文档漏了新能力)。外加正文里那句
+        # 「N 个 operation」也必须与 spec 对得上。
+        #
+        # fail-closed: 表格一条都解析不出来时**判失败**而不是当成「0 违规」。
+        # 这不是假想 —— 首次跑时作者自己的正则把 method 写在第一列, 而表里
+        # 第一列是分组名, 于是一行都没匹配上; 是这段守卫把它变成了一次显式失败,
+        # 否则就是一个永远绿的检查。
+        #
+        # 判别力已用变异测试证明, 6 处全部 RED: 整行删端点 / 加不存在的端点 /
+        # 路径拼错 / 正文数量不符 / 表格形状改变 / method 写小写。
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/check-api-quickstart.ps1
       - name: check AsyncAPI drift (WS frames vs im-protocol serde)
         # 2026-10-05 新增。OpenAPI 覆盖 HTTP 面, 但 WebSocket 面此前**完全没有**
         # 机器可读描述 —— 接入方要自己读 im-protocol 的 Rust 源码反推帧的 JSON
