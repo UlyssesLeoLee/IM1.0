@@ -19,6 +19,8 @@ pub mod message_actions;
 pub mod messages;
 pub mod state;
 #[cfg(test)]
+pub mod openapi_contract;
+#[cfg(test)]
 pub mod test_support;
 
 use actix_web::web;
