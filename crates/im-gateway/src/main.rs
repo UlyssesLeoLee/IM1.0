@@ -10,12 +10,42 @@
 //! 5. bind http_port + run
 //!
 //! ## 环境变量覆盖
+//!
+//! 规则只有一条(per `im-common::config::AppConfig::load_from_paths` 的实现):
+//! **变量名去掉 `IM_` 前缀后小写, 必须等于 `AppConfig` 的字段名**。该实现遍历
+//! `std::env::vars()` 逐个 strip `IM_` 再小写, 不认识的 `IM_*` 变量会被
+//! **静默忽略**。
+//!
 //! - `IM_HTTP_PORT` (u16, 默认 8080)
 //! - `IM_POSTGRES_URL` (postgres://...) — 必填
 //! - `IM_JWT_SIGNING_KEYS` (JSON 数组, 至少 1 项) — 必填
 //! - `IM_REFRESH_PEPPER` (string) — 必填
-//! - `IM_EVENT_PUBLISHER_KIND` (stub|nats, 默认 stub)
-//! - `IM_EVENT_PUBLISHER_NATS_URL` (optional, 仅 kind=nats)
+//! - `IM_EVENT_PUBLISHER` (JSON 对象) — 必填
+//!
+//! ### `IM_EVENT_PUBLISHER` 是**一个** JSON 值, 不是两个扁平变量
+//!
+//! `AppConfig` 的字段是嵌套的 `event_publisher: EventPublisherConfig`,
+//! 所以正确写法是:
+//!
+//! ```text
+//! IM_EVENT_PUBLISHER={"kind":"stub","nats_url":""}
+//! IM_EVENT_PUBLISHER={"kind":"nats","nats_url":"nats://nats:4222"}
+//! ```
+//!
+//! **此前本文件的文档写的是 `IM_EVENT_PUBLISHER_KIND` /
+//! `IM_EVENT_PUBLISHER_NATS_URL`, 那是错的**: 它们会被 strip 成
+//! `event_publisher_kind` / `event_publisher_nats_url`, 不是任何字段名。
+//! 照着配的结果是 `event_publisher` 仍然缺失(它没有 `#[serde(default)]`),
+//! 服务启动失败。`deploy/k3s/dev/im-gateway.yaml` 与 `crates/jobctl` 用的
+//! 一直是上面这个 JSON 写法, 即 k3s 清单是对的、只有本注释是错的。
+//!
+//! ### `config/default.toml` **不会被** `load()` 读到
+//!
+//! `AppConfig::load()` 调的是 `load_from_paths(None, None)`, 而 TOML provider
+//! 只在 `config_dir` 为 `Some` 时才 merge(见 config.rs 的 `if let Some(dir)`)。
+//! 故 `config/default.toml` / `config/local.toml` 在默认启动路径上**完全不参与**,
+//! 生效的只有 `#[serde(default)]` 内置默认值与环境变量。**本文件下方的报错
+//! 提示曾让 operator 去提供那个文件, 那是误导, 已更正。**
 //!
 //! ## 已知缺口 (per 138 §8 + D-1 MVP 范围)
 //! - 46 项完整配置实装在 V1 阶段, 本 D-1 仅含 MVP 必需 9 项
@@ -59,15 +89,31 @@ const DEFAULT_ACCESS_TOKEN_TTL_SECONDS: i64 = 900;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    // 1. 加载配置 (figment: default.toml < local.toml < env vars, per im-common::config)
+    // 1. 加载配置
+    //
+    // 只加载「内置默认值 + 环境变量」: `AppConfig::load()` 走
+    // `load_from_paths(None, None)`, config_dir 为 None, 故 `config/*.toml`
+    // 在这条路径上**不参与**(见文件头「环境变量覆盖」一节)。
     let cfg = AppConfig::load().unwrap_or_else(|e| {
+        // 注意 `{e}` 打出来是 `internal error` —— `AppError::Internal` 的
+        // `#[error("internal error")]` 漏了 `{0}` 占位符, figment 的完整诊断
+        // (哪个字段缺失/值哪里不对) 被 Display 丢掉了。
+        //
+        // **刻意不把那行诊断放出来**: figment 解析 IM_JWT_SIGNING_KEYS 失败时
+        // 会回显输入值, 而输入值就是 JWT 签名密钥原文, 会直接打到 stderr。
+        // 要修应改 `AppError::Internal` 的 Display 或另加一个只带字段名的
+        // Config 变体, 而不是把 `{0}` 填回去。
         eprintln!("[im-gateway] config load failed: {e}");
-        eprintln!(
-            "[im-gateway] hint: set IM_POSTGRES_URL + IM_JWT_SIGNING_KEYS + IM_REFRESH_PEPPER"
-        );
-        eprintln!(
-            "[im-gateway]        or provide config/default.toml (see config/local.toml.example)"
-        );
+        eprintln!("[im-gateway] the detailed reason is intentionally not printed here:");
+        eprintln!("[im-gateway]   it may echo the value of IM_JWT_SIGNING_KEYS, i.e. the signing key.");
+        eprintln!("[im-gateway] 4 required env vars (AppConfig fields have no serde default):");
+        eprintln!("[im-gateway]   IM_POSTGRES_URL      postgres://user:pass@host:port/db");
+        eprintln!("[im-gateway]   IM_JWT_SIGNING_KEYS   JSON array, e.g. [{{\"kid\":\"v1\",\"key\":\"...\",\"active\":true}}]");
+        eprintln!("[im-gateway]   IM_REFRESH_PEPPER     any non-empty string");
+        eprintln!("[im-gateway]   IM_EVENT_PUBLISHER    one JSON object, e.g. {{\"kind\":\"stub\",\"nats_url\":\"\"}}");
+        eprintln!("[im-gateway] note: config/default.toml is NOT read by this code path.");
+        eprintln!("[im-gateway] run scripts/preflight.ps1 (ships with the release package) to get");
+        eprintln!("[im-gateway]   a per-variable verdict; it never prints any value.");
         std::process::exit(78);
     });
 

@@ -1,19 +1,37 @@
 # im-gateway 默认配置 (committed, per aux-12 §A.1 默认值)
 # 注意: 任何密钥 (jwt_signing_keys / refresh_pepper / server_secrets) 都不写在此文件,
 #       全部从环境变量 / K3s Secret 注入 (per aux-12 §A.1 「K3s Secret Key 从 env 读,不进 VCS」).
+#
+# ## ⚠ 本文件在默认启动路径上**不会被读取** (2026-10-06 实测更正)
+#
+# `AppConfig::load()` 调的是 `load_from_paths(None, None)`, config_dir 为 `None`,
+# 而 figment 的 TOML provider 只在 `config_dir` 为 `Some` 时才 merge
+# (crates/im-common/src/config.rs 的 `if let Some(dir) = config_dir`)。
+# 故 `im-gateway` 启动时生效的只有:
+#   1. `AppConfig` 字段上的 `#[serde(default = ...)]` 内置默认值
+#   2. 环境变量(见下方规则)
+#
+# 本文件仅在测试里经 `load_from_paths(Some(dir), ...)` 被读到。
+# **它不是**运维改配置的入口 —— 改这里对实际运行的服务没有任何效果。
 
+# 规则: 变量名去掉 IM_ 前缀后小写, 必须等于 AppConfig 的字段名。
+# 不认识的 IM_* 变量会被**静默忽略**。
 http_port = 8080
 
 postgres_url = "postgres://postgres:postgres@localhost:5432/im1"
 
 # 双密钥示例 (active = true 启用签发/校验, false 仅校验, 用于轮换期)
-# 实际密钥必须从环境变量 IM__JWT__SIGNING__KEYS 注入,本文件不写.
+# 实际密钥必须从环境变量 IM_JWT_SIGNING_KEYS 注入,本文件不写。
+# (此前此处写的是 IM__JWT__SIGNING__KEYS —— 双下划线是 figment 的嵌套分隔符,
+#  本仓字段是单层的, 用不了双下划线, 已更正。)
 jwt_signing_keys = []
 
-# refresh_pepper 必须从环境变量 IM__REFRESH__PEPPER 注入
+# refresh_pepper 必须从环境变量 IM_REFRESH_PEPPER 注入
 refresh_pepper = ""
 
 # event_publisher.kind = "stub" (MVP) | "nats" (V1+)
+# 环境变量里这是**一个** JSON 值: IM_EVENT_PUBLISHER={"kind":"stub","nats_url":""}
+# 不存在 IM_EVENT_PUBLISHER_KIND / IM_EVENT_PUBLISHER_NATS_URL 这两个扁平变量。
 # MVP stub 不连 NATS, 仅打印 tracing 日志
 [event_publisher]
 kind = "stub"
