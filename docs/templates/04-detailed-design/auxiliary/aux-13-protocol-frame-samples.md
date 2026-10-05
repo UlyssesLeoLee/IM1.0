@@ -159,6 +159,13 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 ```
 
 > 客户端每 30s 发一次,服务端 60s 未收到任何帧视为死连接主动断开(`IM_WS_HEARTBEAT_TIMEOUT_SECONDS=60`,见 `DetailedDesign.md §10`)。
+>
+> `ping` 是**唯一不带 `req_id` 的客户端帧**,故服务端**不回 `ack`**,只回 `pong`。
+> 其余 7 类客户端帧都必须带 `req_id`。
+>
+> `ts` 声明为 `#[serde(default)] Option<i64>` 而**无** `skip_serializing_if`
+> (`ws_frames.rs:67`),故 wire 上**恒出现**,未提供时为 `null` —— 客户端可以
+> 省略,服务端能解析,但回程 `pong.ts` 不会是「原样回传」(见 §1.2.11)。
 
 ### 1.2 服务端 → 客户端 帧
 
@@ -324,6 +331,24 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 }
 ```
 
+客户端 `ping` 省略 `ts`(或显式传 `null`)时:
+
+```json
+{
+  "type": "pong",
+  "ts": 0
+}
+```
+
+> **`ts` 不是严格回显**。实现是 `ts: ts.unwrap_or(0)`
+> (`crates/im-gateway/src/ws/handler.rs:437`),故客户端省略 `ts` 时服务端回
+> **`ts: 0`**,而不是把 `null` 或缺省原样送回。
+>
+> 接入方若用 `pong.ts` 做 RTT 计算,**必须**在 `ping` 里始终带 `ts`,并注意
+> `ts: 0` 是「客户端没带」与「客户端确实带了 0」无法区分的哨兵值。
+>
+> `pong.ts` 的类型是必填 `i64`(`ws_frames.rs:133`),无 `Option`,故该键恒出现。
+
 #### 1.2.12 `force_disconnect`
 
 ```json
@@ -341,7 +366,7 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 |---|---|
 | 帧编码 | JSON over WS Text Frame(UTF-8) |
 | 请求-响应配对 | 客户端写操作必带 `req_id`,服务端 `ack` 回带 |
-| 心跳 | 客户端 30s `ping`,服务端 60s 无帧超时 |
+| 心跳 | 客户端 30s `ping`,服务端 60s 无帧超时;`pong.ts` 在客户端省略 `ts` 时为 `0`(非严格回传,见 §1.2.11) |
 | 重连 | 客户端负责,使用 `after_sequence` 增量拉取(不在 WS 层做服务端补发) |
 | 顺序保证 | 同一会话内消息 `sequence` 单调递增;WS 帧顺序按服务端发送顺序 |
 | 错误语义 | `IDEMPOTENCY_CONFLICT` 走成功语义(详见 §1.2.3);其他错误 `ok=false` |
