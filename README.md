@@ -6,11 +6,22 @@ IM 通信软件，适合 AI 和工作场景，便于集成进游戏的通信软�
 
 ## 接入本平台（Integrator）
 
-**先看这一页**：[API 快速接入](docs/api/QUICKSTART.md) —— 五分钟走通「注册 guest 身份 → 建会话 → 发消息 → 开 WebSocket」，含端点全表、必需环境变量、**以及哪些端点还没实现**（免得照着文档打过去拿到 404）。
+**最快的方式**：下载 `im1.0-<版本>-win-x64.zip`（由 `scripts/build-package.ps1` 组装），解压后
+
+```powershell
+pwsh -File scripts\install.ps1     # 生成 .env -> 配置自检 -> 跑数据库迁移
+pwsh -File scripts\start-gateway.ps1
+```
+
+包内是预编译的 `im-gateway` / `im-migrate` / `jobctl`，**不需要 Rust 工具链、不需要 Docker**。`BUILD-INFO.txt` 记录了它是从哪个 commit 构建的，`SHA256SUMS.txt` 可逐文件校验。
+
+**没有安装包时**（或要跑 Linux/macOS）：[API 快速接入](docs/api/QUICKSTART.md) —— 五分钟走通「注册 guest 身份 → 建会话 → 发消息 → 开 WebSocket」，含端点全表、必需环境变量、**以及哪些端点还没实现**（免得照着文档打过去拿到 404）。
 
 机器可读契约：[OpenAPI 3.1](docs/api/openapi.json) ｜ [AsyncAPI 3.0](docs/api/asyncapi.json)。
 两者与代码之间有漂移门禁，`docs/api/QUICKSTART.md` 的端点表也被
 `scripts/check-api-quickstart.ps1` 与 `openapi.json` 双向对拍。
+
+> 配置自检：`scripts/preflight.ps1` 会在启动前逐项给出可操作的结论，**任何情况下都不打印变量的值**。它之所以必要，是因为 `im-gateway` 配置出错时只会打印一句 `config load failed: internal error` —— 见 `packaging/template/INSTALL.md` §5 的两条实测原因。
 
 ## 文档
 
@@ -121,6 +132,10 @@ pwsh scripts/check-asyncapi.ps1         # WS 帧 vs im-protocol 的 serde 定义
 pwsh scripts/check-api-quickstart.ps1   # 接入文档的端点表 vs openapi.json
 pwsh scripts/check-error-codes.ps1      # aux-03 §B vs im_common::ErrorCode
 pwsh scripts/check-naming-convention.ps1
+pwsh scripts/test-preflight.ps1         # 配置自检脚本的变异测试 + 密钥泄露断言
+
+# 组装 release 安装包（预编译二进制 + 配置模板 + 启动脚本 + 校验和）
+pwsh scripts/build-package.ps1          # 产物在 dist/，含 BUILD-INFO.txt 与 SHA256SUMS.txt
 
 # 诊断脚本（Docker 故障时用，有超时保护，不会自己卡死）
 pwsh scripts/diag-docker-bridge.ps1

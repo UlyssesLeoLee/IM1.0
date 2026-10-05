@@ -328,6 +328,23 @@ jobs:
         # 路径拼错 / 正文数量不符 / 表格形状改变 / method 写小写。
         shell: pwsh
         run: pwsh -NoProfile -File ./scripts/check-api-quickstart.ps1
+      - name: preflight regression (配置自检的变异测试)
+        # 2026-10-06 新增。`packaging/template/scripts/preflight.ps1` 是接入方
+        # 启动服务前唯一的自查手段, 它随 release 包发给外部用户 —— 所以它坏了
+        # 不只是本仓的问题。
+        #
+        # 本步做两件事: ① 喂 12 份配置(1 对照 + 11 变异), 断言正确的过、坏的挂;
+        # ② **泄露断言** —— 密钥/pepper 原文绝不能出现在输出里。
+        #
+        # 为什么必须有 ②: preflight 的全部价值就是「告诉你哪儿不对, 但不打印
+        # 你的值」。若哪天有人图省事把值打出来, 它就变成一个主动泄密的工具。
+        #
+        # 为什么变异组里有一半是「宽松 JSON」: PowerShell 的 ConvertFrom-Json
+        # 会放行无引号键/单引号/尾随逗号/**截断的 JSON**, 而 Rust 侧 serde_json
+        # 全部拒绝。用宽松解析器当门禁 -> preflight 放行、服务拒绝。
+        # 这 4 条用例就是为此存在的, 2026-10-06 当场抓出该 bug。
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/test-preflight.ps1
       - name: check AsyncAPI drift (WS frames vs im-protocol serde)
         # 2026-10-05 新增。OpenAPI 覆盖 HTTP 面, 但 WebSocket 面此前**完全没有**
         # 机器可读描述 —— 接入方要自己读 im-protocol 的 Rust 源码反推帧的 JSON
