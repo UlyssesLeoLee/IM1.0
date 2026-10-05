@@ -1,0 +1,1133 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "IM1.0 Gateway",
+    "version": "0.1.0",
+    "summary": "IM1.0 即时通讯内核的 HTTP 接入层",
+    "description": "本文件是 im-gateway 对外 HTTP 接口的**机器可读契约**, 由 `scripts/check-openapi.ps1` 与代码路由注册双向比对, 漂移即 CI 红。\n\n## 字段来源\n\n请求/响应 schema 的字段集**逐个**取自 Rust 的 `serde` DTO, 不取自设计文档的样例 JSON。`ImplementationSpec` 处于 `[PROTOCOL-FROZEN]`, aux-13 多处只给样例; 凡样例与代码不一致的, 以代码为准并在 `docs/gap-ledger.md` 挂起。\n\n## 错误\n\n所有非 2xx 响应共用 `ErrorResponse` 信封。`code` 的取值域是 `docs/templates/04-detailed-design/auxiliary/aux-03-error-code-registry.md` §B 的 21 项, 每个 operation 的可能取值列在 `x-error-codes` 扩展里。\n\n## 幂等\n\n`POST /v1/conversations/{id}/messages` 要求 `idempotency_key`; 重放同一键返回既有消息, 不重复投递。\n\n## WebSocket\n\n`GET /v1/ws` 是 WebSocket 升级握手, 不产生 REST 响应体; 帧协议不在本文件内, 见 `description` 与 `docs/gap-ledger.md`。",
+    "license": { "name": "SEE LICENSE IN LICENSE" }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:8080",
+      "description": "本地开发 (IM_HTTP_PORT 默认值)"
+    }
+  ],
+  "tags": [
+    { "name": "auth", "description": "令牌签发、刷新、账号绑定与会话吊销" },
+    { "name": "conversations", "description": "会话生命周期、成员、已读位点" },
+    { "name": "messages", "description": "消息发送、列举、编辑、撤回、表情回应" },
+    { "name": "friends", "description": "好友申请、应答、拉黑" },
+    { "name": "me", "description": "调用者自身资料" },
+    { "name": "realtime", "description": "WebSocket 升级握手" },
+    { "name": "ops", "description": "存活、就绪与指标端点" }
+  ],
+  "security": [],
+  "paths": {
+    "/healthz": {
+      "get": {
+        "tags": ["ops"],
+        "operationId": "healthz",
+        "summary": "存活探针",
+        "description": "只回答「进程是否活着」。**刻意不检查任何外部依赖** —— 数据库抖动不应触发容器重启, 那会把一个依赖的故障放大成整个服务不可用。\n\n依赖健康由 `/readyz` 负责。",
+        "x-error-codes": [],
+        "responses": {
+          "200": {
+            "description": "进程存活",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HealthResponse" },
+                "example": { "status": "ok" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/readyz": {
+      "get": {
+        "tags": ["ops"],
+        "operationId": "readyz",
+        "summary": "就绪探针",
+        "description": "回答「能否接流量」。当前只探测 PostgreSQL; `checks` 里显式列出 `nats` 与 `valkey` 未被检查的原因, 避免读响应的人把「没提到」误解成「查过且通过」。\n\n`checks.nats` = `not_checked` (端点拿不到 publisher 实例), `checks.valkey` = `not_implemented_D4` (D-4 未落地)。",
+        "x-error-codes": [],
+        "responses": {
+          "200": {
+            "description": "可接流量",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadyResponse" },
+                "example": {
+                  "status": "ready",
+                  "checks": {
+                    "postgres": "ok",
+                    "nats": "not_checked",
+                    "valkey": "not_implemented_D4"
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "不可接流量; 编排器应把本实例摘出 Service endpoints",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ReadyResponse" },
+                "example": {
+                  "status": "not_ready",
+                  "checks": {
+                    "postgres": "unreachable",
+                    "nats": "not_checked",
+                    "valkey": "not_implemented_D4"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": ["ops"],
+        "operationId": "metrics",
+        "summary": "Prometheus 文本指标",
+        "description": "Prometheus text exposition format v0.0.4。四个指标:\n\n- `im_ws_broadcast_subscriptions` (gauge) 已订阅广播的连接数\n- `im_events_published_total` (counter) 成功发布并拿到 JetStream ack 的事件数\n- `im_events_publish_failed_total` (counter) 发布失败数; **当前无 DLQ, 这些事件已丢失**\n- `im_events_dropped_total` (counter) 因 `IM_EVENT_PUBLISHER_KIND=stub` 被丢弃数 (配置问题, 非故障)",
+        "x-error-codes": [],
+        "responses": {
+          "200": {
+            "description": "指标文本",
+            "content": {
+              "text/plain": {
+                "schema": { "type": "string" },
+                "example": "# HELP im_ws_broadcast_subscriptions 已订阅 WS 广播的连接数\n# TYPE im_ws_broadcast_subscriptions gauge\nim_ws_broadcast_subscriptions 0\n"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/auth/token/exchange": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "exchangeToken",
+        "summary": "外部身份换取本系统令牌",
+        "description": "无鉴权。把第三方平台身份 (steam / xbox / psn / epic / custom_jwt) 换成本系统的 access + refresh 令牌对。\n\n请求体按原始字节解析; JSON 语法错误或字段缺失均返回 400 `VALIDATION_ERROR`。",
+        "x-error-codes": ["VALIDATION_ERROR", "UNAUTHORIZED", "ACCOUNT_BANNED", "ACCOUNT_SUSPENDED", "ENVIRONMENT_DISABLED", "INTERNAL_ERROR"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/TokenExchangeRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "签发成功",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/v1/auth/guest": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "registerGuest",
+        "summary": "游客注册",
+        "description": "无鉴权。为一个 `environment` 下的设备指纹签发游客身份与令牌对。\n\n`device_fingerprint` 缺省时由服务端生成。",
+        "x-error-codes": ["VALIDATION_ERROR", "ENVIRONMENT_DISABLED", "INTERNAL_ERROR"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/GuestRegisterRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "签发成功",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/v1/auth/refresh": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "refreshToken",
+        "summary": "刷新访问令牌",
+        "description": "无鉴权。用 refresh token 换新的令牌对。refresh token 被吊销 (如已 logout) 或过期时返回 401。",
+        "x-error-codes": ["VALIDATION_ERROR", "UNAUTHORIZED", "INTERNAL_ERROR"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RefreshRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "签发成功",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/v1/auth/link": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "linkAccount",
+        "summary": "游客账号升级绑定",
+        "description": "无鉴权 —— 凭据是请求体里的 `access_token`, 不是 Authorization 头。\n\n把当前游客身份与一个外部平台身份绑定。目标外部身份若已绑定到其他用户, 返回 409 `ACCOUNT_MERGE_CONFLICT` (MVP 不自动合并)。",
+        "x-error-codes": ["VALIDATION_ERROR", "UNAUTHORIZED", "ACCOUNT_MERGE_CONFLICT", "INTERNAL_ERROR"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/LinkAccountRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "绑定成功, 返回升级后的令牌对",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/TokenResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "500": { "$ref": "#/components/responses/InternalError" }
+        }
+      }
+    },
+    "/v1/auth/logout": {
+      "post": {
+        "tags": ["auth"],
+        "operationId": "logout",
+        "summary": "吊销当前设备会话",
+        "description": "需要 Bearer 鉴权。吊销 access token 绑定的 device session, 使该令牌立即失效。\n\n令牌未携带 `dsid` claim (本服务签发前的老令牌, 或非本服务签发) 时返回 401 —— 定位不到会话就不能假装登出成功。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "responses": {
+          "204": { "description": "会话已吊销, 无响应体" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/conversations": {
+      "post": {
+        "tags": ["conversations"],
+        "operationId": "createConversation",
+        "summary": "创建会话",
+        "description": "创建单聊或群。`kind` 接受 `dm` 与 `group`; `channel` / `broadcast` / `system` 在接入侧被拒。\n\n`member_user_ids` 缺省为空数组, `metadata` 缺省为空对象。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "FORBIDDEN", "VALIDATION_ERROR", "USER_BLOCKED", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/CreateConversationRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "已创建",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ConversationResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      },
+      "get": {
+        "tags": ["conversations"],
+        "operationId": "listConversations",
+        "summary": "列举当前用户所在会话",
+        "description": "游标分页。`has_more` 为 true 时 `next_cursor` 可直接作为下一次请求的 `cursor`。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "VALIDATION_ERROR", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "parameters": [
+          { "$ref": "#/components/parameters/Cursor" },
+          { "$ref": "#/components/parameters/ConversationLimit" }
+        ],
+        "responses": {
+          "200": {
+            "description": "会话列表",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ListConversationsResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/conversations/{id}": {
+      "get": {
+        "tags": ["conversations"],
+        "operationId": "getConversation",
+        "summary": "读取会话详情",
+        "description": "非成员读取返回 404 `CONVERSATION_NOT_FOUND` —— 用 404 而非 403, 避免向非成员确认该会话 id 确实存在。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "CONVERSATION_NOT_FOUND", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "parameters": [{ "$ref": "#/components/parameters/ConversationId" }],
+        "responses": {
+          "200": {
+            "description": "会话详情",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ConversationResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/conversations/{id}/members": {
+      "get": {
+        "tags": ["conversations"],
+        "operationId": "listConversationMembers",
+        "summary": "列举会话成员",
+        "description": "调用方必须是成员, 否则 403。返回每个成员的 `role`、`joined_at` 与 `last_read_sequence`。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "FORBIDDEN", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "parameters": [{ "$ref": "#/components/parameters/ConversationId" }],
+        "responses": {
+          "200": {
+            "description": "成员列表",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ListMembersResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/conversations/{id}/read": {
+      "post": {
+        "tags": ["conversations"],
+        "operationId": "markConversationRead",
+        "summary": "上报已读位点",
+        "description": "把调用方在该会话的 `last_read_sequence` 推进到 `sequence`。\n\n提交**更小**的 sequence 是幂等成功而非错误, 返回 `advanced: false`。`sequence` 为负数返回 400。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "FORBIDDEN", "VALIDATION_ERROR", "CONVERSATION_NOT_FOUND", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "parameters": [{ "$ref": "#/components/parameters/ConversationId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MarkReadRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "已读位点处理完毕",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MarkReadResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/conversations/{id}/messages": {
+      "post": {
+        "tags": ["messages"],
+        "operationId": "sendMessage",
+        "summary": "发送消息",
+        "description": "在会话内发一条消息。`idempotency_key` 必填; 同一 `(conversation_id, sender_id, idempotency_key)` 重放返回既有消息, 不重复投递, 也不重复广播。\n\n`content` 的具体形状由 `kind` 决定并**在服务端校验**; 本文件不逐 `kind` 展开, 因为 `ImplementationSpec` 处于 `[PROTOCOL-FROZEN]` 且只给了样例 JSON, 展开即等于发明协议。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "FORBIDDEN", "CONVERSATION_NOT_FOUND", "USER_BLOCKED", "VALIDATION_ERROR", "INVALID_IDEMPOTENCY_KEY", "MESSAGE_TOO_LARGE", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "parameters": [{ "$ref": "#/components/parameters/ConversationId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SendMessageRequest" }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "已发送",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MessageResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      },
+      "get": {
+        "tags": ["messages"],
+        "operationId": "listMessages",
+        "summary": "列举消息",
+        "description": "按 `sequence` 升序的游标分页。`after_sequence` 缺省 0 (从头), `limit` 缺省由服务端决定。\n\n`next_after_sequence` 可直接作为下一次请求的 `after_sequence`。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "FORBIDDEN", "CONVERSATION_NOT_FOUND", "VALIDATION_ERROR", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "parameters": [
+          { "$ref": "#/components/parameters/ConversationId" },
+          { "$ref": "#/components/parameters/AfterSequence" },
+          { "$ref": "#/components/parameters/MessageLimit" }
+        ],
+        "responses": {
+          "200": {
+            "description": "消息列表",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ListMessagesResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/conversations/{id}/messages/{msg_id}": {
+      "patch": {
+        "tags": ["messages"],
+        "operationId": "editMessage",
+        "summary": "编辑消息",
+        "description": "仅**发送者本人**可编辑; 非发送者返回 403。消息不存在或不属于该会话返回 404 (消息与会话 id 不匹配时用 404 而非 403, 避免确认该 id 存在)。\n\n对已撤回消息编辑返回 409 `INVALID_STATE_TRANSITION`。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "FORBIDDEN", "MESSAGE_NOT_FOUND", "INVALID_STATE_TRANSITION", "VALIDATION_ERROR", "MESSAGE_TOO_LARGE", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "parameters": [
+          { "$ref": "#/components/parameters/ConversationId" },
+          { "$ref": "#/components/parameters/MessageId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/EditMessageRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "编辑后的消息",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MessageResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/conversations/{id}/messages/{msg_id}/recall": {
+      "post": {
+        "tags": ["messages"],
+        "operationId": "recallMessage",
+        "summary": "撤回消息",
+        "description": "软删除。超过环境配置 `message.recall_window_seconds` 后返回 409 `RECALL_WINDOW_EXPIRED`; 对已撤回消息再次撤回返回 409 `INVALID_STATE_TRANSITION`。\n\n无请求体。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "FORBIDDEN", "MESSAGE_NOT_FOUND", "INVALID_STATE_TRANSITION", "RECALL_WINDOW_EXPIRED", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "parameters": [
+          { "$ref": "#/components/parameters/ConversationId" },
+          { "$ref": "#/components/parameters/MessageId" }
+        ],
+        "responses": {
+          "200": {
+            "description": "撤回后的消息 (state=recalled)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MessageResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/conversations/{id}/messages/{msg_id}/reactions": {
+      "post": {
+        "tags": ["messages"],
+        "operationId": "addReaction",
+        "summary": "添加表情回应",
+        "description": "调用方必须是该会话成员。同一用户对同一消息加同一表情是幂等的: 首次返回 201, 重复返回 200, 由响应体的 `created` 字段区分。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "FORBIDDEN", "MESSAGE_NOT_FOUND", "VALIDATION_ERROR", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "parameters": [
+          { "$ref": "#/components/parameters/ConversationId" },
+          { "$ref": "#/components/parameters/MessageId" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/AddReactionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "回应已存在 (幂等命中)",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AddReactionResponse" },
+                "example": { "message_id": "3f1b2c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d", "user_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", "emoji": "thumbsup", "created": false }
+              }
+            }
+          },
+          "201": {
+            "description": "回应已创建",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/AddReactionResponse" },
+                "example": { "message_id": "3f1b2c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d", "user_id": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", "emoji": "thumbsup", "created": true }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/friends/requests": {
+      "post": {
+        "tags": ["friends"],
+        "operationId": "sendFriendRequest",
+        "summary": "发起好友申请",
+        "description": "成功一律 204 无响应体 —— 首次创建与幂等重发返回同一个结果, 客户端无需也不应区分两者。\n\n目标已把调用者拉黑返回 403 `USER_BLOCKED`; 已有待处理申请返回 409 `FRIEND_REQUEST_EXISTS`。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "FORBIDDEN", "USER_BLOCKED", "FRIEND_REQUEST_EXISTS", "VALIDATION_ERROR", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SendFriendRequestBody" }
+            }
+          }
+        },
+        "responses": {
+          "204": { "description": "申请已提交或已存在, 无响应体" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": { "$ref": "#/components/responses/Conflict" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/friends/requests/{id}/respond": {
+      "post": {
+        "tags": ["friends"],
+        "operationId": "respondFriendRequest",
+        "summary": "接受或拒绝好友申请",
+        "description": "只有申请接收方可以应答, 否则 403。申请不存在或已被处理返回 404 `FRIEND_REQUEST_NOT_FOUND`。\n\n成功返回 204 无响应体。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "FORBIDDEN", "FRIEND_REQUEST_NOT_FOUND", "VALIDATION_ERROR", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "parameters": [{ "$ref": "#/components/parameters/FriendRequestId" }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RespondFriendRequestBody" }
+            }
+          }
+        },
+        "responses": {
+          "204": { "description": "已应答, 无响应体" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/friends/{id}/block": {
+      "post": {
+        "tags": ["friends"],
+        "operationId": "blockUser",
+        "summary": "拉黑用户",
+        "description": "无请求体。成功后双方的好友关系进入 blocked 状态, 后续互发消息被拒。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "VALIDATION_ERROR", "USER_BLOCKED", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "parameters": [{ "$ref": "#/components/parameters/FriendRequestId" }],
+        "responses": {
+          "204": { "description": "已拉黑, 无响应体" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/me": {
+      "get": {
+        "tags": ["me"],
+        "operationId": "getMe",
+        "summary": "读取当前用户资料",
+        "description": "返回**调用者自己**的资料。\n\n刻意不返回 `password_hash` (argon2id 哈希) 与 `username` (登录凭证, 且 proto `User` 本身就不含该字段)。`external_identity` 在 REST 侧按结构化对象返回, 而非 proto 的 JSON 字符串套 JSON。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "NOT_FOUND", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "responses": {
+          "200": {
+            "description": "当前用户资料",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MeResponse" }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      },
+      "patch": {
+        "tags": ["me"],
+        "operationId": "updateMe",
+        "summary": "更新当前用户资料",
+        "description": "只接受 `display_name`。**目标用户 id 不来自请求体** —— 取自 access token claims, 否则客户端可改他人资料。\n\n`display_name` 缺省表示本次不改动。返回**更新后**的实体, 客户端一次往返即可拿到新值。",
+        "security": [{ "bearerAuth": [] }],
+        "x-error-codes": ["UNAUTHORIZED", "NOT_FOUND", "VALIDATION_ERROR", "INTERNAL_ERROR", "SERVICE_UNAVAILABLE"],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/UpdateMeBody" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "更新后的资料",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/MeResponse" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "500": { "$ref": "#/components/responses/InternalError" },
+          "503": { "$ref": "#/components/responses/ServiceUnavailable" }
+        }
+      }
+    },
+    "/v1/ws": {
+      "get": {
+        "tags": ["realtime"],
+        "operationId": "openWebSocket",
+        "summary": "WebSocket 升级握手",
+        "description": "把本连接升级为 WebSocket。**不返回 REST 响应体**, 故本 operation 的 101 响应无 content。\n\n鉴权不在握手阶段: 连接建立后客户端必须发送**第一帧** `{\"type\":\"auth\",\"access_token\":\"<access token>\"}`, 服务端校验通过后回 `{\"type\":\"auth_ok\"}`。未鉴权前只接受 Auth 帧。\n\n路径以代码既有意图取 `/v1/ws`; 文档对 WS 路径本身有分歧 (`aux-13` 与 `Observability.md §1.1.3` 写 `/ws`), 见 `docs/gap-ledger.md` §1.22 待规范所有者裁决。",
+        "x-error-codes": ["UNAUTHORIZED", "FORBIDDEN", "NOT_FOUND", "RATE_LIMITED"],
+        "responses": {
+          "101": { "description": "协议切换成功; 后续交互以 WebSocket 帧进行" }
+        },
+        "x-websocket": {
+          "authFrame": { "type": "auth", "access_token": "string" },
+          "authOkFrame": { "type": "auth_ok" },
+          "note": "帧协议未建模为 OpenAPI; OpenAPI 3.1 无原生 WebSocket 支持。"
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "bearerAuth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT",
+        "description": "本服务签发的 access token。令牌绑定一个 device session (`dsid` claim), `/v1/auth/logout` 靠它吊销会话。"
+      }
+    },
+    "parameters": {
+      "ConversationId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "会话 id",
+        "schema": { "type": "string", "format": "uuid" },
+        "example": "6c1b2a39-7d4e-4f2a-9b8c-1d2e3f4a5b6c"
+      },
+      "MessageId": {
+        "name": "msg_id",
+        "in": "path",
+        "required": true,
+        "description": "消息 id",
+        "schema": { "type": "string", "format": "uuid" },
+        "example": "3f1b2c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+      },
+      "FriendRequestId": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "好友申请 id, 或 `block` 目标的用户 id",
+        "schema": { "type": "string", "format": "uuid" },
+        "example": "9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d"
+      },
+      "Cursor": {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "description": "游标, 取自上一次响应的 `next_cursor`",
+        "schema": { "type": "string" }
+      },
+      "ConversationLimit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "单页条数上限",
+        "schema": { "type": "integer", "format": "int32", "minimum": 1 }
+      },
+      "AfterSequence": {
+        "name": "after_sequence",
+        "in": "query",
+        "required": false,
+        "description": "只返回 `sequence` 严格大于此值的消息; 缺省 0",
+        "schema": { "type": "integer", "format": "int64", "minimum": 0, "default": 0 }
+      },
+      "MessageLimit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "单页条数上限",
+        "schema": { "type": "integer", "format": "int32", "minimum": 1 }
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "请求体或参数校验失败",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+            "example": { "code": "VALIDATION_ERROR", "message": "error", "trace_id": "b0a1c2d3-e4f5-4a6b-8c9d-0e1f2a3b4c5d", "ts": 1759660800000, "conversation_id": null }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "缺少、签名错误或过期的 access token",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+            "example": { "code": "UNAUTHORIZED", "message": "error", "trace_id": "b0a1c2d3-e4f5-4a6b-8c9d-0e1f2a3b4c5d", "ts": 1759660800000, "conversation_id": null }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "资源存在但调用方无权限 (如非会话成员、被拉黑、账号封禁)",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+            "example": { "code": "FORBIDDEN", "message": "not a member of this conversation", "trace_id": "b0a1c2d3-e4f5-4a6b-8c9d-0e1f2a3b4c5d", "ts": 1759660800000, "conversation_id": "6c1b2a39-7d4e-4f2a-9b8c-1d2e3f4a5b6c" }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "资源不存在; 对非成员, 用本码而非 403 以免确认该 id 存在",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+            "example": { "code": "CONVERSATION_NOT_FOUND", "message": "error", "trace_id": "b0a1c2d3-e4f5-4a6b-8c9d-0e1f2a3b4c5d", "ts": 1759660800000, "conversation_id": "6c1b2a39-7d4e-4f2a-9b8c-1d2e3f4a5b6c" }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "与当前状态冲突 (幂等键复用、状态机非法转换、撤回窗过期、好友申请已存在)",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+            "example": { "code": "INVALID_STATE_TRANSITION", "message": "error", "trace_id": "b0a1c2d3-e4f5-4a6b-8c9d-0e1f2a3b4c5d", "ts": 1759660800000, "conversation_id": null }
+          }
+        }
+      },
+      "PayloadTooLarge": {
+        "description": "`content` 序列化后超过 64KB 上限",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+            "example": { "code": "MESSAGE_TOO_LARGE", "message": "error", "trace_id": "b0a1c2d3-e4f5-4a6b-8c9d-0e1f2a3b4c5d", "ts": 1759660800000, "conversation_id": null }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "服务端内部错误; 可重试",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+            "example": { "code": "INTERNAL_ERROR", "message": "internal error", "trace_id": "b0a1c2d3-e4f5-4a6b-8c9d-0e1f2a3b4c5d", "ts": 1759660800000, "conversation_id": null }
+          }
+        }
+      },
+      "ServiceUnavailable": {
+        "description": "依赖服务不可用 (PG / NATS / Valkey); 客户端应指数退避重试",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/ErrorResponse" },
+            "example": { "code": "SERVICE_UNAVAILABLE", "message": "token service not configured", "trace_id": "b0a1c2d3-e4f5-4a6b-8c9d-0e1f2a3b4c5d", "ts": 1759660800000, "conversation_id": null }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "ErrorResponse": {
+        "type": "object",
+        "description": "统一错误信封。`code` 的取值域是 aux-03 §B 的 21 项。",
+        "required": ["code", "message", "trace_id", "ts"],
+        "properties": {
+          "code": { "type": "string", "description": "错误码, 与 aux-03 §B 一致", "examples": ["UNAUTHORIZED", "VALIDATION_ERROR", "INTERNAL_ERROR"] },
+          "message": { "type": "string", "description": "i18n key 或简短说明" },
+          "trace_id": { "type": "string", "format": "uuid", "description": "服务端生成的追踪 id, 排障时与日志对齐" },
+          "ts": { "type": "integer", "format": "int64", "description": "毫秒级 unix 时间戳" },
+          "conversation_id": { "type": ["string", "null"], "format": "uuid", "description": "出错时所属会话; 与本错误无关时为 null" }
+        },
+        "additionalProperties": false
+      },
+      "TokenResponse": {
+        "type": "object",
+        "required": ["access_token", "refresh_token", "user_id", "expires_in", "device_session_id"],
+        "properties": {
+          "access_token": { "type": "string", "description": "访问令牌, 放 Authorization: Bearer 头" },
+          "refresh_token": { "type": "string", "description": "刷新令牌, 只用于 /v1/auth/refresh 与 /v1/auth/link" },
+          "user_id": { "type": "string", "format": "uuid" },
+          "expires_in": { "type": "integer", "format": "int64", "description": "access token 剩余有效期, 秒" },
+          "device_session_id": { "type": "string", "format": "uuid", "description": "本次签发绑定的设备会话; logout 靠它吊销" }
+        },
+        "additionalProperties": false
+      },
+      "TokenExchangeRequest": {
+        "type": "object",
+        "required": ["environment_id", "external_provider", "external_uid"],
+        "properties": {
+          "environment_id": { "type": "string", "format": "uuid" },
+          "external_provider": { "type": "string", "description": "外部身份提供方", "examples": ["steam", "xbox", "psn", "epic", "custom_jwt"] },
+          "external_uid": { "type": "string", "description": "该提供方侧的用户标识" },
+          "display_name": { "type": ["string", "null"], "description": "首次创建时写入的展示名; 缺省为 null" }
+        },
+        "additionalProperties": false
+      },
+      "GuestRegisterRequest": {
+        "type": "object",
+        "required": ["environment_id"],
+        "properties": {
+          "environment_id": { "type": "string", "format": "uuid" },
+          "device_fingerprint": { "type": ["string", "null"], "description": "设备指纹; 缺省时由服务端生成" }
+        },
+        "additionalProperties": false
+      },
+      "RefreshRequest": {
+        "type": "object",
+        "required": ["refresh_token"],
+        "properties": {
+          "refresh_token": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "LinkAccountRequest": {
+        "type": "object",
+        "required": ["access_token", "external_provider", "external_uid"],
+        "properties": {
+          "access_token": { "type": "string", "description": "当前游客身份的 access token; 本端点不用 Authorization 头" },
+          "external_provider": { "type": "string", "examples": ["steam", "xbox", "psn", "epic", "custom_jwt"] },
+          "external_uid": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "CreateConversationRequest": {
+        "type": "object",
+        "required": ["kind"],
+        "properties": {
+          "kind": { "type": "string", "enum": ["dm", "group"], "description": "channel / broadcast 在接入侧被拒" },
+          "member_user_ids": { "type": "array", "items": { "type": "string", "format": "uuid" }, "default": [] },
+          "metadata": { "type": "object", "default": {}, "additionalProperties": true }
+        },
+        "additionalProperties": false
+      },
+      "ConversationResponse": {
+        "type": "object",
+        "required": ["id", "environment_id", "kind", "metadata", "created_at"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "environment_id": { "type": "string", "format": "uuid" },
+          "kind": { "type": "string", "enum": ["dm", "group", "channel", "system", "broadcast"] },
+          "metadata": { "type": "object", "additionalProperties": true },
+          "created_at": { "type": "string", "format": "date-time" }
+        },
+        "additionalProperties": false
+      },
+      "ListConversationsResponse": {
+        "type": "object",
+        "required": ["conversations", "has_more"],
+        "properties": {
+          "conversations": { "type": "array", "items": { "$ref": "#/components/schemas/ConversationResponse" } },
+          "next_cursor": { "type": "string", "description": "下一页游标; has_more 为 false 时不出现" },
+          "has_more": { "type": "boolean" }
+        },
+        "additionalProperties": false
+      },
+      "SendMessageRequest": {
+        "type": "object",
+        "required": ["kind", "content", "idempotency_key"],
+        "properties": {
+          "kind": { "type": "string", "description": "消息类型标识", "examples": ["text"] },
+          "content": { "type": "object", "additionalProperties": true, "description": "消息载荷, 形状由 kind 决定并在服务端校验", "examples": [{ "kind": "text", "text": "hi" }] },
+          "reply_to": { "type": ["string", "null"], "format": "uuid", "description": "被回复的消息 id; 缺省为 null" },
+          "idempotency_key": { "type": "string", "description": "客户端生成的幂等键; 同一三元组重放返回既有消息" }
+        },
+        "additionalProperties": false
+      },
+      "MessageResponse": {
+        "type": "object",
+        "required": ["id", "conversation_id", "sequence", "sender_id", "kind", "content", "state", "created_at"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "conversation_id": { "type": "string", "format": "uuid" },
+          "sequence": { "type": "integer", "format": "int64", "description": "会话内单调递增序号" },
+          "sender_id": { "type": ["string", "null"], "format": "uuid" },
+          "kind": { "type": "string" },
+          "content": { "type": "object", "additionalProperties": true },
+          "reply_to": { "type": "string", "format": "uuid", "description": "被回复的消息 id; 无回复时不出现" },
+          "state": { "type": "string", "enum": ["sent", "delivered", "read", "recalled", "deleted"] },
+          "created_at": { "type": "string", "format": "date-time" },
+          "edited_at": { "type": "string", "format": "date-time", "description": "编辑时间; 未编辑过时不出现" }
+        },
+        "additionalProperties": false
+      },
+      "ListMessagesResponse": {
+        "type": "object",
+        "required": ["messages", "has_more", "next_after_sequence"],
+        "properties": {
+          "messages": { "type": "array", "items": { "$ref": "#/components/schemas/MessageResponse" } },
+          "has_more": { "type": "boolean" },
+          "next_after_sequence": { "type": "integer", "format": "int64", "description": "直接作为下一次请求的 after_sequence" }
+        },
+        "additionalProperties": false
+      },
+      "EditMessageRequest": {
+        "type": "object",
+        "required": ["content"],
+        "properties": {
+          "content": { "type": "object", "additionalProperties": true, "description": "新的消息载荷" }
+        },
+        "additionalProperties": false
+      },
+      "AddReactionRequest": {
+        "type": "object",
+        "required": ["emoji"],
+        "properties": {
+          "emoji": { "type": "string", "description": "表情标识", "examples": ["thumbsup"] }
+        },
+        "additionalProperties": false
+      },
+      "AddReactionResponse": {
+        "type": "object",
+        "required": ["message_id", "user_id", "emoji", "created"],
+        "properties": {
+          "message_id": { "type": "string", "format": "uuid" },
+          "user_id": { "type": "string", "format": "uuid" },
+          "emoji": { "type": "string" },
+          "created": { "type": "boolean", "description": "true=本次新建(201); false=幂等命中已存在的回应(200)" }
+        },
+        "additionalProperties": false
+      },
+      "MarkReadRequest": {
+        "type": "object",
+        "required": ["sequence"],
+        "properties": {
+          "sequence": { "type": "integer", "format": "int64", "minimum": 0, "description": "已读到的消息序号; 负数返回 400" }
+        },
+        "additionalProperties": false
+      },
+      "MarkReadResponse": {
+        "type": "object",
+        "required": ["conversation_id", "last_read_sequence", "advanced"],
+        "properties": {
+          "conversation_id": { "type": "string", "format": "uuid" },
+          "last_read_sequence": { "type": "integer", "format": "int64", "description": "推进后的当前位点" },
+          "advanced": { "type": "boolean", "description": "true=本次确实推进; false=提交的位点不高于现有值(幂等成功)" }
+        },
+        "additionalProperties": false
+      },
+      "SendFriendRequestBody": {
+        "type": "object",
+        "required": ["recipient_id"],
+        "properties": {
+          "recipient_id": { "type": "string", "format": "uuid" }
+        },
+        "additionalProperties": false
+      },
+      "RespondFriendRequestBody": {
+        "type": "object",
+        "required": ["accept"],
+        "properties": {
+          "accept": { "type": "boolean", "description": "true=接受, false=拒绝" }
+        },
+        "additionalProperties": false
+      },
+      "MeResponse": {
+        "type": "object",
+        "description": "调用者自身资料。刻意不含 password_hash 与 username。",
+        "required": ["id", "environment_id", "kind", "state", "created_at"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "environment_id": { "type": "string", "format": "uuid" },
+          "kind": { "type": "string", "enum": ["user", "guest"] },
+          "external_identity": { "$ref": "#/components/schemas/ExternalIdentity", "description": "未绑定外部身份时不出现" },
+          "state": { "type": "string", "enum": ["active", "banned", "suspended", "deleted"] },
+          "display_name": { "type": "string", "description": "为 null 时不出现" },
+          "created_at": { "type": "string", "format": "date-time" }
+        },
+        "additionalProperties": false
+      },
+      "ExternalIdentity": {
+        "type": "object",
+        "required": ["provider", "external_uid"],
+        "properties": {
+          "provider": { "type": "string", "examples": ["steam", "xbox", "psn", "epic", "custom_jwt"] },
+          "external_uid": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "UpdateMeBody": {
+        "type": "object",
+        "properties": {
+          "display_name": { "type": ["string", "null"], "description": "缺省表示本次不改动" }
+        },
+        "additionalProperties": false
+      },
+      "MemberDto": {
+        "type": "object",
+        "required": ["user_id", "role", "joined_at", "last_read_sequence"],
+        "properties": {
+          "user_id": { "type": "string", "format": "uuid" },
+          "role": { "type": "string", "enum": ["owner", "admin", "member"] },
+          "joined_at": { "type": "string", "format": "date-time" },
+          "last_read_sequence": { "type": "integer", "format": "int64" }
+        },
+        "additionalProperties": false
+      },
+      "ListMembersResponse": {
+        "type": "object",
+        "required": ["conversation_id", "members"],
+        "properties": {
+          "conversation_id": { "type": "string", "format": "uuid" },
+          "members": { "type": "array", "items": { "$ref": "#/components/schemas/MemberDto" } }
+        },
+        "additionalProperties": false
+      },
+      "HealthResponse": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "type": "string", "const": "ok" }
+        },
+        "additionalProperties": false
+      },
+      "ReadyResponse": {
+        "type": "object",
+        "required": ["status", "checks"],
+        "properties": {
+          "status": { "type": "string", "enum": ["ready", "not_ready"] },
+          "checks": {
+            "type": "object",
+            "description": "逐依赖结果; 未检查的依赖显式列出, 避免「没提到」被读成「查过且通过」。",
+            "required": ["postgres", "nats", "valkey"],
+            "properties": {
+              "postgres": { "type": "string", "enum": ["ok", "unreachable", "timeout"] },
+              "nats": { "type": "string", "enum": ["not_checked"] },
+              "valkey": { "type": "string", "enum": ["not_implemented_D4"] }
+            },
+            "additionalProperties": false
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  }
+}

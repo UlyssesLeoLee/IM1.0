@@ -2198,6 +2198,111 @@ stream 的消息计数确实增加了」, 这比「订阅者收到了」更强(�
 - `crates/im-gateway/src/health.rs` (3 个指标 + readyz 取值)
 - `.github/workflows/ci.yml` (integration job 的 NATS 步骤)
 
+### 1.28 OpenAPI 3.1 规范 + 漂移门禁 (2026-10-05 落地, 用户选 A)
+
+#### 落地前的状态
+
+全仓**没有任何** OpenAPI / AsyncAPI 文件。对外契约只有 `core.proto`, 接入方
+必须读 `crates/im-gateway/src/http/*.rs` 的 DTO 才能知道: 有哪些端点、每个收
+什么字段、成功返回什么、失败返回哪个错误码。proto 描述的是 gRPC 面, 与 HTTP
+面不是同一套形状(例: proto 的 `User` 没有 HTTP 侧 `MeResponse` 刻意剔除
+`password_hash` 的那层约束)。对「主要用于集成」的工具, 这是最硬的接入障碍。
+
+#### 交付物
+
+- `docs/api/openapi.json` —— OpenAPI **3.1.0**, 21 个 path / 24 个 operation /
+  26 个 schema。请求与响应 schema 的字段集**逐个**取自 Rust 的 `serde` DTO,
+  不取自 aux-13 的样例 JSON(`ImplementationSpec` 处于 `[PROTOCOL-FROZEN]`,
+  样例与代码冲突处以代码为准)。
+- `scripts/check-openapi.ps1` —— 漂移门禁, 接入 `ci.yml` 的 `sast` job。
+- 字段来源与「刻意不返回的字段」逐条写进了 `me.rs` 的模块文档, 规范里的
+  `description` 复述了同一批理由。
+
+#### 门禁实际检查什么(五项)
+
+1. **路由双向比对**: 从 `main.rs` / `http/mod.rs` / `ws/router.rs` 重新推导
+   路由表, 与规范双向比对 —— 规范有而代码没有、代码有而规范没有, 都会红。
+2. **错误码**: 规范 `x-error-codes` 里每个取值必须存在于 aux-03 §B(21 项),
+   且 21 项中没有被任何 operation 漏引(有理由的豁免见下)。
+3. **operationId** 存在且唯一。
+4. **所有 `$ref` 可解析**; 禁止 `TODO` / `待定` / `example.com` 一类占位符。
+5. **每个 bearer 保护的 operation 必须声明 503 且引用 `SERVICE_UNAVAILABLE`**。
+
+第 5 项是门禁**自己发现**的真缺口, 不是预防性检查: `crates/im-gateway/src/
+http/auth.rs:66` 在 token service 未配置时, 对**任何**已鉴权请求都返回
+`json_response(ServiceUnavailable, ...)`。这条路径独立于各 handler, 原先
+没有任何文档提到它。补之前 16 个受保护端点全部漏写 503。
+
+#### `IDEMPOTENCY_CONFLICT` 为何豁免(不是漏检)
+
+aux-03 第 93 行明写该码 REST 侧返 **HTTP 200** 并回带原 `message_id`,
+WS 侧返 `ack.ok=true`; 同一文件第 167 行的样例代码直接
+`throw new Error("internal: IDEMPOTENCY_CONFLICT on 200")`。也就是说客户端
+**收到**这个码就意味着实现有 bug。把它写进某个 operation 的错误码列表,
+等于文档化一个规范禁止的响应。豁免名单手工钉住并断言(条目数必须为 1),
+且每项必须仍存在于 aux-03 —— 若 aux-03 把它改名, 门禁会红而不是默默放过。
+
+#### 路由解析为什么用括号深度栈
+
+actix 的 `scope("X")` 只在**它所在的括号组**内有效, 但源码是流式链式调用,
+文本上看不出边界。用「最后一个 scope 胜出」的纯文本扫描会恰好把这件事做反:
+
+```rust
+.service(web::scope("/v1").configure(http::configure))   // /v1 在此闭合
+.route("/healthz", web::get().to(health::healthz))        // 不该继承 /v1
+```
+
+所以实现为: 预先算出每个字符偏移处的括号深度, `scope("X")` 入栈时记下当前
+深度, 当深度回落到该值**以下**时出栈。纯文本扫描会把这个 `/healthz` 归到
+`/v1` 下, 而实际它是根级端点。
+
+#### 判别力实测: 18 个变异用例 0 失败
+
+| 组 | 数量 | 内容 |
+|---|---|---|
+| 对照组 | 1 | 未变异必须绿(证明红的是变异造成的) |
+| 注入缺陷 | 12 | 删/加/改规范路径、删/改代码路由、换 HTTP 方法、把路由挪进别的 scope、重复 operationId、引用不存在的错误码、占位符、悬空 `$ref`、删 `x-error-codes`、删 503 行、出现第二个 `configure` 委托 |
+| 解析退化 | 1 | JSON 坏掉必须 `exit 2` 而不是当成通过 |
+| 反例守卫 | 3 | 注释里的不平衡括号、注释里的 `//`、长得像路由的字符串 —— 都**不得**让门禁变红 |
+
+源文件改前改后 SHA256 三份全部一致, 还原干净。
+
+#### 开发过程中门禁自身暴露的 4 个缺陷(均已修)
+
+1. **括号深度只在 match 之间统计**, 而正则本身吞掉了 `scope(...)` 与
+   `web::post()` 的括号, 导致 `.route(` 的左括号被算成多余右括号, 活着的
+   scope 被提前弹出 —— `/auth` 的 5 条路由丢了 4 条前缀。改为全量统计。
+2. **HTTP 方法用 400 字符窗口回溯查找**, 会匹配到**下一条**路由的动词,
+   造成静默串号。改为单条正则同时捕获 path 与 verb。
+3. **注释里的孤立 `)` 破坏括号平衡**(`http/mod.rs` 就有), 必须先中和注释;
+   但第一版把字符串内容也一并清空, 导致委托检测读到 `scope("")` 找不到任何
+   委托。最终版用单次左到右的 alternation: 块注释丢弃、行注释丢弃、
+   字符串**保留内容**只把括号换成空格。
+4. **aux-03 正则缺 `(?m)`**, `^` 只锚在字符串开头, 21 个错误码解析成 0。
+
+外加一处自身笔误: 改 `x-error-codes` 读取方式时漏写 `$op = $specOps[$k]`,
+导致 24 个 operation 全读成同一个(哈希表最后一个), 报出 17 个「未被引用」
+的错误码。
+
+#### 仍未做(诚实声明)
+
+- **AsyncAPI 缺失**: WS 帧协议(`im_protocol::ws_frames`)无机器可读描述。
+  `/v1/ws` 在 OpenAPI 里只登记了 101 握手与首帧 `auth` 的形状, 6 类业务帧
+  未建模 —— OpenAPI 3.1 无原生 WebSocket 支持。
+- **`content` 未按 `kind` 展开**: 各 `kind` 的载荷 schema 在服务端校验,
+  但 `ImplementationSpec` 冻结且只给样例, 展开即等于发明协议, 故只声明为
+  自由对象并在 `description` 里写明「服务端为准」。
+- **`GET /v1/friends` 仍不在规范里**: 它在代码中本就未注册(aux-13 说返
+  `repeated Friend`、proto 说 `repeated User`, 矛盾未裁决), 见 §1.16。
+- **媒体端点缺失**: `POST /v1/media/presign` / `GET /v1/media/{id}` 依赖
+  对象存储, 未落地, 故既不在代码也不在规范, 见 §1.16。
+
+#### 位置
+
+- `docs/api/openapi.json` (规范)
+- `scripts/check-openapi.ps1` (门禁)
+- `.github/workflows/ci.yml` (sast job 的 `check OpenAPI drift` 步骤)
+
 ---
 
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)

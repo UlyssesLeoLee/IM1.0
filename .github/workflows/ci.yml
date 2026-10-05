@@ -279,6 +279,37 @@ jobs:
         # 双向各报一条并 exit 1。
         shell: pwsh
         run: pwsh -NoProfile -File ./scripts/check-error-codes.ps1
+      - name: check OpenAPI drift (spec vs routes)
+        # 2026-10-05 新增。此前全仓**没有任何** OpenAPI/AsyncAPI 文件 ——
+        # 对外只有 core.proto, 接入方要自己读代码才能知道有哪些端点、各自
+        # 收什么字段、失败时返回哪个错误码。
+        #
+        # 现补 docs/api/openapi.json (3.1.0) + 本漂移门禁。门禁做五件事:
+        #   1. 从 main.rs / http/mod.rs / ws/router.rs 重新推导路由表, 与规范
+        #      **双向**比对 (规范有而代码没有 / 代码有而规范没有, 都会红)
+        #   2. 规范引用的每个错误码必须存在于 aux-03 §B(21 项权威表, 已由
+        #      上一个步骤钉到 im_common::ErrorCode 枚举)
+        #   3. operationId 必须存在且唯一
+        #   4. 所有 $ref 必须可解析; 禁止 TODO/待定/example.com 一类占位符
+        #   5. 每个 bearer 保护的 operation 必须声明 503 并引用
+        #      SERVICE_UNAVAILABLE —— http/auth.rs 在 token service 未配置时
+        #      对**任何**已鉴权请求都会返 503, 那条路径独立于 handler
+        #
+        # 路由解析用括号深度栈: scope("X") 在其所在括号组闭合后失效。这让
+        # `.service(web::scope("/v1").configure(http::configure))` 之后的
+        # `.route("/healthz", ...)` 不会错误继承 /v1 前缀 —— 而"最后一个
+        # scope 胜出"的纯文本扫描恰好会把这件事做反。
+        #
+        # 判别力已用变异测试证明: 18 个用例 0 失败 —— 1 个对照组(未变异必须绿)、
+        # 12 个注入缺陷(删/加/改路径、换方法、移 scope、重复 operationId、
+        # 引用不存在的错误码、占位符、悬空 $ref、删 x-error-codes、删 503、
+        # 出现第二个 configure 委托)、1 个解析退化(JSON 坏掉必须 exit 2
+        # 而不是当成通过)、3 个反例守卫(注释里的不平衡括号、注释里的 //、
+        # 长得像路由的字符串, 都**不得**让门禁变红)。
+        #
+        # 纯 PowerShell, 不需要 cargo, 故与上面的 aux-03 检查并列。
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/check-openapi.ps1
       - name: semgrep
         # 2026-10-04 换掉 `uses: returntocorp/semgrep-action@v1`。
         #
