@@ -1,0 +1,817 @@
+{
+  "asyncapi": "3.0.0",
+  "info": {
+    "title": "IM1.0 WebSocket 帧协议",
+    "version": "0.1.0",
+    "description": "IM1.0 的 WebSocket(`/v1/ws`)上行与下行帧的机器可读描述。HTTP 面见同目录的 `openapi.json`。\n\n## 字段从哪来: 以 serde 实现为准, 不以文档样例为准\n\n本文件的**每一个字段名、可空性、必填性**都逐条取自 `crates/im-protocol/src/ws_frames.rs`、`content.rs`、`error_body.rs` 的 `serde` 派生, **不取自** aux-13 的样例 JSON。原因是本项目 `ImplementationSpec` 处于 `[PROTOCOL-FROZEN]`, 其样例与代码多处冲突; 且样例只给样例, 不给字段表。本文件的选择一律是「代码事实优先」, 与 `openapi.json` 同一口径。\n\n## `required` 的含义是「wire 上一定出现」, 不是「Rust 里有这个字段」\n\n这是读本文件最容易踩的坑, 故显式声明。serde 里 `Option<T>` 有三种截然不同的行为, 直接决定该字段在 JSON 里**是 `null` 还是整个 key 消失**:\n\n1. **无任何属性** —— 恒序列化。`None` 时输出 `\"field\": null`。→ 本文件标为 `required` 且类型含 `\"null\"`。\n2. **仅 `#[serde(default)]`** —— 恒序列化(同上)。`default` 只影响**反序列化**时的可省略性, **不影响**序列化。→ 同样标为 `required` 且类型含 `\"null\"`。\n3. **`#[serde(default, skip_serializing_if = \"...\")]`** —— `None`/`false` 时**整个 key 不出现**。→ 本文件**不**标为 `required`, 类型不含 `null`。\n\n最容易写错的是第 2 条: 很多人以为 `default` 会让字段可省略, 于是标成非必填 —— 那是在描述一个服务端**永远不会发出**的形状。\n\n## 未知字段被静默忽略\n\n`im-protocol` 全库无 `deny_unknown_fields`, 所以 `{\"type\":\"send_message\", ..., \"typo_field\": 1}` **会被接受**。本文件因此把所有 schema 的 `additionalProperties` 显式设为 `true` 而**不是** `false` —— 标成 `false` 会让严格校验的客户端拒掉服务端实际接受的帧, 那是比不校验更坏的误导。\n\n## 与 REST 错误信封形状不同(易踩)\n\n同一个「错误体」在两条通道上**字段集不同**, 不是笔误:\n\n| 通道 | 字段 | 差异 |\n|---|---|---|\n| REST(`http/error_response.rs::json_response`) | `code` `message` `trace_id` `ts` `conversation_id` | 有 `conversation_id`(恒出现, 可为 null); **无** `details` |\n| WS(`im_protocol::error_body::ErrorBody`) | `code` `message` `trace_id` `ts` `details` | 有 `details`(空时 key 消失); **无** `conversation_id` |\n\n两条通道都复用 aux-03 §B 的错误码取值域。\n\n## 已知偏差: `auth_ok` 不在 `ServerFrame` 枚举里\n\n鉴权成功后服务端回 `{\"type\":\"auth_ok\",\"req_id\":...}`, 它由 `crates/im-gateway/src/ws/handler.rs:381` 的裸 `serde_json::json!` 构造, **不属于** `ServerFrame` 任何变体, 也不在 aux-13 §1.2 的任何小节里(§1.2.1 规定的是 `connected`)。本文件按代码事实把它登记为 `ServerAuthOk` 并标注 `x-im-spec-status: undeclared`, 但**不**替规范所有者裁决它是否应当是 `connected`。详见 `docs/gap-ledger.md` §1.8.2。\n\n`connected` 变体本身在枚举中存在, 但 im-gateway 生产代码**从不发送**它(只有 `im-testkit` 的 mock server 用), 故标注为保留未发出。"
+  },
+  "servers": {
+    "production": {
+      "host": "localhost:8080",
+      "protocol": "ws",
+      "description": "WebSocket 端点。**升级时不带鉴权凭证** —— 鉴权是连接建立后的**第一帧** `auth`(见 `ClientAuth`)。若在 HTTP upgrade 阶段就要求 Bearer, 客户端会拿到一个永远等不到 `auth_ok` 的连接。",
+      "bindings": {
+        "ws": {
+          "method": "GET",
+          "bindingVersion": "0.2.0"
+        }
+      }
+    }
+  },
+  "channels": {
+    "ws": {
+      "address": "/v1/ws",
+      "title": "IM 实时通道",
+      "description": "单一 WebSocket 通道承载全部双向帧。无 per-topic 子通道。\n\n## 心跳\n\n客户端每 30s 内至少发一帧(任意业务帧或 `ping`)。服务端 `no_frame_timeout` 为 60s, 超时关闭连接。心跳帧为 `ping` / `pong`。\n\n## 路径待裁决\n\naux-13 的 wscat 样例写 `/ws`, 而 `ImplementationSpec §3.2` 与 `ws/router.rs` 写 `/v1/ws`。本文件取代码既有的 `/v1/ws`。若规范所有者改判为 `/ws`, 改 `ws/router.rs` 一行即可。见 `docs/gap-ledger.md` §1.22。",
+      "messages": {
+        "clientAuth": { "$ref": "#/components/messages/clientAuth" },
+        "clientSendMessage": { "$ref": "#/components/messages/clientSendMessage" },
+        "clientEditMessage": { "$ref": "#/components/messages/clientEditMessage" },
+        "clientRecallMessage": { "$ref": "#/components/messages/clientRecallMessage" },
+        "clientReact": { "$ref": "#/components/messages/clientReact" },
+        "clientMarkRead": { "$ref": "#/components/messages/clientMarkRead" },
+        "clientTyping": { "$ref": "#/components/messages/clientTyping" },
+        "clientPing": { "$ref": "#/components/messages/clientPing" },
+        "serverAuthOk": { "$ref": "#/components/messages/serverAuthOk" },
+        "serverAck": { "$ref": "#/components/messages/serverAck" },
+        "serverMessageNew": { "$ref": "#/components/messages/serverMessageNew" },
+        "serverMessageRecalled": { "$ref": "#/components/messages/serverMessageRecalled" },
+        "serverTyping": { "$ref": "#/components/messages/serverTyping" },
+        "serverPong": { "$ref": "#/components/messages/serverPong" },
+        "serverMessageEdited": { "$ref": "#/components/messages/serverMessageEdited" },
+        "serverReactionAdded": { "$ref": "#/components/messages/serverReactionAdded" },
+        "serverPresenceUpdate": { "$ref": "#/components/messages/serverPresenceUpdate" },
+        "serverForceDisconnect": { "$ref": "#/components/messages/serverForceDisconnect" },
+        "serverConnected": { "$ref": "#/components/messages/serverConnected" }
+      }
+    }
+  },
+  "operations": {
+    "clientToServer": {
+      "action": "send",
+      "title": "客户端 → 服务端",
+      "description": "连接建立后客户端发出的全部帧。**第一帧必须是 `auth`**, 否则连接会被以 `VALIDATION_ERROR` 关闭。",
+      "channel": { "$ref": "#/channels/ws" },
+      "messages": [
+        { "$ref": "#/channels/ws/messages/clientAuth" },
+        { "$ref": "#/channels/ws/messages/clientSendMessage" },
+        { "$ref": "#/channels/ws/messages/clientEditMessage" },
+        { "$ref": "#/channels/ws/messages/clientRecallMessage" },
+        { "$ref": "#/channels/ws/messages/clientReact" },
+        { "$ref": "#/channels/ws/messages/clientMarkRead" },
+        { "$ref": "#/channels/ws/messages/clientTyping" },
+        { "$ref": "#/channels/ws/messages/clientPing" }
+      ]
+    },
+    "serverToClient": {
+      "action": "receive",
+      "title": "服务端 → 客户端",
+      "description": "服务端下行的全部帧。`serverAuthOk` 之后的帧才带业务载荷。\n\n注意: 本列表里 5 个帧类型当前**不会被生产代码发出**(见各消息的 `x-im-implementation-status`)。它们登记在此是为了让接入方知道协议预留了这些形状, 而不是为了让人去等它们。",
+      "channel": { "$ref": "#/channels/ws" },
+      "messages": [
+        { "$ref": "#/channels/ws/messages/serverAuthOk" },
+        { "$ref": "#/channels/ws/messages/serverAck" },
+        { "$ref": "#/channels/ws/messages/serverMessageNew" },
+        { "$ref": "#/channels/ws/messages/serverMessageRecalled" },
+        { "$ref": "#/channels/ws/messages/serverTyping" },
+        { "$ref": "#/channels/ws/messages/serverPong" },
+        { "$ref": "#/channels/ws/messages/serverMessageEdited" },
+        { "$ref": "#/channels/ws/messages/serverReactionAdded" },
+        { "$ref": "#/channels/ws/messages/serverPresenceUpdate" },
+        { "$ref": "#/channels/ws/messages/serverForceDisconnect" },
+        { "$ref": "#/channels/ws/messages/serverConnected" }
+      ]
+    }
+  },
+  "components": {
+    "messages": {
+      "clientAuth": {
+        "name": "auth",
+        "title": "ClientFrame::Auth",
+        "summary": "WS 鉴权(连接后的第一帧)",
+        "contentType": "application/json",
+        "description": "解析走 `handler.rs` 私有的 `AuthFrame` 枚举, **不是** `im_protocol::ClientFrame::Auth`。二者唯一差别: `AuthFrame.req_id` 是 `#[serde(default)] Option<Uuid>`, **可省略**; 而枚举里的 `ClientFrame::Auth.req_id` 是必填。生产路径只用前者, 故本消息按可选建模 —— 标成必填会拒掉 `openapi.json` 已承诺的形状。省略时, 服务端回的 `auth_ok.req_id` 为 `null`。",
+        "payload": { "$ref": "#/components/schemas/ClientAuthFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.1.1"
+      },
+      "clientSendMessage": {
+        "name": "send_message",
+        "title": "ClientFrame::SendMessage",
+        "summary": "发消息",
+        "contentType": "application/json",
+        "description": "`kind` 与 `content.kind` 是**两个独立字段, 服务端不校验二者一致**。客户端可以发 `kind:\"text\"` 配 `content.kind:\"image\"`, 服务端只按**内层** `content.kind` 校验 content 并原样存储外层 `kind`, 下行 `message_new` 会把这一对不一致的值一起广播出去。这是已知的实现缺口, 本文件按代码事实记录, 不擅自收紧。\n\n`idempotency_key` 相同的重发返回 `ack.ok=true` + `data.idempotent_replay=true`, 并**不**新建消息(见 `ServerAck`)。",
+        "payload": { "$ref": "#/components/schemas/ClientSendMessageFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.1.2"
+      },
+      "clientEditMessage": {
+        "name": "edit_message",
+        "title": "ClientFrame::EditMessage",
+        "summary": "编辑消息",
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/ClientEditMessageFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.1.3"
+      },
+      "clientRecallMessage": {
+        "name": "recall_message",
+        "title": "ClientFrame::RecallMessage",
+        "summary": "撤回消息",
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/ClientRecallMessageFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.1.4"
+      },
+      "clientReact": {
+        "name": "react",
+        "title": "ClientFrame::React",
+        "summary": "添加 reaction",
+        "contentType": "application/json",
+        "description": "落库并回 `ack`, 但**不会**下行 `reaction_added`(见该消息的 `x-im-implementation-status`)。",
+        "payload": { "$ref": "#/components/schemas/ClientReactFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.1.5"
+      },
+      "clientMarkRead": {
+        "name": "mark_read",
+        "title": "ClientFrame::MarkRead",
+        "summary": "上报已读",
+        "contentType": "application/json",
+        "description": "aux-04 §B.4 转换表要求本动作的效果是「UPDATE last_read_sequence **+ fanout**」, 但 `ServerFrame` 里**没有已读回执下行帧**(aux-13 §1.2 也未定义)。故本帧**无**下行广播, 客户端不能用它判断别人是否已读。属规范级遗漏, 非实现取舍。见 `docs/gap-ledger.md` §1.12。",
+        "payload": { "$ref": "#/components/schemas/ClientMarkReadFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.1.6"
+      },
+      "clientTyping": {
+        "name": "typing",
+        "title": "ClientFrame::Typing",
+        "summary": "输入中指示",
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/ClientTypingFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.1.7"
+      },
+      "clientPing": {
+        "name": "ping",
+        "title": "ClientFrame::Ping",
+        "summary": "心跳",
+        "contentType": "application/json",
+        "description": "唯一**不带 `req_id`** 的客户端帧, 因此服务端**不会**回 `ack`, 只回 `pong`。`ts` 在 wire 上恒出现(为 `null` 当未提供), 而回程 `pong.ts` 在客户端省略 `ts` 时是 `0` 而非原样回传。",
+        "payload": { "$ref": "#/components/schemas/ClientPingFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.1.8"
+      },
+      "serverAuthOk": {
+        "name": "auth_ok",
+        "title": "鉴权成功(非枚举帧)",
+        "summary": "鉴权通过",
+        "contentType": "application/json",
+        "description": "**本帧不在 `ServerFrame` 枚举里**, 由 `handler.rs:381` 的裸 `serde_json::json!` 构造并直发, 绕过了整个 `im_protocol` 类型体系。aux-13 §1.2 没有定义它(§1.2.1 定义的是 `connected`)。本文件按代码事实登记, 但**不**裁决它是否本应是 `connected` —— 改它会变动客户端可见的 wire 形状, 且无证据表明 `connected` 就是原意。见 `docs/gap-ledger.md` §1.8.2。\n\n鉴权**失败**时服务端不回 `auth_ok`, 而是回一条 `ack.ok=false` 的帧。",
+        "payload": { "$ref": "#/components/schemas/ServerAuthOkFrame" },
+        "x-im-spec-status": "undeclared",
+        "x-im-implementation-status": "emitted",
+        "x-im-ledger-ref": "docs/gap-ledger.md §1.8.2"
+      },
+      "serverAck": {
+        "name": "ack",
+        "title": "ServerFrame::Ack",
+        "summary": "请求响应(成功或失败)",
+        "contentType": "application/json",
+        "description": "`ok=true` 时带 `data`、不带 `error`; `ok=false` 时带 `error`、不带 `data`。该互斥不变量 serde **无法表达**, 由构造方保证, 故两个字段在本文件里都是非必填。\n\n`req_id` 恒存在。协议级错误(非法 JSON / binary 帧 / continuation 帧等, 解析不出请求)用 `00000000-0000-0000-0000-000000000000` 占位, 表示「无可关联的请求」—— **不是**省略该字段。\n\naux-03 §B 规定的 `IDEMPOTENCY_CONFLICT` 在 WS 路径以**成功**形式返回(`ok=true` + `data.idempotent_replay=true`), **不会**出现在 `error.code` 里。",
+        "payload": { "$ref": "#/components/schemas/ServerAckFrame" },
+        "examples": [
+          {
+            "name": "success",
+            "payload": {
+              "type": "ack",
+              "req_id": "22222222-2222-4222-8222-222222222222",
+              "ok": true,
+              "data": {
+                "message_id": "11111111-1111-4111-8111-111111111111",
+                "sequence": 42
+              }
+            }
+          },
+          {
+            "name": "idempotentReplayReturnsSuccessNotConflict",
+            "payload": {
+              "type": "ack",
+              "req_id": "22222222-2222-4222-8222-222222222222",
+              "ok": true,
+              "data": {
+                "message_id": "11111111-1111-4111-8111-111111111111",
+                "sequence": 42,
+                "idempotent_replay": true
+              }
+            }
+          },
+          {
+            "name": "failure",
+            "payload": {
+              "type": "ack",
+              "req_id": "22222222-2222-4222-8222-222222222222",
+              "ok": false,
+              "error": {
+                "code": "VALIDATION_ERROR",
+                "message": "message.content too large",
+                "trace_id": "",
+                "ts": 1692528000000
+              }
+            }
+          }
+        ],
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.2.2 / §1.2.3 / §1.2.4",
+        "x-im-implementation-status": "emitted"
+      },
+      "serverMessageNew": {
+        "name": "message_new",
+        "title": "ServerFrame::MessageNew",
+        "summary": "广播新消息",
+        "contentType": "application/json",
+        "description": "**`reactions` 当前恒为 `[]`** —— `hub.rs:423` 硬编码 `reactions: Vec::new()`, reaction 数据不会随新消息下行。接入方不应依赖该字段携带内容。",
+        "payload": { "$ref": "#/components/schemas/ServerMessageNewFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.2.5",
+        "x-im-implementation-status": "emitted"
+      },
+      "serverMessageRecalled": {
+        "name": "message_recalled",
+        "title": "ServerFrame::MessageRecalled",
+        "summary": "消息被撤回",
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/ServerMessageRecalledFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.2.7",
+        "x-im-implementation-status": "emitted"
+      },
+      "serverTyping": {
+        "name": "typing",
+        "title": "ServerFrame::Typing",
+        "summary": "输入中广播",
+        "contentType": "application/json",
+        "payload": { "$ref": "#/components/schemas/ServerTypingFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.2.10",
+        "x-im-implementation-status": "emitted"
+      },
+      "serverPong": {
+        "name": "pong",
+        "title": "ServerFrame::Pong",
+        "summary": "心跳响应",
+        "contentType": "application/json",
+        "description": "`ts` 非严格回显: 客户端省略 `ts` 时服务端回 `0`(`handler.rs:437` 的 `ts.unwrap_or(0)`)。",
+        "payload": { "$ref": "#/components/schemas/ServerPongFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.2.11",
+        "x-im-implementation-status": "emitted"
+      },
+      "serverMessageEdited": {
+        "name": "message_edited",
+        "title": "ServerFrame::MessageEdited",
+        "summary": "消息被编辑(保留未发出)",
+        "contentType": "application/json",
+        "description": "**生产代码从不发送本帧。** wire 形状缺 `conversation_id`(aux-13 §1.2.6 未定义该字段), 广播中枢无从判断接收方是否该会话成员, 于是 `hub.rs:362` 把本帧归为 `Audience::Undeliverable` 并在 `publish` 里直接短路。后果: **编辑消息没有实时同步**, 客户端只能靠 `GET /v1/conversations/{id}/messages` 拉取。\n\n补 `conversation_id` 属**协议变更**, 不由实现方拍板。见 `docs/gap-ledger.md` §1.10 / §1.13。",
+        "payload": { "$ref": "#/components/schemas/ServerMessageEditedFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.2.6",
+        "x-im-implementation-status": "reserved-not-emitted",
+        "x-im-ledger-ref": "docs/gap-ledger.md §1.10"
+      },
+      "serverReactionAdded": {
+        "name": "reaction_added",
+        "title": "ServerFrame::ReactionAdded",
+        "summary": "新 reaction(保留未发出)",
+        "contentType": "application/json",
+        "description": "**生产代码从不发送本帧**, 原因同 `message_edited`: 缺 `conversation_id`(aux-13 §1.2.8 未定义), `hub.rs:365` 归 `Undeliverable`。发给别人即跨会话泄漏, 故宁可不发。",
+        "payload": { "$ref": "#/components/schemas/ServerReactionAddedFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.2.8",
+        "x-im-implementation-status": "reserved-not-emitted",
+        "x-im-ledger-ref": "docs/gap-ledger.md §1.10"
+      },
+      "serverPresenceUpdate": {
+        "name": "presence_update",
+        "title": "ServerFrame::PresenceUpdate",
+        "summary": "在线状态变化(保留未发出)",
+        "contentType": "application/json",
+        "description": "**生产代码从不发送本帧** —— presence 能力随 WBS G-1 落地。当前只有 `im-testkit` 的 mock server 会发。\n\n`status` 在 Rust 里是裸 `String`, serde **不校验取值**; 下列取值来自 `ws_frames.rs` 的行内注释, 属已知取值而非受约束的枚举。",
+        "payload": { "$ref": "#/components/schemas/ServerPresenceUpdateFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.2.9",
+        "x-im-implementation-status": "reserved-not-emitted"
+      },
+      "serverForceDisconnect": {
+        "name": "force_disconnect",
+        "title": "ServerFrame::ForceDisconnect",
+        "summary": "强制下线(保留未发出)",
+        "contentType": "application/json",
+        "description": "**生产代码从不发送本帧**。`reason` 同 `status`: 裸 `String`, 不受约束, 下列取值来自行内注释。",
+        "payload": { "$ref": "#/components/schemas/ServerForceDisconnectFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.2.12",
+        "x-im-implementation-status": "reserved-not-emitted"
+      },
+      "serverConnected": {
+        "name": "connected",
+        "title": "ServerFrame::Connected",
+        "summary": "WS 握手成功(保留未发出)",
+        "contentType": "application/json",
+        "description": "**im-gateway 生产代码从不发送本帧** —— 鉴权成功后发的是 `auth_ok`(见 `serverAuthOk`)。本变体只有 `im-testkit` 的 mock server 在用。aux-13 §1.2.1 规定的是本帧, 故这是「代码偏离规范」的已知点, 但**不**擅自改成 `connected`(那会变动客户端可见的 wire 形状)。见 `docs/gap-ledger.md` §1.8.2。",
+        "payload": { "$ref": "#/components/schemas/ServerConnectedFrame" },
+        "x-im-spec-status": "declared",
+        "x-im-spec-ref": "aux-13 §1.2.1",
+        "x-im-implementation-status": "reserved-not-emitted",
+        "x-im-ledger-ref": "docs/gap-ledger.md §1.8.2"
+      }
+    },
+    "schemas": {
+      "Uuid": {
+        "title": "UUID",
+        "type": "string",
+        "format": "uuid"
+      },
+      "UnixMillis": {
+        "title": "Unix 毫秒时间戳",
+        "type": "integer",
+        "format": "int64",
+        "description": "`ErrorBody.ts` 的单位是**毫秒**(非秒)。"
+      },
+      "DateTimeUtc": {
+        "title": "RFC 3339 UTC 时间戳",
+        "type": "string",
+        "format": "date-time"
+      },
+      "FieldError": {
+        "title": "FieldError",
+        "type": "object",
+        "description": "`ErrorBody.details` 的元素。仅 `VALIDATION_ERROR` 可能带。",
+        "properties": {
+          "field": { "type": "string" },
+          "reason": { "type": "string" }
+        },
+        "required": ["field", "reason"],
+        "additionalProperties": true
+      },
+      "ErrorBody": {
+        "title": "ErrorBody(WS 专用)",
+        "type": "object",
+        "description": "WS `ack.error` 的载荷。**与 REST 错误信封字段集不同**, 见 `info.description` 的对照表。\n\n`details` 带 `skip_serializing_if = \"Vec::is_empty\"`, 故为空时**整个 key 消失**(不是 `[]`)。im-gateway 当前**从不填充** `details`, 所以线上这个 key 基本不出现。\n\n`trace_id`: im-gateway 传空串(`handler.rs:148`), 故线上通常是 `\"\"`。aux-13 §1.2.4 的样例写的是 `tr_01HXY...` 形态, 与实现不一致。",
+        "properties": {
+          "code": {
+            "type": "string",
+            "description": "错误码, 与 aux-03 §B 的 21 项取值域一致。"
+          },
+          "message": {
+            "type": "string",
+            "description": "i18n key 或错误描述, **不是**面向最终用户的文案。"
+          },
+          "trace_id": { "type": "string" },
+          "ts": { "$ref": "#/components/schemas/UnixMillis" },
+          "details": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/FieldError" }
+          }
+        },
+        "required": ["code", "message", "trace_id", "ts"],
+        "additionalProperties": true
+      },
+      "AckData": {
+        "title": "AckData",
+        "type": "object",
+        "description": "`ack.ok=true` 时的 `data`。**三个字段全部带 `skip_serializing_if`**, 故都可能整个 key 消失 —— 一个非空的 `data` 对象也可能三个字段全无。",
+        "properties": {
+          "message_id": { "$ref": "#/components/schemas/Uuid" },
+          "sequence": { "type": "integer", "format": "int64" },
+          "idempotent_replay": {
+            "type": "boolean",
+            "description": "`false` 时**整个 key 消失**(自定义谓词 `is_false`), 不是 `\"idempotent_replay\": false`。故判断重放要用「key 存在且为 true」, 不能用「值不等于 false」。"
+          }
+        },
+        "additionalProperties": true
+      },
+      "Reaction": {
+        "title": "Reaction",
+        "type": "object",
+        "properties": {
+          "emoji": { "type": "string" },
+          "user_ids": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Uuid" }
+          }
+        },
+        "required": ["emoji", "user_ids"],
+        "additionalProperties": true
+      },
+      "MessageContent": {
+        "title": "MessageContent",
+        "description": "`Message.content` 的 6 种 kind, 由**内层 `kind`** 区分(aux-13 的样例只写了 `{\"text\":\"...\"}` 而漏掉内层 `kind`, 与实现不符; 本文件以代码为准)。\n\n带 `#[serde(default)]` 的可选字段在 wire 上**恒出现**, 为 `null` 当未提供 —— 它们被标为 `required` 且类型含 `\"null\"`。",
+        "oneOf": [
+          { "$ref": "#/components/schemas/MessageContentText" },
+          { "$ref": "#/components/schemas/MessageContentImage" },
+          { "$ref": "#/components/schemas/MessageContentFile" },
+          { "$ref": "#/components/schemas/MessageContentSticker" },
+          { "$ref": "#/components/schemas/MessageContentSystem" },
+          { "$ref": "#/components/schemas/MessageContentCustom" }
+        ]
+      },
+      "MessageContentText": {
+        "title": "kind=text",
+        "type": "object",
+        "properties": {
+          "kind": { "const": "text" },
+          "text": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4000,
+            "description": "服务端校验 1..=4000, 越界返 `VALIDATION_ERROR`。"
+          }
+        },
+        "required": ["kind", "text"],
+        "additionalProperties": true
+      },
+      "MessageContentImage": {
+        "title": "kind=image",
+        "type": "object",
+        "properties": {
+          "kind": { "const": "image" },
+          "media_id": { "$ref": "#/components/schemas/Uuid" },
+          "width": { "type": ["integer", "null"] },
+          "height": { "type": ["integer", "null"] },
+          "thumbnail_media_id": { "type": ["string", "null"], "format": "uuid" }
+        },
+        "required": ["kind", "media_id", "width", "height", "thumbnail_media_id"],
+        "additionalProperties": true,
+        "description": "`width` / `height` / `thumbnail_media_id` 恒出现在 wire 上(可为 null)。"
+      },
+      "MessageContentFile": {
+        "title": "kind=file",
+        "type": "object",
+        "properties": {
+          "kind": { "const": "file" },
+          "media_id": { "$ref": "#/components/schemas/Uuid" },
+          "file_name": { "type": "string", "minLength": 1, "maxLength": 255 },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 1,
+            "description": "Rust 是 `u64`; JSON 无无符号整型, 故按 int64 建模, 且必须 > 0。"
+          },
+          "mime_type": { "type": ["string", "null"] }
+        },
+        "required": ["kind", "media_id", "file_name", "size_bytes", "mime_type"],
+        "additionalProperties": true
+      },
+      "MessageContentSticker": {
+        "title": "kind=sticker",
+        "type": "object",
+        "properties": {
+          "kind": { "const": "sticker" },
+          "sticker_id": { "type": "string", "minLength": 1, "maxLength": 64 }
+        },
+        "required": ["kind", "sticker_id"],
+        "additionalProperties": true
+      },
+      "MessageContentSystem": {
+        "title": "kind=system",
+        "type": "object",
+        "properties": {
+          "kind": { "const": "system" },
+          "event": {
+            "type": "string",
+            "minLength": 1,
+            "description": "已知取值 join / leave / kicked / renamed 等, 但服务端只校验非空, **不校验取值**。"
+          },
+          "actor_user_id": { "type": ["string", "null"], "format": "uuid" },
+          "target_user_id": { "type": ["string", "null"], "format": "uuid" }
+        },
+        "required": ["kind", "event", "actor_user_id", "target_user_id"],
+        "additionalProperties": true
+      },
+      "MessageContentCustom": {
+        "title": "kind=custom",
+        "type": "object",
+        "properties": {
+          "kind": { "const": "custom" },
+          "schema": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64,
+            "description": "自定义载荷的 schema 名。"
+          },
+          "data": {
+            "description": "任意 JSON(Rust 侧是 `serde_json::Value`)。**不强制是对象** —— 可以是数组、字符串、数字。"
+          }
+        },
+        "required": ["kind", "schema", "data"],
+        "additionalProperties": true
+      },
+      "WireMessage": {
+        "title": "WireMessage",
+        "type": "object",
+        "description": "下行消息体。**10 个字段在 wire 上全部恒出现**(其中 `sender_id` / `reply_to` / `edited_at` 可为 `null`, `reactions` 恒为数组)。",
+        "properties": {
+          "id": { "$ref": "#/components/schemas/Uuid" },
+          "conversation_id": { "$ref": "#/components/schemas/Uuid" },
+          "sequence": { "type": "integer", "format": "int64" },
+          "sender_id": { "type": ["string", "null"], "format": "uuid" },
+          "kind": {
+            "type": "string",
+            "description": "由上行 `send_message.kind` 原样抄回, **不校验**它与 `content.kind` 一致。"
+          },
+          "content": { "$ref": "#/components/schemas/MessageContent" },
+          "reply_to": { "type": ["string", "null"], "format": "uuid" },
+          "state": {
+            "type": "string",
+            "enum": ["sent", "delivered", "read", "recalled", "deleted"],
+            "description": "字段本身是裸 `String`(serde 不校验), 但服务端只从 `MessageState::as_str()` 取值, 故取值域确定; 数据库 `messages.state` 有同样的 CHECK 约束。"
+          },
+          "created_at": { "$ref": "#/components/schemas/DateTimeUtc" },
+          "edited_at": { "type": ["string", "null"], "format": "date-time" },
+          "reactions": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Reaction" },
+            "description": "**当前恒为 `[]`**(`hub.rs:423` 硬编码)。"
+          }
+        },
+        "required": [
+          "id",
+          "conversation_id",
+          "sequence",
+          "sender_id",
+          "kind",
+          "content",
+          "reply_to",
+          "state",
+          "created_at",
+          "edited_at",
+          "reactions"
+        ],
+        "additionalProperties": true
+      },
+      "ClientAuthFrame": {
+        "title": "ClientFrame::Auth",
+        "type": "object",
+        "properties": {
+          "type": { "const": "auth" },
+          "req_id": {
+            "type": ["string", "null"],
+            "format": "uuid",
+            "description": "**可省略**。解析走 `handler.rs` 的私有 `AuthFrame`, 其 `req_id` 是 `#[serde(default)] Option<Uuid>`。省略或显式 null 时, 回程 `auth_ok.req_id` 也是 null。"
+          },
+          "access_token": { "type": "string" }
+        },
+        "required": ["type", "access_token"],
+        "additionalProperties": true
+      },
+      "ClientSendMessageFrame": {
+        "title": "ClientFrame::SendMessage",
+        "type": "object",
+        "properties": {
+          "type": { "const": "send_message" },
+          "req_id": { "$ref": "#/components/schemas/Uuid" },
+          "conversation_id": { "$ref": "#/components/schemas/Uuid" },
+          "idempotency_key": {
+            "$ref": "#/components/schemas/Uuid",
+            "description": "重发保护键。相同 key 重发返 `ack.ok=true` + `data.idempotent_replay=true`。"
+          },
+          "kind": {
+            "type": "string",
+            "description": "自由字符串, **与 `content.kind` 不互相校验**。已知取值 text / image / file / sticker / system / custom。"
+          },
+          "content": { "$ref": "#/components/schemas/MessageContent" },
+          "reply_to": {
+            "type": ["string", "null"],
+            "format": "uuid",
+            "description": "仅 `#[serde(default)]` 无 skip, 故 wire 上**恒出现**, 未引用消息时为 `null`。"
+          }
+        },
+        "required": [
+          "type",
+          "req_id",
+          "conversation_id",
+          "idempotency_key",
+          "kind",
+          "content",
+          "reply_to"
+        ],
+        "additionalProperties": true
+      },
+      "ClientEditMessageFrame": {
+        "title": "ClientFrame::EditMessage",
+        "type": "object",
+        "properties": {
+          "type": { "const": "edit_message" },
+          "req_id": { "$ref": "#/components/schemas/Uuid" },
+          "message_id": { "$ref": "#/components/schemas/Uuid" },
+          "content": { "$ref": "#/components/schemas/MessageContent" }
+        },
+        "required": ["type", "req_id", "message_id", "content"],
+        "additionalProperties": true
+      },
+      "ClientRecallMessageFrame": {
+        "title": "ClientFrame::RecallMessage",
+        "type": "object",
+        "properties": {
+          "type": { "const": "recall_message" },
+          "req_id": { "$ref": "#/components/schemas/Uuid" },
+          "message_id": { "$ref": "#/components/schemas/Uuid" }
+        },
+        "required": ["type", "req_id", "message_id"],
+        "additionalProperties": true
+      },
+      "ClientReactFrame": {
+        "title": "ClientFrame::React",
+        "type": "object",
+        "properties": {
+          "type": { "const": "react" },
+          "req_id": { "$ref": "#/components/schemas/Uuid" },
+          "message_id": { "$ref": "#/components/schemas/Uuid" },
+          "emoji": { "type": "string" }
+        },
+        "required": ["type", "req_id", "message_id", "emoji"],
+        "additionalProperties": true
+      },
+      "ClientMarkReadFrame": {
+        "title": "ClientFrame::MarkRead",
+        "type": "object",
+        "properties": {
+          "type": { "const": "mark_read" },
+          "req_id": { "$ref": "#/components/schemas/Uuid" },
+          "conversation_id": { "$ref": "#/components/schemas/Uuid" },
+          "sequence": { "type": "integer", "format": "int64" }
+        },
+        "required": ["type", "req_id", "conversation_id", "sequence"],
+        "additionalProperties": true
+      },
+      "ClientTypingFrame": {
+        "title": "ClientFrame::Typing",
+        "type": "object",
+        "properties": {
+          "type": { "const": "typing" },
+          "req_id": { "$ref": "#/components/schemas/Uuid" },
+          "conversation_id": { "$ref": "#/components/schemas/Uuid" }
+        },
+        "required": ["type", "req_id", "conversation_id"],
+        "additionalProperties": true
+      },
+      "ClientPingFrame": {
+        "title": "ClientFrame::Ping",
+        "type": "object",
+        "description": "唯一不带 `req_id` 的客户端帧, 因此服务端不回 `ack`。",
+        "properties": {
+          "type": { "const": "ping" },
+          "ts": {
+            "type": ["integer", "null"],
+            "format": "int64",
+            "description": "仅 `#[serde(default)]` 无 skip, 故 wire 上**恒出现**, 未提供时为 `null`。"
+          }
+        },
+        "required": ["type", "ts"],
+        "additionalProperties": true
+      },
+      "ServerAuthOkFrame": {
+        "title": "auth_ok(非 ServerFrame 变体)",
+        "type": "object",
+        "description": "由 `handler.rs:381` 的裸 `serde_json::json!` 构造, **不在 `ServerFrame` 枚举里**。它**不是** aux-13 §1.2.1 的 `connected`, 也不带 `ok` / `data` 字段。",
+        "properties": {
+          "type": { "const": "auth_ok" },
+          "req_id": {
+            "type": ["string", "null"],
+            "format": "uuid",
+            "description": "回显上行 `auth.req_id`; 上行省略时为 `null`。"
+          }
+        },
+        "required": ["type", "req_id"],
+        "additionalProperties": true
+      },
+      "ServerAckFrame": {
+        "title": "ServerFrame::Ack",
+        "type": "object",
+        "properties": {
+          "type": { "const": "ack" },
+          "req_id": {
+            "$ref": "#/components/schemas/Uuid",
+            "description": "协议级错误(解析不出请求)时为 `00000000-0000-0000-0000-000000000000` 哨兵, 而非省略。"
+          },
+          "ok": { "type": "boolean" },
+          "data": { "$ref": "#/components/schemas/AckData" },
+          "error": { "$ref": "#/components/schemas/ErrorBody" }
+        },
+        "required": ["type", "req_id", "ok"],
+        "additionalProperties": true
+      },
+      "ServerMessageNewFrame": {
+        "title": "ServerFrame::MessageNew",
+        "type": "object",
+        "properties": {
+          "type": { "const": "message_new" },
+          "message": { "$ref": "#/components/schemas/WireMessage" }
+        },
+        "required": ["type", "message"],
+        "additionalProperties": true
+      },
+      "ServerMessageEditedFrame": {
+        "title": "ServerFrame::MessageEdited",
+        "type": "object",
+        "description": "**缺 `conversation_id`**(aux-13 §1.2.6 未定义), 因此无法定向投递, 生产代码从不发送。",
+        "properties": {
+          "type": { "const": "message_edited" },
+          "message_id": { "$ref": "#/components/schemas/Uuid" },
+          "content": { "$ref": "#/components/schemas/MessageContent" },
+          "edited_at": { "$ref": "#/components/schemas/DateTimeUtc" }
+        },
+        "required": ["type", "message_id", "content", "edited_at"],
+        "additionalProperties": true
+      },
+      "ServerMessageRecalledFrame": {
+        "title": "ServerFrame::MessageRecalled",
+        "type": "object",
+        "properties": {
+          "type": { "const": "message_recalled" },
+          "message_id": { "$ref": "#/components/schemas/Uuid" },
+          "conversation_id": { "$ref": "#/components/schemas/Uuid" }
+        },
+        "required": ["type", "message_id", "conversation_id"],
+        "additionalProperties": true
+      },
+      "ServerReactionAddedFrame": {
+        "title": "ServerFrame::ReactionAdded",
+        "type": "object",
+        "description": "**缺 `conversation_id`**(aux-13 §1.2.8 未定义), 生产代码从不发送。",
+        "properties": {
+          "type": { "const": "reaction_added" },
+          "message_id": { "$ref": "#/components/schemas/Uuid" },
+          "user_id": { "$ref": "#/components/schemas/Uuid" },
+          "emoji": { "type": "string" }
+        },
+        "required": ["type", "message_id", "user_id", "emoji"],
+        "additionalProperties": true
+      },
+      "ServerPresenceUpdateFrame": {
+        "title": "ServerFrame::PresenceUpdate",
+        "type": "object",
+        "properties": {
+          "type": { "const": "presence_update" },
+          "user_id": { "$ref": "#/components/schemas/Uuid" },
+          "status": {
+            "type": "string",
+            "description": "裸 `String`, 服务端不校验。已知取值: online / offline / away / busy / invisible(来自源码行内注释, 非受约束枚举)。"
+          }
+        },
+        "required": ["type", "user_id", "status"],
+        "additionalProperties": true
+      },
+      "ServerTypingFrame": {
+        "title": "ServerFrame::Typing",
+        "type": "object",
+        "properties": {
+          "type": { "const": "typing" },
+          "conversation_id": { "$ref": "#/components/schemas/Uuid" },
+          "user_id": { "$ref": "#/components/schemas/Uuid" }
+        },
+        "required": ["type", "conversation_id", "user_id"],
+        "additionalProperties": true
+      },
+      "ServerPongFrame": {
+        "title": "ServerFrame::Pong",
+        "type": "object",
+        "properties": {
+          "type": { "const": "pong" },
+          "ts": {
+            "type": "integer",
+            "format": "int64",
+            "description": "客户端省略 `ts` 时服务端回 `0`, 非原样回传。"
+          }
+        },
+        "required": ["type", "ts"],
+        "additionalProperties": true
+      },
+      "ServerForceDisconnectFrame": {
+        "title": "ServerFrame::ForceDisconnect",
+        "type": "object",
+        "properties": {
+          "type": { "const": "force_disconnect" },
+          "reason": {
+            "type": "string",
+            "description": "裸 `String`, 服务端不校验。已知取值: token_revoked / account_banned / account_deleted / admin_kick(来自源码行内注释)。"
+          }
+        },
+        "required": ["type", "reason"],
+        "additionalProperties": true
+      },
+      "ServerConnectedFrame": {
+        "title": "ServerFrame::Connected",
+        "type": "object",
+        "description": "枚举中存在, 但 im-gateway 生产代码**从不发送**(鉴权成功发的是 `auth_ok`)。",
+        "properties": {
+          "type": { "const": "connected" },
+          "session_id": { "$ref": "#/components/schemas/Uuid" }
+        },
+        "required": ["type", "session_id"],
+        "additionalProperties": true
+      }
+    }
+  }
+}

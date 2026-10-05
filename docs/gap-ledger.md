@@ -2451,11 +2451,13 @@ skip, 而 skip 在 libtest 眼里等于通过)。
 
 #### 仍未做(诚实声明)
 
-- **AsyncAPI 仍缺**: WS 帧协议无机器可读描述 —— `im_protocol::ws_frames` 实际有
-  **8 类 `ClientFrame`**(aux-13 §1.1 称 8 类, 对齐)与 **10 类 `ServerFrame`**
-  (§1.2 称 11 类, 缺的是已读回执帧, 见 §1.12)。OpenAPI 3.1 无原生 WebSocket
-  支持, `/v1/ws` 只登记了 101 握手与首帧 `auth`。这是「主要用于集成」下**剩余的
-  最大接入障碍** —— WS 客户端目前只能读 `im_protocol` 的 Rust 源码反推帧形状。
+- **AsyncAPI 仍缺**: WS 帧协议无机器可读描述。逐个数 aux-13 的小节标题:
+  客户端 §1.1.1–§1.1.8 共 **8** 类, 与 `ClientFrame` 的 8 个变体 1:1 对齐;
+  服务端 §1.2.1–§1.2.12 共 **12 个小节**, 但 `ack` 占了 3 个(成功 / 幂等冲突 /
+  真错误), 去重后是 **10 个不同帧类型**, 与 `ServerFrame` 的 10 个变体
+  **1:1 完全对应**。OpenAPI 3.1 无原生 WebSocket 支持, `/v1/ws` 只登记了
+  101 握手与首帧 `auth`。这是「主要用于集成」下**剩余的最大接入障碍** ——
+  WS 客户端目前只能读 `im_protocol` 的 Rust 源码反推帧形状。
 - §1.18 的 `/readyz` 仍**不检查 NATS**(publisher 不在 `AppState` 里),
   也不检查 Valkey(D-4 不存在)。
 

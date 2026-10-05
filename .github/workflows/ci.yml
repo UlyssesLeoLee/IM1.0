@@ -310,6 +310,44 @@ jobs:
         # 纯 PowerShell, 不需要 cargo, 故与上面的 aux-03 检查并列。
         shell: pwsh
         run: pwsh -NoProfile -File ./scripts/check-openapi.ps1
+      - name: check AsyncAPI drift (WS frames vs im-protocol serde)
+        # 2026-10-05 新增。OpenAPI 覆盖 HTTP 面, 但 WebSocket 面此前**完全没有**
+        # 机器可读描述 —— 接入方要自己读 im-protocol 的 Rust 源码反推帧的 JSON
+        # 形状。对「主要用于集成」的产品, 这是最大的接入障碍。
+        #
+        # docs/api/asyncapi.json (3.0.0) 的每个字段**逐个取自 serde 派生**,
+        # 不取自 aux-13 的样例 JSON —— ImplementationSpec 处于 [PROTOCOL-FROZEN],
+        # 样例与代码在 content 内层 kind、ErrorBody.ts 等多处冲突, 以代码为准。
+        #
+        # 门禁做五件事:
+        #   1. 变体名双向比对: 每个 Rust 枚举变体都要有一个被 operation 引用的
+        #      schema, 其 properties.type.const 等于 snake_case 后的 wire 值;
+        #      反向也要成立
+        #   2. 字段名双向比对: 每个变体字段都要出现在 schema 的 properties 里
+        #   3. **required 标志**逐字段核对(核心检查)—— serde 给 Option<T> 三种
+        #      截然不同的行为, 产生不同的 JSON:
+        #        (a) 无属性            -> 恒序列化, None 时为 null
+        #        (b) 仅 serde(default) -> **同样恒序列化**, default 只影响反序列化
+        #        (c) default + skip_serializing_if -> key 整个消失
+        #      故: 有 skip 不得 required, 无 skip 必须 required。写反了会描述出
+        #      服务端**永远不会发出**的形状, 且不产生任何运行期错误
+        #   4. 所有 $ref 可解析
+        #   5. 手工核对的基线(8/10/6 个变体、19 条 message), 使解析失败导致的
+        #      空集合不会读成「无漂移」
+        #
+        # discriminator 索引**按方向分别建立**: `typing` 在上下行都存在
+        # (ClientFrame::Typing 与 ServerFrame::Typing), 全局索引会让一条静默
+        # 覆盖另一条。索引来源是 operation 的 message 列表, 这同时意味着
+        # 一个 schema 只有被 operation 真正引用才可能满足某个方向。
+        #
+        # 判别力已用变异测试证明: 13 个用例 0 失败 —— 1 个对照组、8 个注入缺陷
+        # (删/加字段、skip 字段标 required、恒序列化字段标可选、改 const、
+        # 从 operation 删 message、悬空 $ref、破坏 message 数基线)、
+        # 2 个反例守卫(auth_ok 豁免仍放行; 注释里长得像变体的文本必须被忽略)、
+        # 2 个解析退化(Rust 括号坏掉、JSON 坏掉, 均必须 exit 2 而非当成通过)。
+        # 源文件改前改后 SHA256 一致。
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/check-asyncapi.ps1
       - name: semgrep
         # 2026-10-04 换掉 `uses: returntocorp/semgrep-action@v1`。
         #

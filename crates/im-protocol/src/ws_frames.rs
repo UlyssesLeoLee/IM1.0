@@ -1,7 +1,23 @@
 //! WebSocket 客户端/服务端帧
 //!
-//! 依据: aux-13 §1.1 (客户端 8 类) / §1.2 (服务端 11 类)
+//! 依据: aux-13 §1.1 (客户端 **8** 类) / §1.2 (服务端 **10** 类)
 //! 帧格式: JSON over WebSocket Text Frame
+//!
+//! ## 「11 类」是错的, 正确数字是 10 (2026-10-05 核对 aux-13 标题后修正)
+//!
+//! 本行此前写「服务端 11 类」。逐个数 aux-13 §1.2 的小节标题:
+//! §1.2.1 `connected` / §1.2.2 `ack` / §1.2.3 `ack` / §1.2.4 `ack` /
+//! §1.2.5 `message_new` / §1.2.6 `message_edited` / §1.2.7 `message_recalled` /
+//! §1.2.8 `reaction_added` / §1.2.9 `presence_update` / §1.2.10 `typing` /
+//! §1.2.11 `pong` / §1.2.12 `force_disconnect` —— **12 个小节**, 其中 `ack`
+//! 占了 3 个(成功 / 幂等冲突 / 真错误), 去重后是 **10 个不同帧类型**,
+//! 与下方 `ServerFrame` 的 10 个变体 **1:1 完全对应**。
+//!
+//! **别把「11」理解成「缺 1 类」**: aux-13 并**没有**定义已读回执下行帧。
+//! 该需求来自另一份文档(aux-04 §B.4 转换表要求 mark_read 后 fanout), 属规范级
+//! 遗漏, 不是本枚举少实现了一个变体。见 `docs/gap-ledger.md` §1.12。
+//!
+//! 客户端侧 8 类与 aux-13 §1.1.1–§1.1.8 逐条对齐, 无增减。
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
