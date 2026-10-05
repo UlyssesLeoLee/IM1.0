@@ -3021,7 +3021,45 @@ nats` 这样的合并分支 —— 结果 4 个用例**当场抓出两处判定�
 - `cargo test -p im-gateway --test migration_smoke` → **3 passed**
 - `cargo clippy --workspace --all-targets --locked -- -D warnings` **EXIT=0**
   (过程中修掉 1 处 `unused_doc_comment` —— 真值表注释被我写进了函数体)
-- `scripts/check-openapi.ps1` exit 0
+- `scripts/check-naming-convention.ps1` / `check-openapi.ps1` /
+  `check-asyncapi.ps1` 均 exit 0
+
+#### 首次 CI 红了 3 个 job, 4 条失败 —— 其中一条是**我按记忆写的解析器**
+
+run 37336615992: Lint / Unit / Integration 三个 job 失败。四条根因:
+
+| # | 失败 | 根因 |
+|---|---|---|
+| 1 | aux-01 命名门禁报 4 条 | `error_http_status` 违反 §I(`status` 保留给 `delivery_state` / `users.state`); 两个具名 CHECK 也不符合 §D.6 的 `chk_<table>_<column>` |
+| 2 | `pg_sink_..._read_back` | 列名已改, 跟随更新 |
+| 3 | `migrator_embeds_all_seven_migrations` | 7 → 8 |
+| 4 | `migration_0008_indexes_exist_...` | **我的解析器** |
+
+第 4 条值得单独记。我写的解析器是
+`def.find(" ON public.dlq_records (")` —— 理由是「我只见过这个形状」。而真 PG 的
+`pg_indexes.indexdef` 实际输出(run 37336615992 日志里的**原文**)是:
+
+```
+CREATE INDEX idx_dlq_records_original_task_failed_at
+  ON public.dlq_records USING btree (original_task, failed_at DESC)
+```
+
+中间多一个 `USING btree`, 于是那条 find 匹配不到, 测试在真库上直接 panic。
+**我按记忆写了格式, 没在真 PG 上核过** —— 与 §1.33 那次「核实的是相邻属性」
+同源, 只是这次更浅: 连对象都没验对形状。
+
+修法不只是把字符串改对: 解析器改成找 ` ON ` 再**配对括号**, 使
+`USING btree` / `USING gin` / 未来的 `INCLUDE (...)` 都不影响; 并新增
+`indexdef_columns_handle_the_real_pg_output` —— 用**上面那段 CI 日志里的原文**
+当夹具, 锁住这个函数。该用例**不需要 PG**, 因为它守的恰恰是「解析器对得上真实
+格式」这件事 —— 而那件事当初只在真库上才暴露。
+
+命名那条(第 1 条)判定为**门禁正确、我错**: 全部 8 份 migration 里只有我这个用了
+`status`, 而 §I 的规则就是「SQL 标识符不得含 `status` 词段」。改法是列名改为
+`error_http_response_code`、约束名改为 `chk_dlq_records_error_http_response_code`;
+**JSON/wire 侧仍是 `http_status`**(aux-08 §D.2 冻结), 故 Rust 的
+`DlqError::http_status` 不改名, 只在列名上避开保留词。列名与 wire 字段名不一致
+这一点已在 migration 注释里写明。
 
 #### 位置
 

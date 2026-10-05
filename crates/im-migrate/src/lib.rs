@@ -192,23 +192,26 @@ pub fn with_database(base: &str, dbname: &str) -> String {
 mod tests {
     use super::*;
 
-    /// 迁移器里确实编进了 7 份 SQL, 且版本号连续。
+    /// 迁移器里确实编进了 8 份 SQL, 且版本号连续。
     ///
     /// 这条是纯逻辑断言(不连库), 守的是一件很具体的事: 有人往 `migrations/`
-    /// 加了第 8 份、或者编号跳号时, 这里的数字会提醒你去更新文档里那些
-    /// 「7/7 migration」的表述 —— 否则文档会开始说谎。
+    /// 加了第 9 份、或者编号跳号时, 这里的数字会提醒你去更新文档里那些
+    /// 「8/8 migration」的表述 —— 否则文档会开始说谎。
+    ///
+    /// 2026-10-06: 0008(DLQ 的 PG 长留存层)加入后由 7 → 8。它**当场**变红,
+    /// 与这条注释写的一字不差 —— 这正是它该有的样子。
     #[test]
-    fn migrator_embeds_all_seven_migrations() {
+    fn migrator_embeds_all_eight_migrations() {
         assert_eq!(
             MIGRATOR.migrations.len(),
-            7,
-            "migrations/ 应有 7 份; 新增/删除时同步更新 \
-             migration_smoke_pg.rs 的 EXPECTED_TABLES 注释与文档中的 '7/7'"
+            8,
+            "migrations/ 应有 8 份; 新增/删除时同步更新 \
+             migration_smoke_pg.rs 的 EXPECTED_TABLES 注释与文档中的 '8/8'"
         );
         let versions: Vec<i64> = MIGRATOR.migrations.iter().map(|m| m.version).collect();
         assert_eq!(
             versions,
-            vec![1, 2, 3, 4, 5, 6, 7],
+            vec![1, 2, 3, 4, 5, 6, 7, 8],
             "版本号必须连续且从 1 开始, 否则 run() 会认为缺失的版本可跳过"
         );
     }

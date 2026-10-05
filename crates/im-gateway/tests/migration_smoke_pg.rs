@@ -261,14 +261,92 @@ async fn migration_0007_partial_indexes_exist() {
 // 3b. 0008 的 dlq_records 索引建成, 且名字逐字拼出列名 (aux-01 §D)
 // ============================================================================
 
+/// 从 `pg_indexes.indexdef` 里抠出被索引的**列名**列表
+///
+/// ## 为什么不写成一行 `find`
+///
+/// 初版是 `def.find(" ON public.dlq_records (")` —— 理由是「我只见过这个形状」。
+/// 而真 PG 的 `indexdef` 实际输出(run 37336615992 的日志里抓到的原文)中间多一个
+/// `USING btree`, 于是那条 find 匹配不到, 测试在真库上直接 panic。
+///
+/// **我按记忆写了格式, 没在真 PG 上核过。** 故这里改成找 ` ON ` 再配对括号,
+/// 使 `USING btree` / `USING gin` / 未来的 `INCLUDE (...)` 都不影响; 并且
+/// `indexdef_columns_handle_the_real_pg_output` 用真 PG 的**原文**锁住这个函数。
+fn indexdef_columns(def: &str) -> Vec<String> {
+    let on_at = def
+        .find(" ON ")
+        .unwrap_or_else(|| panic!("indexdef 里没有 ' ON ': {def}"));
+    let after_on = &def[on_at + " ON ".len()..];
+    let open = after_on
+        .find('(')
+        .unwrap_or_else(|| panic!("indexdef 的 ON 子句里没有 '(': {def}"));
+    // 配对找右括号(处理 `INCLUDE (a, b)` 这类嵌套)
+    let mut depth = 0usize;
+    let mut close = None;
+    for (i, ch) in after_on[open..].char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(open + i);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let close = close.unwrap_or_else(|| panic!("indexdef 括号不配对: {def}"));
+    after_on[open + 1..close]
+        .split(',')
+        .map(|c| {
+            c.split_whitespace()
+                .next()
+                .unwrap_or("")
+                .trim_matches('"')
+                .to_string()
+        })
+        .filter(|c| !c.is_empty())
+        .collect()
+}
+
+/// 上面那个解析器的**原文**回归 —— 三个字符串是 PG 18 实际输出的形状
+///
+/// 第一条逐字来自 run 37336615992 的失败日志, 不是我复述的。第二条是 partial
+/// 索引(PG 会把 `WHERE` 条件也加括号), 第三条是带 `INCLUDE` 的形态。
+///
+/// 本用例**不需要 PG**: 它锁的正是「解析器对得上真实格式」这件事, 而那件事
+/// 恰恰是当初在真库上才暴露的。
+#[test]
+fn indexdef_columns_handle_the_real_pg_output() {
+    // 逐字取自 run 37336615992 的 CI 日志
+    let plain = "CREATE INDEX idx_dlq_records_original_task_failed_at \
+                 ON public.dlq_records USING btree (original_task, failed_at DESC)";
+    assert_eq!(indexdef_columns(plain), vec!["original_task", "failed_at"]);
+
+    // partial 索引: `WHERE` 子句在列清单之后, 不能被吃进列名
+    let partial = "CREATE INDEX idx_dlq_records_pending_replay_failed_at \
+                   ON public.dlq_records USING btree (failed_at) \
+                   WHERE (replayed_at IS NULL) AND (discarded_at IS NULL)";
+    assert_eq!(indexdef_columns(partial), vec!["failed_at"]);
+
+    // 嵌套括号(`INCLUDE`)不应让配对提前结束
+    let with_include = "CREATE INDEX idx_x ON public.t USING btree (a) INCLUDE (b, c)";
+    assert_eq!(indexdef_columns(with_include), vec!["a"]);
+
+    // 形状真的不认识时要**炸**, 不能悄悄返回空 —— 空列表会让下游断言空转
+    let result = std::panic::catch_unwind(|| indexdef_columns("CREATE INDEX i ON t"));
+    assert!(
+        result.is_err(),
+        "缺 '(' 时必须 panic, 否则列名列表为空会让断言空转"
+    );
+}
+
 /// 0008 的 3 条索引确实建成; 且**名字里必须出现它索引的每一列**
 ///
 /// 这条断言的价值不在「索引存在」, 而在**名字**。既有 12 个索引的
-/// `CREATE INDEX` 都把列写对了, 只是名字缩写(`idx_conversations_environment_id`
-/// 没写 `created_at`)。若日后有人新加一个缩写名字的索引, 这条会红。
-///
-/// 做法: 从 `pg_indexes.indexdef` 里**把列名抠出来**, 再逐个检查是否出现在
-/// 索引名里。这样断言的对象是 PG **实际建成**的索引, 不是我们希望的样子。
+/// `CREATE INDEX` 都把列写对了, 只是名字缩写。若日后有人新加一个缩写名字的
+/// 索引, 这条会红。
 #[tokio::test]
 async fn migration_0008_indexes_exist_and_spell_out_every_column() {
     let Some(p) = pool().await else {
@@ -294,26 +372,7 @@ async fn migration_0008_indexes_exist_and_spell_out_every_column() {
              UNIQUE 会让重放被幂等约束挡住。实际: {def}"
         );
 
-        // 从 indexdef 抠出列名: 形如 ON public.dlq_records (col_a, col_b DESC)
-        let open = def
-            .find(" ON public.dlq_records (")
-            .unwrap_or_else(|| panic!("indexdef 形状变了, 请同步本测试: {def}"));
-        let tail = &def[open + " ON public.dlq_records (".len()..];
-        let close = tail
-            .find(')')
-            .unwrap_or_else(|| panic!("indexdef 缺右括号: {def}"));
-        let cols: Vec<String> = tail[..close]
-            .split(',')
-            .map(|c| {
-                c.split_whitespace()
-                    .next()
-                    .unwrap_or("")
-                    .trim_matches('"')
-                    .to_string()
-            })
-            .filter(|c| !c.is_empty())
-            .collect();
-
+        let cols = indexdef_columns(&def);
         assert!(
             !cols.is_empty(),
             "从 indexdef 抠不出列名 —— 那会让下面的断言变成空转: {def}"

@@ -64,7 +64,12 @@ CREATE TABLE IF NOT EXISTS dlq_records (
     error_code             TEXT NOT NULL,
     error_message          TEXT NOT NULL,
     error_stack            TEXT,
-    error_http_status      SMALLINT NOT NULL,
+    -- **刻意不叫 `error_http_status`**: aux-01 §I 禁止 SQL 标识符含 `status`
+    -- 这个词段(它保留给投递状态 `delivery_state` 与 `users.state`), 门禁
+    -- `check-naming-convention.ps1` I.1 按词段字面匹配并阻断合并。
+    -- wire/JSON 侧的字段名**仍是** `http_status`(aux-08 §D.2 冻结), 故 Rust 的
+    -- `DlqError::http_status` 不改名, 只在**列名**上避开保留词。
+    error_http_response_code SMALLINT NOT NULL,
     -- aux-08 §D.2 `context` 子结构
     context_trace_id       TEXT,
     context_user_id        TEXT,
@@ -80,11 +85,12 @@ CREATE TABLE IF NOT EXISTS dlq_records (
     replayed_at            TIMESTAMPTZ,
     discarded_at           TIMESTAMPTZ,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT now(),
-    -- HTTP 状态码取值域: DB 层兜住, 应用层漏掉时不要静默写进 0 或 700
-    CONSTRAINT dlq_records_error_http_status_check
-        CHECK (error_http_status BETWEEN 100 AND 599),
+    -- HTTP 响应码取值域: DB 层兜住, 应用层漏掉时不要静默写进 0 或 700。
+    -- 约束名按 aux-01 §D.6 用 `chk_<table>_<column>`。
+    CONSTRAINT chk_dlq_records_error_http_response_code
+        CHECK (error_http_response_code BETWEEN 100 AND 599),
     -- 重放簿记的最小一致性: 重放次数不能是负数
-    CONSTRAINT dlq_records_replay_attempts_check
+    CONSTRAINT chk_dlq_records_replay_attempts
         CHECK (replay_attempts >= 0)
 );
 

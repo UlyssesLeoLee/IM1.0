@@ -96,7 +96,7 @@ async fn pg_sink_persists_the_record_and_it_can_be_read_back() {
         .expect("store 应成功 —— 0008 的列名/类型与 PgDlqSink 的 INSERT 必须对得上");
 
     let row = sqlx::query(
-        "SELECT original_task, original_payload, error_code, error_http_status, \
+        "SELECT original_task, original_payload, error_code, error_http_response_code, \
                 context_attempt_count, dlq_destination, replay_attempts, replayed_at \
          FROM dlq_records WHERE dlq_id = $1",
     )
@@ -107,7 +107,7 @@ async fn pg_sink_persists_the_record_and_it_can_be_read_back() {
 
     use sqlx::Row;
     assert_eq!(row.get::<String, _>("original_task"), "im.message.created");
-    assert_eq!(row.get::<i32, _>("error_http_status"), 503);
+    assert_eq!(row.get::<i32, _>("error_http_response_code"), 503);
     assert_eq!(row.get::<i32, _>("context_attempt_count"), 4);
     assert_eq!(
         row.get::<String, _>("dlq_destination"),
@@ -185,7 +185,7 @@ async fn db_rejects_an_out_of_range_http_status() {
 
     let r = sqlx::query(
         "INSERT INTO dlq_records (dlq_id, original_task, original_payload, \
-           error_code, error_message, error_http_status, context_attempt_count, \
+           error_code, error_message, error_http_response_code, context_attempt_count, \
            context_first_attempt_at, context_last_attempt_at, failed_at, \
            dlq_destination) \
          VALUES ($1,'im.x','{}'::jsonb,'E','m',0,1,now(),now(),now(),'dlq.event.im.x')",
@@ -196,8 +196,8 @@ async fn db_rejects_an_out_of_range_http_status() {
 
     assert!(
         r.is_err(),
-        "error_http_status = 0 必须被 CHECK 约束拒绝 —— 0008 的 \
-         dlq_records_error_http_status_check 若没生效, 应用层漏校验就能写进垃圾"
+        "error_http_response_code = 0 必须被 CHECK 约束拒绝 —— 0008 的 \
+         chk_dlq_records_error_http_response_code 若没生效, 应用层漏校验就能写进垃圾"
     );
 }
 

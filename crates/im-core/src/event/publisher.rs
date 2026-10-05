@@ -785,7 +785,7 @@ impl DlqSink for PgDlqSink {
         sqlx::query(
             "INSERT INTO dlq_records (\
                dlq_id, original_task, original_payload,\
-               error_code, error_message, error_stack, error_http_status,\
+               error_code, error_message, error_stack, error_http_response_code,\
                context_trace_id, context_user_id, context_env_id,\
                context_attempt_count, context_first_attempt_at,\
                context_last_attempt_at, failed_at, dlq_destination\

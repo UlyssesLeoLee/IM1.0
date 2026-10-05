@@ -7,11 +7,11 @@
 //! 它一概不问。也就是说: 那条测试能证明「schema 是对的」, 但证明不了
 //! 「**我们的代码能把它变成对的**」。
 //!
-//! 本文件补上后半段: 建一个**全新的空库**, 用 `im_migrate` 把 7 份迁移真的
-//! 跑一遍, 然后断言 14 张表建成、0007 的列与索引都在、DB 层 CHECK 真的生效。
+//! 本文件补上后半段: 建一个**全新的空库**, 用 `im_migrate` 把 8 份迁移真的
+//! 跑一遍, 然后断言 15 张表建成、0007 的列与索引都在、DB 层 CHECK 真的生效。
 //!
 //! 顺带说明一件之前没人提过的事: `migrate-job.yaml` 引用一个**无法构建**的
-//! 镜像, 而 `cargo test` 里**没有任何代码会应用迁移** —— 也就是说, 7 份
+//! 镜像, 而 `cargo test` 里**没有任何代码会应用迁移** —— 也就是说, 当时那 7 份
 //! migration 从未由本仓的代码在任何环境执行过。它们「看起来是对的」是因为
 //! 有人(某次手工操作)在某个库上跑过, 之后的测试都复用那个已建好的库。
 //!
@@ -27,7 +27,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::Row;
 use std::env;
 
-/// 14 张表(与 `migration_smoke_pg.rs` 的 `EXPECTED_TABLES` 必须一致)
+/// 15 张表(与 `migration_smoke_pg.rs` 的 `EXPECTED_TABLES` 必须一致)
 const EXPECTED_TABLES: &[&str] = &[
     "tenants",
     "games",
@@ -43,6 +43,8 @@ const EXPECTED_TABLES: &[&str] = &[
     "messages",
     "message_reactions",
     "audit_logs",
+    // 0008(2026-10-06): aux-08 §D.3 的 DLQ 长留存层
+    "dlq_records",
 ];
 
 async fn admin_url() -> Option<String> {
@@ -145,7 +147,7 @@ async fn probe(url: String) -> Result<(), String> {
         .await
         .map_err(|e| format!("run: {e}"))?;
 
-    // 1) 14 张表都在
+    // 1) 15 张表都在
     let rows = sqlx::query(
         "SELECT table_name FROM information_schema.tables \
          WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
@@ -164,13 +166,15 @@ async fn probe(url: String) -> Result<(), String> {
         );
     }
 
-    // 2) 迁移历史表记录了 7 条且全部 success
+    // 2) 迁移历史表记录了 8 条且全部 success
+    //
+    // 2026-10-06: 0008(DLQ 的 PG 长留存层)加入后由 7 → 8。
     let applied: i64 =
         sqlx::query_scalar("SELECT count(*)::bigint FROM _sqlx_migrations WHERE success")
             .fetch_one(&pool)
             .await
             .map_err(|e| format!("count migrations: {e}"))?;
-    assert_eq!(applied, 7, "7 份迁移应全部记入历史表");
+    assert_eq!(applied, 8, "8 份迁移应全部记入历史表");
 
     // 3) 0007 的两列真的在 users 上
     for col in ["username", "password_hash"] {
