@@ -2920,6 +2920,122 @@ Commit: `04c2993`
 
 ---
 
+### 1.34 DLQ 的 PG 长留存层: NATS 整体挂掉时事件**不再**永久丢失 (2026-10-06)
+
+#### §1.31 留下的那半个缺口
+
+§1.31 的 DLQ 只有 **NATS 一层**。`aux-08 §D.3` 要求两层, 且表格里 PG 那行的用途
+写的是「**长留存**」—— 而 NATS DLQ 是 7 天 / 256MB。
+
+更要紧的是: 缺了 PG 层, 「NATS 整体不可用」这个场景下**连死信都写不进去**,
+事件真的永久没了。当时靠 `im_events_dlq_write_failed_total` 诚实计数, 即
+**丢失可见, 但没接住**。
+
+#### 为什么是**专表**而不是 `audit_logs`(2026-10-06 架构拍板)
+
+`aux-08 §D.3` 的 MVP 原文确实是 `audit_logs(action=dlq_record, detail=JSONB)`,
+但这条路**在 schema 上走不通**:
+
+| 阻碍 | 位置 |
+|---|---|
+| `audit_logs.tenant_id UUID NOT NULL` | `migrations/0006:15` |
+| `audit_logs.target_type` 6 值 CHECK(不含「事件」) | `migrations/0006:18` |
+
+而事件发布路径**拿不到租户** —— `publish(topic, payload: &[u8])` 只有裸字节,
+且在 `tx.commit()` 之后调用。凑出 `tenant_id` 只有两条路:
+
+1. 改 `EventPublisher::publish` 签名把上下文带进去 → 触及**全部**调用点
+2. 在**失败路径**上解析 `conversation_id` 再查 `environment → game → tenant`
+   → 多一次 DB 往返, 且让 publisher 耦合仓储
+
+两条都比重开一张表贵。故走专表, 这也正是 `aux-08 GAP-2` 计划的 V1+ 形态。
+
+按 DB 三分类, 它是 **Transaction(事件流水) + Work(待重放队列)**: 表以追加为
+主, 但带 `replayed_at` / `discarded_at` / `replay_attempts` 三列, 生命周期与
+普通事件流水不同(完成后应清理, per `aux-08 §D.4` 的人工处置流程)。而
+`audit_logs` 是「谁做了什么」的审计轨迹 —— 两种生命周期、两种保留期、两种读者。
+
+#### 核心规则: 「可恢复」= **任一层接住**
+
+```
+nats   pg        判定
+Ok     Ok/None   可恢复
+Err    Ok        可恢复     <- PG 层存在的全部意义
+Ok     Err       可恢复     <- 丢的是长留存副本, 事件仍在 NATS
+Err    None      永久丢失
+Err    Err       永久丢失
+```
+
+#### 测试抓到了我实现里的**两个真 bug**
+
+真值表是这个改动的全部意义, 我第一版实现时把它写成了 `None | Some(Ok(())) =>
+nats` 这样的合并分支 —— 结果 4 个用例**当场抓出两处判定反了**:
+
+1. `Some(Ok(()))` 与「没配 PG 层」被合到同一支, 于是「PG 成功 + NATS 失败」
+   判成不可恢复 —— 恰好是 PG 层**唯一重要**的那一格
+2. 修完第 1 处后又把 `None` 算成「PG 成功」, 于是「没配 PG + NATS 挂了」被
+   误判成可恢复
+
+两处都是「看起来合理、只错一个格子」的形状, 而那一个格子**平时永远不触发** ——
+不会在开发期冒烟, 只会在生产 NATS 真的挂掉时才暴露, 且暴露方式是「事件丢了但
+没人知道为什么」。最终实现改成对 `(nats, pg)` 元组穷举的 5 个分支, 无
+`unreachable!`。
+
+除逐格外另加两个反例守卫: 两层都失败时错误串必须**同时**报出两边原因(只报
+一边, 排障的人会去查那个健康的组件); 同样的 NATS 失败在 PG 成功/失败下必须
+给出不同结论(否则说明 PG 的结果根本没参与判定)。
+
+#### 指标: 三个计数器的语义必须分得开
+
+| 指标 | 含义 | 级别 |
+|---|---|---|
+| `im_events_publish_failed_total` | 某次尝试没发出去(**含每次重试**) | — |
+| `im_events_dlq_total` | 已落到可恢复的地方 | — |
+| `im_events_dlq_write_failed_total` | **两层都没接住** → 事件真没了 | **P1** |
+| `im_events_dlq_pg_write_failed_total` | PG 副本没写上 → 事件多半**还在** NATS | **P2** |
+
+新加的 `dlq_pg_write_failed` 与 `dlq_write_failed` **必须分开**: 后者涨 = 正在
+丢数据; 前者涨 = 备份没做上, 7 天后那条死信就查不到了。合成一个数就分不出
+这两者 —— 而这恰是 `aux-08 §D.5` 告警阈值要分开的情况。`/metrics` 因此由 9 个
+变成 **10** 个, `EXPECTED_METRIC_COUNT` 同步。
+
+#### 顺带修的连带项
+
+新增 migration 会打破既有断言, 一并更新(而不是让它们红着): `migration_smoke.rs`
+7 → **8** 份 / 14 → **15** 张表 / 版本区间 `1..=8`; 两个测试名与文件头注释里的
+旧数字也一并更正(名字里带过期数字本身就是一种文档漂移)。
+
+`migration_smoke_pg.rs` 新增
+`migration_0008_indexes_exist_and_spell_out_every_column` —— 它从
+`pg_indexes.indexdef` **把列名抠出来**再逐个检查是否出现在索引名里。断言的
+对象是 PG **实际建成**的索引, 不是我们希望的样子。
+
+新表的 3 条索引刻意按 `aux-01 §D` **逐字拼出列名**。既有 12 个缩写的索引
+(§1.33)重命名会触及迁移历史(`aux-01 §H` 规定「永远追加, 不改历史」), 不在本次
+范围 —— 但新表不该再欠一笔。
+
+#### 验证
+
+- `cargo test -p im-core --lib` → **54 passed / 0 failed**(基线 50 + 新增 4)
+- `cargo test -p im-gateway --bins` → **140 passed / 0 failed**
+- `cargo test -p im-gateway --test migration_smoke` → **3 passed**
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` **EXIT=0**
+  (过程中修掉 1 处 `unused_doc_comment` —— 真值表注释被我写进了函数体)
+- `scripts/check-openapi.ps1` exit 0
+
+#### 位置
+
+- `migrations/0008_create_dlq_records.sql` (表 + 3 索引 + 2 CHECK)
+- `crates/im-core/src/event/publisher.rs` (`DlqSink` / `PgDlqSink` /
+  `combine_dlq_results` / 双层写入)
+- `crates/im-core/tests/dlq_pg_sink_integration.rs` (真 PG, 3 个)
+- `crates/im-gateway/src/main.rs` (PG 层接线, 生产下总是 `Some`)
+- `crates/im-gateway/src/health.rs` (10 个指标)
+
+Commit: `2b73080`
+
+---
+
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
