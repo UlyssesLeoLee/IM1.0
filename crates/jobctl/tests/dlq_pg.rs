@@ -75,7 +75,17 @@ async fn require_table(p: &PgPool) {
     );
 }
 
-/// 造一条死信, **经由真正的生产者** `PgDlqSink` 落库
+/// 造一条死信, **经由真正的生产者** `PgDlqSink` 落库, 并让它真的「变老」
+///
+/// ## 2026-10-06: `failed_at` 必须显式改, 不能靠 `new()` 的入参
+///
+/// `DlqRecord::new` 把 `failed_at` 写死成 `Utc::now()`
+/// (`crates/im-core/src/event/publisher.rs:393`), **完全不使用**传入的
+/// `last_attempt_at` —— 后者落在 `context.last_attempt_at` 上。
+///
+/// 夹具原本假设 `new()` 会跟随传入时间, 于是 `seed(..., 60)` 造出的其实是一条
+/// 「刚刚」的行, `--since` 的三条断言全部命中。测试红在了一个**夹具的错误假设**
+/// 上, 生产代码是对的(死信落库时刻就该是 `now()`)。
 async fn seed(p: &PgPool, topic: &str, payload: &[u8], failed_secs_ago: i64) -> DlqRecord {
     let now = Utc::now();
     let rec = DlqRecord::new(
@@ -90,6 +100,17 @@ async fn seed(p: &PgPool, topic: &str, payload: &[u8], failed_secs_ago: i64) -> 
         .store(&rec)
         .await
         .expect("PgDlqSink 应写入成功(否则读侧测的就不是真实存法)");
+
+    sqlx::query(
+        "UPDATE dlq_records SET failed_at = now() - make_interval(secs => $2::float8) \
+         WHERE dlq_id = $1",
+    )
+    .bind(rec.dlq_id)
+    .bind(failed_secs_ago as f64)
+    .execute(p)
+    .await
+    .expect("把 failed_at 改老失败 —— 少了这一步, --since 的断言全是假的");
+
     rec
 }
 
@@ -255,10 +276,12 @@ async fn replay_of_a_json_payload_republishes_equivalent_bytes() {
     cleanup(&p, &ids).await;
 }
 
-/// **本文件最该被守住的一条**: 解析失败时存下的 JSON 字符串, 重放时必须还原
-/// 成**原始字节**, 而不是双重编码
+/// 解析失败但**是合法 UTF-8** 的载荷: 重放必须**逐字节**还原, 且不得双重编码
 ///
-/// 退化路径的样子:
+/// 这是真实场景(事件载荷是 JSON, 解析失败通常意味着上游发了半截/畸形 JSON,
+/// 而那仍然是合法 UTF-8), 也是 `payload_bytes` 唯一能保证无损的那一类。
+///
+/// 双重编码的形态:
 /// ```text
 /// 库里存的是   "\"hello\""            (JSON 字符串, 内容 hello)
 /// 错的做法     "\"\\\"hello\\\"\""    (引号又套一层)
@@ -266,12 +289,12 @@ async fn replay_of_a_json_payload_republishes_equivalent_bytes() {
 /// 错的后果不是「重放失败」, 而是「重放成功地把一条坏数据又发了出去」——
 /// 下游拿到 `\"hello\"` 解析成带引号的字符串, 业务上却看不出任何异常。
 #[tokio::test]
-async fn replay_of_an_unparseable_payload_sends_the_raw_bytes_not_double_encoded() {
+async fn replay_of_an_unparseable_utf8_payload_sends_the_raw_bytes_not_double_encoded() {
     let Some(p) = pool().await else { return };
     require_table(&p).await;
 
-    // 非 JSON、非 UTF-8 —— `DlqRecord` 会把它存成 JSON 字符串
-    let raw: &[u8] = b"\xff\xfe not utf8, not json at all";
+    // 非 JSON 但是合法 UTF-8 —— `DlqRecord` 会把它存成 JSON 字符串
+    let raw: &[u8] = br#"{"broken":"#.as_slice();
     let a = seed(&p, "im.message.recalled", raw, 5).await;
     let ids = [a.dlq_id];
 
@@ -291,16 +314,81 @@ async fn replay_of_an_unparseable_payload_sends_the_raw_bytes_not_double_encoded
     assert_eq!(
         cap[0].1,
         raw.to_vec(),
-        "重放出去的必须**逐字节**等于原始载荷。若失败, 检查 payload_bytes 是否 \
-         退化成了 serde_json::to_vec(那个 JSON 字符串)"
+        "UTF-8 载荷必须**逐字节**还原。若失败, 检查 payload_bytes 是否退化成了 \
+         serde_json::to_vec(那个 JSON 字符串)"
     );
     // 反例守卫: 不能是「看起来一样的双重编码」
     let encoded = serde_json::to_vec(&serde_json::Value::String(
-        String::from_utf8_lossy(raw).to_string(),
+        String::from_utf8_lossy(raw).into_owned(),
     ))
     .unwrap();
     assert_ne!(cap[0].1, encoded, "双重编码的形态必须被排除");
-    drop(cap);
+
+    cleanup(&p, &ids).await;
+}
+
+/// **已知的静默损坏**: 非 UTF-8 载荷在**写入时**就被 `from_utf8_lossy` 破坏
+///
+/// 2026-10-06 在真库上实测到: 原本这个用例断言「非 UTF-8 载荷也能逐字节还原」,
+/// 实测拿到的是
+/// ```text
+/// left:  [239,191,189, 239,191,189, 32, ...]   <- 两个 U+FFFD
+/// right: [255,254, 32, ...]                     <- 原始的 0xFF 0xFE
+/// ```
+/// 根因在 `DlqRecord::new`
+/// (`crates/im-core/src/event/publisher.rs:374`): 它用
+/// `String::from_utf8_lossy(payload)`, 把非法字节替换成 U+FFFD。**信息在写的
+/// 那一步就没了**, `payload_bytes` 无论怎么写都还原不回来。
+///
+/// 严重性: DLQ 这一层的存在理由是「NATS 挂了事件不丢」, 而它对**非 UTF-8**
+/// 载荷做的是**静默改写**, 且改写后的行看起来完全正常 —— 没有标记、没有告警。
+///
+/// 为什么**不在这里修**: 无损需要改 `original_payload` 的存储形状(如
+/// `{"__b64__": "..."}`), 而 aux-08 §D.2 冻结了该字段的 JSON 形状, 属规范变更。
+/// 已记入 `docs/gap-ledger.md` §1.35 待规范所有者裁决。
+///
+/// 本用例的职责: 把这个**已知行为**钉住, 使得将来若真去修(改成 base64 或
+/// 其它形状), 它会**变红** —— 那正是「行为已变」的信号, 而不是悄悄漂移。
+#[tokio::test]
+async fn replay_of_a_non_utf8_payload_is_lossy_at_write_time() {
+    let Some(p) = pool().await else { return };
+    require_table(&p).await;
+
+    let raw: &[u8] = b"\xff\xfe not utf8, not json at all";
+    let a = seed(&p, "im.message.recalled", raw, 5).await;
+    let ids = [a.dlq_id];
+
+    let seen = Arc::new(Mutex::new(Vec::<(String, Vec<u8>)>::new()));
+    let sink = seen.clone();
+    dlq::replay_with(&p, a.dlq_id, move |topic, bytes| {
+        let sink = sink.clone();
+        async move {
+            sink.lock().unwrap().push((topic, bytes));
+            Ok(())
+        }
+    })
+    .await
+    .unwrap();
+
+    let cap = { seen.lock().unwrap().clone() };
+    let sent = &cap[0].1;
+    assert_ne!(
+        sent,
+        &raw.to_vec(),
+        "当前实现是 lossy 的, 所以重放内容**不等于**原始字节。若这条断言失败, \
+         说明 from_utf8_lossy 已被替换成无损方案 —— 好消息, 但必须同步改 aux-08 \
+         §D.2 的 original_payload 形状说明与 gap-ledger §1.35"
+    );
+    assert_eq!(
+        sent,
+        String::from_utf8_lossy(raw).as_bytes(),
+        "实际送出的应是 from_utf8_lossy 之后的替换字符形态"
+    );
+    assert_eq!(
+        sent.iter().filter(|b| **b == 0xEF).count(),
+        2,
+        "两个非法字节各对应一个 U+FFFD 的首字节 0xEF"
+    );
 
     cleanup(&p, &ids).await;
 }
@@ -366,9 +454,13 @@ async fn replay_refuses_rows_that_are_already_settled() {
         .await
         .unwrap();
 
+    // 断言的是**区分性**用词, 不是整句 —— 整句一旦改个标点就红, 而那句话
+    // 对判断「为什么被拒」没有额外信息。
+    // 2026-10-06 踩过: 原先断言找子串 "已重放", 而实际消息是「已于先前重放过」
+    // —— "已" 与 "重放" 中间隔了 3 个字, 子串不存在, 测试红在一个纯措辞差异上。
     let r1 = dlq::replay_with(&p, a.dlq_id, |_t, _b| async { Ok(()) }).await;
     let e1 = r1.unwrap_err();
-    assert!(e1.contains("已重放"), "已重放的应被拒, 实际: {e1}");
+    assert!(e1.contains("重放过"), "已重放的应被拒, 实际: {e1}");
 
     let r2 = dlq::replay_with(&p, b.dlq_id, |_t, _b| async { Ok(()) }).await;
     let e2 = r2.unwrap_err();

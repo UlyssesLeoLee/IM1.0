@@ -28,13 +28,17 @@ async fn main() -> ExitCode {
         )
         .init();
 
-    let raw: Vec<String> = std::env::args().skip(1).collect();
-
     // 该规则针对把 `args` 拼进**安全敏感操作**(如 exec 拼命令行)。此处是
     // 运维 CLI 读**自己的** argv 取 `--database-url`, 是 CLI 的本职, 不存在
     // 「不可信输入拼进危险调用」的结构; 下游 parse 只做「找到 flag 取下一个
     // 非空串」, 不做任何拼接执行。
+    //
+    // `nosemgrep` **只对紧邻的下一行生效** —— 2026-10-06 踩过: 第一版把它写在
+    // 本段说明上方、中间隔了几行, 关联断了, semgrep 照样报出 finding。
+    // im-migrate/src/main.rs 早就把这条写成了注释, 这里再记一次。
     // nosemgrep: rust.lang.security.args.args
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+
     let invocation = match jobctl::parse_args(&raw) {
         Ok(i) => i,
         Err(e) => {

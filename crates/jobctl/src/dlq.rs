@@ -132,10 +132,24 @@ fn row_to_dlq_row(row: &sqlx::postgres::PgRow) -> Result<DlqRow, String> {
 /// 消费者按 JSON 解析时会得到字符串 `"hello"`(含引号)而不是 `hello`, 于是
 /// **重放看起来成功了, 实际上把一条坏数据重新发了出去** —— 这比重放失败更糟。
 ///
-/// 故显式区分两种形态, 并且这条不对称由单测钉住。
+/// 字节层: 非 UTF-8 的损坏**发生在写入时**, 这里救不回来
+///
+/// `DlqRecord::new`(im-core/src/event/publisher.rs:374)用的是
+/// `String::from_utf8_lossy(payload)`, 它把非法字节**替换成 U+FFFD**
+/// (`EF BF BD`)。也就是说 `0xFF 0xFE` 落库时已变成 `EF BF BD EF BF BD`
+/// —— 信息在**写**的那一步就没了, 本函数无论怎么写都还原不回去。
+///
+/// 这是 2026-10-06 在真库上实测到的
+/// (`replay_of_a_non_utf8_payload_is_lossy_at_write_time`)。要真正无损, 得改
+/// `original_payload` 的存储形状(如 `{"__b64__": "..."}`), 而 aux-08 §D.2
+/// 冻结了它的 JSON 形状 —— 那是规范所有者的裁决, 不是这里能顺手改的。
+/// 已记入 `docs/gap-ledger.md` §1.35。
+///
+/// 故本函数的契约是: **对 UTF-8 载荷无损**, 对非 UTF-8 载荷返回替换字符后的
+/// 结果。调用方不该假装它能还原任意字节。
 pub fn payload_bytes(stored: &Value) -> Vec<u8> {
     match stored {
-        // 解析失败时存的那条: 里面就是原始字节本身
+        // 解析失败时存的那条: 里面就是(可能被 lossy 处理过的)原始字节
         Value::String(raw) => raw.as_bytes().to_vec(),
         other => serde_json::to_vec(other).unwrap_or_default(),
     }
