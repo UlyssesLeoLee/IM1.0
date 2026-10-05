@@ -3174,7 +3174,7 @@ operation, 路由 24 条, 精确一一对应; 那 3 个未实装端点(`GET /v1/
 - `crates/jobctl/tests/dlq_pg.rs`(真 PG, 9 个)
 - `Cargo.toml`(workspace members + `im-migrate` 内部依赖)
 
-Commit: `08d0f07`
+Commit: `2543479`
 
 ---
 
