@@ -52,6 +52,73 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch { }
 
+# ============================================================================
+# 平台映射 —— 纯函数, 不读任何全局状态
+# ============================================================================
+#
+# 为什么单独抽出来: 「包名后缀 + 二进制扩展名」是打包里唯一一处**平台相关**的
+# 决策, 此前它是两行写死的 `-win-x64` 与 "$b.exe"。写死的后果不是「不优雅」,
+# 是 **CI 上根本产不出包**: 集成方在 Linux/macOS 上拿不到任何二进制分发件。
+#
+# 纯函数 = 参数进、值出, 不碰 $IsWindows / $env:X / 当前目录。理由是可测:
+# 只有纯函数才能在**任意**机器上被喂任意 (OSPlatform, Architecture) 组合 ——
+# 而 CI runner 恰恰就是要在一台不是自己的机器上问「如果我是 Linux 我会得到什么」。
+# 直接读全局状态的话, 这台 runner 永远只能验出它自己那一种组合。
+#
+# 契约:
+#   Suffix     包名后缀, 沿用 Rust target triple 的约定 (win-x64/linux-x64/darwin-arm64)
+#   Extension  可执行文件扩展名: Windows '.exe', 其余 '' (Unix 可执行文件无后缀)
+#   RustTarget  cargo 完整 target triple, 供 BUILD-INFO 记录 (人可读的溯源信息)
+#   IsWindows  决定文档/清理/示例该怎么写
+#
+# fail-closed: 不认识的 OS / 架构**抛异常**, 绝不编一个看起来合理的包名 ——
+# 一个错后缀的包会让人以为「这个平台没做」, 而实际是「平台识别错了」。
+function Get-PackageTarget {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)] [string] $OSPlatform,
+        [Parameter(Mandatory = $true)] [string] $Architecture
+    )
+
+    # switch 默认大小写不敏感, 故 'MacOS' / 'macos' 也认。
+    $os = switch ($OSPlatform) {
+        'Windows' { [pscustomobject]@{ Slug = 'win';    Ext = '.exe'; Triple = '{0}-pc-windows-msvc' } }
+        'Linux'   { [pscustomobject]@{ Slug = 'linux';  Ext = '';     Triple = '{0}-unknown-linux-gnu' } }
+        'macOS'   { [pscustomobject]@{ Slug = 'darwin'; Ext = '';     Triple = '{0}-apple-darwin' } }
+        default {
+            throw "不支持的操作系统: '$OSPlatform'。已实现 Windows / Linux / macOS; 其它平台没有经过验证的包名约定, 拒绝编造。"
+        }
+    }
+
+    $arch = switch ($Architecture) {
+        'X64'   { 'x64' }
+        'Arm64' { 'arm64' }
+        default {
+            throw "不支持的架构: '$Architecture'。已实现 X64 / Arm64; 其它架构没有经过验证的包名约定, 拒绝编造。"
+        }
+    }
+
+    $rustArch = if ($arch -eq 'x64') { 'x86_64' } else { 'aarch64' }
+
+    [pscustomobject]@{
+        OSPlatform  = $OSPlatform
+        Architecture = $Architecture
+        Suffix      = "$($os.Slug)-$arch"
+        Extension   = $os.Ext
+        RustTarget  = $os.Triple -f $rustArch
+        IsWindows   = ($OSPlatform -eq 'Windows')
+    }
+}
+
+# ---- 被 dot-source 时只取函数, 不执行下面的打包流程 ----
+# 单测要 import 上面的函数, 而本脚本余下部分是**有副作用的**(Set-Location /
+# cargo build / 删目录 / 写 zip)。不设这道闸, 测一个纯函数就会顺手把
+# `dist/` 删一遍重建 —— 测试不该动生产路径。
+# $MyInvocation.InvocationName 在 `pwsh -File x.ps1` / `& x.ps1` / `. x.ps1`
+# 三种调用下分别是 <路径> / '&' / '.'(已实测)。
+if ($MyInvocation.InvocationName -eq '.') { return }
+
 $repo = Split-Path -Parent $PSScriptRoot
 Set-Location $repo
 
