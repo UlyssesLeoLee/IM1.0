@@ -3314,6 +3314,23 @@ A-008 的完整算法是「帧路由 + 成员过滤」, 后半段在 `im-gateway
 末位)走不到第 2 轮 —— 需外部签发, 当前 API 造不出。故 1.91 µs 是双密钥场景的
 下界。**这个误标是被那条反例守卫的断言当场抓到的**, 不是事后复盘发现的。
 
+#### 附带修掉一个会让 CI 必红的 `.gitignore` 误伤
+
+首次提交时 `git status` 只列出 7 个文件, 而我新建的**基准源码不在其中** ——
+`.gitignore:13` 有一行 `benches/`(注释写的是「benchmark **产物**」), 它匹配
+**任意深度**的同名目录, 把 Rust 标准的**源码**目录 `crates/*/benches/` 也吞了。
+
+后果不是「少了点东西」, 而是 **Cargo.toml 里的 `[[bench]]` 指向一个 git 里根本
+不存在的文件 —— CI 构建必红**。
+
+该行本也不需要: criterion 的产物默认写在 `target/criterion/`, 已被
+`.gitignore` 的 `target/` 与 `target/criterion/` 覆盖。故**整行删除**并在原地
+留注释说明, 免得有人再加回来。
+
+> 怎么发现的: 提交前把 `git status --porcelain` 的清单与「我刚写了哪些文件」
+> 逐条对账, 发现少了两个。新增目录若名字看起来像产物目录(`benches` / `build`
+> / `dist`), 提交前**必须** `git check-ignore -v <file>` 确认一次。
+
 #### 位置
 
 - `crates/im-core/benches/auth_hotpath.rs` + `crates/im-core/tests/bench_fixture_guards.rs`

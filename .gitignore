@@ -10,7 +10,14 @@ Cargo.lock.bak
 .sqlx/
 
 # benchmark 产物
-benches/
+#
+# 2026-10-06 **删掉**了原先这里的 `benches/`。它是想忽略基准产物, 但
+# `benches/` 匹配**任意深度**的同名目录, 于是把 Rust 标准的**源码**目录
+# `crates/*/benches/` 也一起吞了 —— 后果是 Cargo.toml 里的 `[[bench]]`
+# 指向一个 git 里根本不存在的文件, CI 构建必红。
+#
+# 而它本来也不需要: criterion 的产物默认写在 `target/criterion/`, 已被下面
+# 这行和第 2 行的 `target/` 覆盖。少一条误伤源, 不丢任何覆盖。
 target/criterion/
 
 # ===== Node / Next.js (V1+ Dashboard) =====
