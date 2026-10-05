@@ -6,7 +6,8 @@
 //! 1. 幂等检查(同 (conv, sender, idem_key) 已存在则直接返回,视为成功)
 //! 2. 校验:content 大小 + 按 kind 的 schema 校验 + 会话成员 + DM friend 关系校验
 //! 3. 开事务:取 sequence(行锁强单调) + insert
-//! 4. 提交事务后发布 `im.message.created` 事件(失败不阻塞 ack,V1+ outbox)
+//! 4. 提交事务后发布 `im.message.created` 事件(失败不阻塞 ack; publisher
+//!    按 aux-08 重试并把耗尽的事件写入 NATS DLQ)
 //! 5. 返回 Message
 //!
 //! ## Friend 关系校验(per 132-wbs §5.3.1 C-2 验收)
@@ -219,7 +220,7 @@ impl MessageService {
             .await
             .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx commit: {}", e)))?;
 
-        // === 第 4 步:提交后发事件(失败不阻塞 ack,V1+ outbox 持久化重试) ===
+        // === 第 4 步:提交后发事件(失败不阻塞 ack; publisher 已写 DLQ) ===
         let event = MessageCreatedEvent {
             message_id: msg.id,
             conversation_id: msg.conversation_id,
@@ -229,7 +230,16 @@ impl MessageService {
             ts: Utc::now(),
         };
         if let Err(e) = self.publish_event("im.message.created", &event).await {
-            tracing::error!(error = %e, message_id = %msg.id, "publish im.message.created failed, will be retried by outbox (V1+)");
+            // 消息本身已落库并会返回给客户端, 所以这里只记日志。
+            // 措辞必须指向**当下真实存在的**恢复路径(publisher 写的 DLQ), 而不是
+            // 一个「V1+ 会有 outbox」的将来式 —— 故障期间照着日志去查的人会
+            // 找不到任何东西。
+            tracing::error!(
+                error = %e,
+                message_id = %msg.id,
+                "publish im.message.created failed; see im_events_dlq_total / \
+                 im_events_dlq_write_failed_total (DLQ pending replay)"
+            );
         }
 
         // === 第 5 步:返回完整 Message ===
@@ -388,12 +398,14 @@ impl MessageService {
             ts: Utc::now(),
         };
         if let Err(e) = self.publish_event("im.message.recalled", &event).await {
-            // 与 send_message 同一约定: 事件失败不阻塞调用方(状态已落库),
-            // 真实重试依赖 V1+ outbox。
+            // 与 send_message 同一约定: 事件失败不阻塞调用方(状态已落库)。
+            // publisher 内部已按 aux-08 重试并写 DLQ, 所以这条错误说的是
+            // 「DLQ 里待重放」而不是「等某个将来的 outbox」—— 两者的处置不同。
             tracing::error!(
                 error = %e,
                 message_id = %updated.id,
-                "publish im.message.recalled failed, will be retried by outbox (V1+)"
+                "publish im.message.recalled failed; see im_events_dlq_total / \
+                 im_events_dlq_write_failed_total (DLQ pending replay)"
             );
         }
         Ok(updated)

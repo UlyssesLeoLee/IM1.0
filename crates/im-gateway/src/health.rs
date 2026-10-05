@@ -114,6 +114,15 @@ pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpRe
     let failed = im_core::event::publisher::failed_event_count();
     let dropped = im_core::event::publisher::dropped_event_count();
 
+    // 2026-10-05 (DLQ 实装) 新增的两个计数。
+    //
+    // `dlq` 与 `write_failed` 绝不能合并成一个: 前者是「事件已经落到可恢复的
+    // 地方」(可接受), 后者是「连兜底都没兜住, 事件**真的没了**」(不可接受)。
+    // 合成一个数, 面板上就分不出「有积压待处理」和「正在丢数据」—— 而这两者
+    // 的处置完全不同。
+    let dlq = im_core::event::publisher::dlq_event_count();
+    let dlq_write_failed = im_core::event::publisher::dlq_write_failed_count();
+
     // 2026-10-05(WS 投递索引改造)新增的三个 WS 指标。
     //
     // 为什么不沿用上一版的 `Lagged`: 上一版是单个 `broadcast` 通道, 慢客户端
@@ -154,7 +163,13 @@ pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpRe
              im_events_publish_failed_total {failed}\n\
              # HELP im_events_dropped_total 因 IM_EVENT_PUBLISHER_KIND=stub 被丢弃的领域事件数(配置问题, 非故障)\n\
              # TYPE im_events_dropped_total counter\n\
-             im_events_dropped_total {dropped}\n"
+             im_events_dropped_total {dropped}\n\
+             # HELP im_events_dlq_total 重试耗尽后写入 NATS DLQ 的事件数(aux-08; 可恢复, 待人工重放)\n\
+             # TYPE im_events_dlq_total counter\n\
+             im_events_dlq_total {dlq}\n\
+             # HELP im_events_dlq_write_failed_total 连写 DLQ 都失败、事件**永久丢失**的次数; NATS 整体不可用时增长\n\
+             # TYPE im_events_dlq_write_failed_total counter\n\
+             im_events_dlq_write_failed_total {dlq_write_failed}\n"
         ))
 }
 
@@ -328,6 +343,56 @@ mod tests {
             assert!(
                 text.contains(name),
                 "/metrics 必须同时暴露 {name}, 否则真实发布故障会与 stub 混为一谈: {text}"
+            );
+        }
+
+        // 2026-10-05 DLQ: 两个计数必须都在, 且**语义相反地重要**。
+        //
+        // `write_failed` 是本文件里唯一能说出「有多少事件彻底没了」的指标。
+        // 它若没被挂到 /metrics, NATS 整体不可用时的数据丢失就完全不可见 ——
+        // 而 `publish_failed` 在涨, 看上去像「在重试, 等会就好」。
+        //
+        // 断言用**前后差**而不是绝对值 0: libtest 在本进程内并行跑用例, 任何
+        // 「某个别的测试让 NATS 抖了一下」都会让绝对值断言假红。差值断言测的
+        // 是同一个性质(本用例这次 stub publish 没有碰 DLQ), 且是确定的。
+        let dlq_before = im_core::event::publisher::dlq_event_count();
+        let dlq_failed_before = im_core::event::publisher::dlq_write_failed_count();
+        StubEventPublisher::new()
+            .publish("im.probe.dlq_wiring", b"{}")
+            .await
+            .expect("stub 返回 Ok");
+        assert_eq!(
+            im_core::event::publisher::dlq_event_count(),
+            dlq_before,
+            "stub 是**配置选择**不是故障, 绝不该进 DLQ —— 否则运维会去排障一个 \
+             根本不存在的问题"
+        );
+        assert_eq!(
+            im_core::event::publisher::dlq_write_failed_count(),
+            dlq_failed_before,
+            "stub 同理不该动「永久丢失」计数"
+        );
+
+        for name in ["im_events_dlq_total", "im_events_dlq_write_failed_total"] {
+            assert!(
+                text.contains(name),
+                "/metrics 必须暴露 {name}: 事件发布失败若没进 DLQ, 没有任何外部表征。\
+                 加了计数器却忘挂 /metrics, 与没加计数器是同一种静默: {text}"
+            );
+            let line = text
+                .lines()
+                .find(|l| l.starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("/metrics 里没有 {name} 的数据行: {text}"));
+            let value: u64 = line
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or_else(|| panic!("无法解析 {name} 的值: {line}"))
+                .parse()
+                .unwrap_or_else(|e| panic!("{name} 的值不是整数({line}): {e}"));
+            assert!(
+                value >= dlq_before.min(dlq_failed_before),
+                "{name} 的值 {value} 看起来不像进程级累计值 —— 它必须真接到了 \
+                 /metrics 而不是硬编码常量: {line}"
             );
         }
     }

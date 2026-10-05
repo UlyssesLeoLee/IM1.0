@@ -92,7 +92,7 @@
         "tags": ["ops"],
         "operationId": "metrics",
         "summary": "Prometheus 文本指标",
-        "description": "Prometheus text exposition format v0.0.4。\n\nWS 连接类(4 项):\n- `im_ws_broadcast_subscriptions` (gauge) 已建出站通道的 WS 连接数, 含尚未鉴权的\n- `im_ws_authenticated_connections` (gauge) 已进入投递索引的 WS 连接数\n- `im_ws_indexed_conversations` (gauge) 投递索引中登记的会话数\n- `im_ws_broadcast_dropped_total` (counter) 因收件端出站通道写满而丢弃的帧数; 客户端需经 `GET /v1/conversations/{id}/messages` 补齐\n\n领域事件类(3 项):\n- `im_events_published_total` (counter) 成功发布并拿到 JetStream ack 的事件数\n- `im_events_publish_failed_total` (counter) 发布失败数; **当前无 DLQ, 这些事件已丢失**\n- `im_events_dropped_total` (counter) 因 `IM_EVENT_PUBLISHER_KIND=stub` 被丢弃数 (配置问题, 非故障)",
+        "description": "Prometheus text exposition format v0.0.4。\n\nWS 连接类(4 项):\n- `im_ws_broadcast_subscriptions` (gauge) 已建出站通道的 WS 连接数, 含尚未鉴权的\n- `im_ws_authenticated_connections` (gauge) 已进入投递索引的 WS 连接数\n- `im_ws_indexed_conversations` (gauge) 投递索引中登记的会话数\n- `im_ws_broadcast_dropped_total` (counter) 因收件端出站通道写满而丢弃的帧数; 客户端需经 `GET /v1/conversations/{id}/messages` 补齐\n\n领域事件类(3 项):\n- `im_events_published_total` (counter) 成功发布并拿到 JetStream ack 的事件数\n- `im_events_publish_failed_total` (counter) 发布尝试失败数(**含每次重试**, 故会大于 DLQ 数); 已按 aux-08 §C.3 重试, 耗尽后转 DLQ\n- `im_events_dropped_total` (counter) 因 `IM_EVENT_PUBLISHER_KIND=stub` 被丢弃数 (配置问题, 非故障)\n\nDLQ 类(2 项, aux-08):\n- `im_events_dlq_total` (counter) 重试耗尽后写入 NATS DLQ 的事件数; **可恢复**, 待人工重放\n- `im_events_dlq_write_failed_total` (counter) 连写 DLQ 都失败、事件**永久丢失**的次数; NATS 整体不可用时增长。这是唯一能说出「有多少事件彻底没了」的指标 —— 它为 0 才代表没有不可恢复的丢失",
         "x-error-codes": [],
         "responses": {
           "200": {
