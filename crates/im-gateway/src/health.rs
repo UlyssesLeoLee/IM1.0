@@ -158,7 +158,7 @@ pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpRe
              # HELP im_events_published_total 成功发布并拿到 JetStream ack 的领域事件数\n\
              # TYPE im_events_published_total counter\n\
              im_events_published_total {published}\n\
-             # HELP im_events_publish_failed_total 发布失败的事件数(NATS 超时/拒绝; 当前无 DLQ, 这些事件已丢失)\n\
+             # HELP im_events_publish_failed_total 发布尝试失败数(含每次重试, 故大于 DLQ 数); 耗尽后转 aux-08 DLQ 而非直接丢弃\n\
              # TYPE im_events_publish_failed_total counter\n\
              im_events_publish_failed_total {failed}\n\
              # HELP im_events_dropped_total 因 IM_EVENT_PUBLISHER_KIND=stub 被丢弃的领域事件数(配置问题, 非故障)\n\
