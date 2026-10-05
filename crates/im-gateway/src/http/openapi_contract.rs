@@ -607,10 +607,11 @@ fn route_table_baseline() {
 /// `/metrics` 真实暴露的指标条数。
 ///
 /// 4 条 WS(`im_ws_*`)、3 条领域事件(`im_events_published_total` /
-/// `im_events_publish_failed_total` / `im_events_dropped_total`)、2 条 DLQ
-/// (`im_events_dlq_total` / `im_events_dlq_write_failed_total`, aux-08,
-/// 2026-10-05 加), 合计 **9**。数法: `health.rs::metrics` 里 `# HELP` 注释行
-/// 逐条数 —— 每个指标恰好一条。
+/// `im_events_publish_failed_total` / `im_events_dropped_total`)、3 条 DLQ
+/// (`im_events_dlq_total` / `im_events_dlq_write_failed_total` /
+/// `im_events_dlq_pg_write_failed_total` —— 前两条 aux-08 于 2026-10-05 加,
+/// 第三条是 aux-08 §D.3 的 PG 长留存层于 2026-10-06 加), 合计 **10**。
+/// 数法: `health.rs::metrics` 里 `# HELP` 注释行逐条数 —— 每个指标恰好一条。
 ///
 /// (此处刻意不在行首写 `+` / `*` / `-` / 数字加点: 那些都是 markdown 列表
 /// 标记, 会被 clippy 的 `doc_lazy_continuation` 判为「列表项未缩进」而
@@ -619,7 +620,7 @@ fn route_table_baseline() {
 /// 这个基线的作用不是「防止指标变多」, 而是**防止抽取逻辑坏掉**:
 /// 集合比较里两个空集合是相等的, 若两边都抽不出东西, `assert_eq!(doc, live)`
 /// 会恒真通过。基线断言排在集合比较**之前**, 正是为了堵这个洞。
-const EXPECTED_METRIC_COUNT: usize = 9;
+const EXPECTED_METRIC_COUNT: usize = 10;
 
 /// 从 markdown 反引号跨度里挑出形如 `` `im_xxx` `` 的**指标名**。
 ///

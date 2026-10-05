@@ -34,7 +34,7 @@ use im_common::config::{AppConfig, EventPublisherKind, SigningKeyConfig};
 use im_common::ids::EnvironmentId;
 use im_core::conversation::pg::PgConversationRepository;
 use im_core::conversation::service::ConversationService;
-use im_core::event::publisher::{NatsEventPublisher, StubEventPublisher};
+use im_core::event::publisher::{DlqSink, NatsEventPublisher, PgDlqSink, StubEventPublisher};
 use im_core::event::EventPublisher;
 use im_core::identity::pg::{PgDeviceSessionRepository, PgUserRepository};
 use im_core::identity::service::IdentityService;
@@ -130,11 +130,21 @@ async fn main() -> std::io::Result<()> {
                 .nats_url
                 .as_deref()
                 .unwrap_or("nats://localhost:4222");
+            // aux-08 §D.3 的 **PG 长留存层**(第 2 层)。
+            //
+            // 它的全部价值在于接住「NATS 整体不可用」—— 而那正是 NATS 层
+            // 自己失效的场景。没有它, NATS 挂掉时死信**也写不进去**, 事件
+            // 就真的永久没了(尽管 `IM_EVENTS_DLQ_WRITE_FAILED` 会诚实计数)。
+            //
+            // 生产下**总是**接上: `IM_POSTGRES_URL` 是必填项, 池在此之前
+            // 已经建好(第 3 步)。故这里没有「PG 层可选」的分叉 —— 可选只
+            // 存在于 `NatsEventPublisher` 那一侧, 供测试用。
+            let pg_dlq: Arc<dyn DlqSink> = Arc::new(PgDlqSink::new(pg_pool.clone()));
             // 连不上就**启动失败**, 不静默退化成 stub。理由: 运维显式配了
             // nats, 却在 NATS 不可用时得到一个「看起来正常、事件全丢」的进程,
             // 正是本仓反复修掉的那类假绿灯。`kind=stub` 仍然是可用的显式选择。
             Arc::new(
-                NatsEventPublisher::connect(url)
+                NatsEventPublisher::connect(url, Some(pg_dlq))
                     .await
                     .map_err(|e| std::io::Error::other(e.to_string()))?,
             )

@@ -47,7 +47,10 @@ fn nats_url_or_skip(context: &str) -> Option<String> {
 
 async fn connect_or_skip(context: &str) -> Option<NatsEventPublisher> {
     let url = nats_url_or_skip(context)?;
-    match NatsEventPublisher::connect(&url).await {
+    // `None` = 不接 PG 长留存层。本文件的用例断言的是 **NATS 层**的行为,
+    // 接上 PG 只会让「NATS 写成功」这条断言多一个无关的成功来源。PG 层由
+    // `dlq_pg_sink_integration.rs` 单独覆盖。
+    match NatsEventPublisher::connect(&url, None).await {
         Ok(p) => Some(p),
         Err(e) => {
             if std::env::var("IM_REQUIRE_NATS").as_deref() == Ok("1") {
@@ -142,7 +145,7 @@ async fn connect_is_idempotent_across_restarts() {
 
     let url = std::env::var("IM_NATS_URL").expect("第一个 connect 已确认有地址");
     // 第二次连接: stream 已存在, create_or_update_stream 必须走 update 分支
-    match NatsEventPublisher::connect(&url).await {
+    match NatsEventPublisher::connect(&url, None).await {
         Ok(_) => {}
         Err(e) => {
             panic!("stream 已存在时第二次 connect 必须成功(create_or_update_stream 幂等): {e}")
@@ -159,7 +162,7 @@ async fn connect_is_idempotent_across_restarts() {
 async fn connect_to_dead_endpoint_fails_instead_of_silently_stubbing() {
     // 127.0.0.1:1 —— 保留端口, 本机几乎不可能有服务在监听
     let started = std::time::Instant::now();
-    let r = NatsEventPublisher::connect("nats://127.0.0.1:1").await;
+    let r = NatsEventPublisher::connect("nats://127.0.0.1:1", None).await;
     let elapsed = started.elapsed();
 
     assert!(

@@ -83,6 +83,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
@@ -136,6 +137,21 @@ static EVENTS_DLQ_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// 失败计数在涨, 但没有任何东西说明这些失败连兜底都没兜住。
 static EVENTS_DLQ_WRITE_FAILED: AtomicU64 = AtomicU64::new(0);
 
+/// **PG 长留存层**写入失败的次数 (2026-10-06, aux-08 §D.3 第 2 层)
+///
+/// ## 为什么它与 `EVENTS_DLQ_WRITE_FAILED` 是两个量
+///
+/// 那个计数的语义是「**所有**层都没接住 -> 事件永久丢失」。而这一层可能失败
+/// 时 NATS 层**已经接住了** —— 事件没丢, 只是丢了长留存的那份副本。
+///
+/// 两者的处置完全不同:
+/// - `dlq_write_failed` 涨 = **有数据没了** -> P1
+/// - 本计数涨 = **副本没留下** -> P2(7 天后那条死信就查不到了)
+///
+/// 合成一个数, 就无法区分「正在丢数据」与「备份没做上」—— 而这恰恰是
+/// `aux-08 §D.5` 告警阈值要分开的两种情况。
+static EVENTS_DLQ_PG_WRITE_FAILED: AtomicU64 = AtomicU64::new(0);
+
 pub fn published_event_count() -> u64 {
     EVENTS_PUBLISHED.load(Ordering::Relaxed)
 }
@@ -156,6 +172,11 @@ pub fn dlq_event_count() -> u64 {
 /// DLQ 写入也失败、事件永久丢失的次数
 pub fn dlq_write_failed_count() -> u64 {
     EVENTS_DLQ_WRITE_FAILED.load(Ordering::Relaxed)
+}
+
+/// PG 长留存层写入失败的次数(事件未必丢 —— 见该计数器的说明)
+pub fn dlq_pg_write_failed_count() -> u64 {
+    EVENTS_DLQ_PG_WRITE_FAILED.load(Ordering::Relaxed)
 }
 
 // ---------------------------------------------------------------------------
@@ -182,6 +203,15 @@ const PUBLISH_ACK_TIMEOUT: Duration = Duration::from_secs(3);
 /// 并被 [`EVENTS_DLQ_WRITE_FAILED`] 计数 —— 宁可让「丢失」可见, 也不把
 /// 请求挂住。
 const DLQ_WRITE_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// 写 **PG** DLQ 层自己的上界 —— 比 `DLQ_WRITE_TIMEOUT` **更短**
+///
+/// PG 写入比 NATS 慢的常见原因不是网络, 而是 `pool.acquire()` 在等一个空闲
+/// 连接: 池被打满时它会等 `acquire_timeout`。给 1s 与给 NATS 层一样的上界,
+/// 就等于在 NATS 已经慢的前提下再叠 1s。给 1s 的一半(500ms)是因为这一层是
+/// **兜底**, 抢的是「NATS 挂掉时的那条路」—— 而那条路上, 用户请求已经等过
+/// 完整的重试预算了。
+const PG_DLQ_WRITE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// 事件 stream 名
 pub const EVENT_STREAM: &str = "IM_EVENTS";
@@ -664,10 +694,138 @@ where
     }
 }
 
+/// 合成两层 DLQ 的结果: **任一层接住就算可恢复** (aux-08 §D.3)
+///
+/// ## 为什么这条规则值得单独抽成一个纯函数
+///
+/// 它是本次增量的**全部意义**所在: PG 层的价值恰恰在于接住「NATS 整体不可用」。
+/// 若判定仍写成「NATS 写成功才算可恢复」, 那么在 PG 层唯一重要的那个场景里,
+/// PG 会被**自己拖累成「失败」** —— 一个只在 NATS 挂掉时才触发的 bug, 平时
+/// 永远看不见。
+///
+/// 而这几种组合在集成环境里**没法稳定复现**: 要让 NATS 层在 PG 层正常的场景下
+/// 失败, 只能去杀 NATS。故抽成纯函数, 逐格断言。
+///
+/// ## 真值表(逐格对应 `dlq_is_recoverable_when_either_layer_accepts`)
+///
+/// | nats | pg | 判定 |
+/// |---|---|---|
+/// | Ok | Ok / None | 可恢复 |
+/// | Err | Ok | 可恢复 —— **PG 层存在的全部意义** |
+/// | Ok | Err | 可恢复 —— 丢的是长留存副本, 事件仍在 NATS |
+/// | Err | None | 永久丢失 —— 没配 PG 层时**没有**东西接住它 |
+/// | Err | Err | 永久丢失 |
+///
+/// ## 为什么 `None` 不能算成「PG 成功」
+///
+/// `None` 是「该进程**没配**这一层」, 不是「这一层成功」。把它当成功的话,
+/// 「没配 PG 且 NATS 挂了」会被判成可恢复 —— 而实际上没有任何东西接住那条
+/// 事件, 它就是丢了。`absent_pg_layer_does_not_rescue_a_failed_publish` 专门
+/// 锁这一格。
+pub fn combine_dlq_results(
+    nats: Result<(), String>,
+    pg: Option<Result<(), String>>,
+) -> Result<(), String> {
+    match (nats, pg) {
+        (Ok(()), _) => Ok(()),
+        (Err(_), Some(Ok(()))) => Ok(()),
+        (Err(nats_e), None) => Err(nats_e),
+        (Err(nats_e), Some(Err(pg_e))) => Err(format!("nats: {nats_e}; postgres: {pg_e}")),
+    }
+}
+
+/// DLQ 的一个落地后端
+///
+/// ## 为什么要抽象成 trait
+///
+/// `aux-08 §D.3` 要求**两层**留存: NATS JetStream(7 天 / 256MB)与
+/// PostgreSQL(长留存)。而 PG 那一层的**全部价值**在于接住「NATS 整体不可用」
+/// —— 那正是 NATS 层失效的场景。故两层必须**并列**而非二选一, 且「可恢复」的
+/// 判定必须改成「**任一**层接住」。
+///
+/// 抽象成 trait 的收益是**可测**: `orchestrate_publish` 的 DLQ 分支此前用
+/// 闭包注入, 现在两个后端的行为可以在无 PG、无 NATS 的环境下分别验。
+#[async_trait]
+pub trait DlqSink: Send + Sync {
+    /// 后端标识, 出现在启动日志与错误串里
+    fn name(&self) -> &'static str;
+
+    /// 把一条死信落地
+    ///
+    /// 返回 `Err(String)` 表示**这一层没接住**。调用方据此决定:
+    /// 全部后端都失败才算「事件永久丢失」。
+    async fn store(&self, record: &DlqRecord) -> Result<(), String>;
+}
+
+/// aux-08 §D.3 的 PostgreSQL 长留存层 (`migrations/0008_create_dlq_records.sql`)
+///
+/// ## 为什么**不**写 `audit_logs`
+///
+/// `aux-08 §D.3` 的 MVP 原文是 `audit_logs(action=dlq_record, detail=JSONB)`,
+/// 但那张表(`migrations/0006`)有 `tenant_id UUID NOT NULL` 与
+/// `target_type` 的 6 值 CHECK(不含「事件」), 而事件发布路径**拿不到租户**。
+/// 详见 0008 migration 顶部。2026-10-06 架构拍板走专表。
+pub struct PgDlqSink {
+    pool: sqlx::PgPool,
+}
+
+impl PgDlqSink {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl DlqSink for PgDlqSink {
+    fn name(&self) -> &'static str {
+        "postgres:dlq_records"
+    }
+
+    async fn store(&self, record: &DlqRecord) -> Result<(), String> {
+        sqlx::query(
+            "INSERT INTO dlq_records (\
+               dlq_id, original_task, original_payload,\
+               error_code, error_message, error_stack, error_http_status,\
+               context_trace_id, context_user_id, context_env_id,\
+               context_attempt_count, context_first_attempt_at,\
+               context_last_attempt_at, failed_at, dlq_destination\
+             ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)",
+        )
+        .bind(record.dlq_id)
+        .bind(&record.original_task)
+        // `original_payload` 是 JSONB。`DlqRecord` 构造时已保证它是合法的
+        // `serde_json::Value`(解析失败会退化成 JSON 字符串), 故可直接绑定。
+        .bind(&record.original_payload)
+        .bind(&record.error.code)
+        .bind(&record.error.message)
+        .bind(&record.error.stack)
+        .bind(record.error.http_status as i16)
+        .bind(&record.context.trace_id)
+        .bind(&record.context.user_id)
+        .bind(&record.context.env_id)
+        .bind(record.context.attempt_count as i32)
+        .bind(record.context.first_attempt_at)
+        .bind(record.context.last_attempt_at)
+        .bind(record.failed_at)
+        .bind(&record.dlq_destination)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("insert into dlq_records: {e}"))
+    }
+}
+
 /// 真实的 NATS JetStream 发布器 (D-3)
 pub struct NatsEventPublisher {
     client: async_nats::Client,
     js: async_nats::jetstream::Context,
+    /// aux-08 §D.3 的 PG 长留存层
+    ///
+    /// `None` = 只靠 NATS 层(测试 / 显式不配)。生产下 `main.rs` **总是**
+    /// 传 `Some` —— 它有 `IM_POSTGRES_URL`, 而那是必填项。取 `Option` 而非
+    /// 必填, 是为了让「本进程没接住 PG 死信」这件事能被 `Some/None` 直接
+    /// 表达, 并在启动日志里报出来, 而不是悄悄退化成单层。
+    pg_dlq: Option<Arc<dyn DlqSink>>,
 }
 
 impl NatsEventPublisher {
@@ -675,7 +833,10 @@ impl NatsEventPublisher {
     ///
     /// 失败即 `Err`: 调用方(`main.rs`)据此**拒绝启动**。配了 `kind=nats`
     /// 却静默退化成 stub, 是本文件长期存在的那类缺陷, 不再重复。
-    pub async fn connect(url: &str) -> Result<Self, AppError> {
+    ///
+    /// `pg_dlq` 是 `aux-08 §D.3` 的 PG 长留存层。传 `None` 表示只靠 NATS 层
+    /// —— 生产下**不该**发生, 而它一旦发生就会打在启动日志里。
+    pub async fn connect(url: &str, pg_dlq: Option<Arc<dyn DlqSink>>) -> Result<Self, AppError> {
         let client = match tokio::time::timeout(CONNECT_TIMEOUT, async_nats::connect(url)).await {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
@@ -702,9 +863,10 @@ impl NatsEventPublisher {
             subjects = EVENT_SUBJECT_FILTER,
             dlq_stream = DLQ_STREAM,
             dlq_max_age = ?DLQ_MAX_AGE,
+            pg_dlq_layer = pg_dlq.as_ref().map(|s| s.name()).unwrap_or("DISABLED"),
             "EventPublisher = NATS JetStream (D-3 实装, DLQ 已实装)"
         );
-        Ok(Self { client, js })
+        Ok(Self { client, js, pg_dlq })
     }
 
     /// 底层 client —— 供集成测试订阅断言用
@@ -756,10 +918,17 @@ impl EventPublisher for NatsEventPublisher {
             }
         };
 
-        // 写 DLQ: 同样的 stream 客户端, 不同 subject。
+        // 写 DLQ: **两层并列** —— NATS JetStream(7 天) + PG `dlq_records`(长留存)。
+        //
+        // 判定规则: **任一层接住就算可恢复**。这正是 PG 层的存在意义 ——
+        // 它专门接住「NATS 整体不可用」这个 NATS 层自己失效的场景。
+        // 若仍按「NATS 写成功才算可恢复」判定, PG 层在它唯一重要的场景里
+        // 反而会被自己拖累成「失败」。
         let js_dlq = self.js.clone();
+        let pg_dlq = self.pg_dlq.clone();
         let mut do_dlq = move |rec: DlqRecord| {
             let js = js_dlq.clone();
+            let pg = pg_dlq.clone();
             async move {
                 let subject = rec.dlq_destination.clone();
                 let body = Bytes::from(
@@ -768,11 +937,59 @@ impl EventPublisher for NatsEventPublisher {
                 // DLQ 写入**不能再等一个完整 ack_timeout**: 此刻已经在预算
                 // 末尾, 再等 3s 就等于把「不阻塞 ack」彻底破坏。给一个短上界,
                 // 失败就承认失败(并被计数), 而不是把请求挂住。
-                match tokio::time::timeout(DLQ_WRITE_TIMEOUT, js.publish(subject, body)).await {
+                let nats_res = match tokio::time::timeout(
+                    DLQ_WRITE_TIMEOUT,
+                    js.publish(subject, body),
+                )
+                .await
+                {
                     Err(_) => Err(format!("DLQ write timed out after {DLQ_WRITE_TIMEOUT:?}")),
                     Ok(Err(e)) => Err(e.to_string()),
                     Ok(Ok(ack)) => ack.await.map(|_a| ()).map_err(|e| e.to_string()),
-                }
+                };
+
+                let pg_res = match &pg {
+                    None => Ok(()), // 该进程没配 PG 层, 不是失败
+                    Some(sink) => {
+                        // PG 写入给一个**更短**的上界: 它此刻在预算末尾, 而
+                        // `acquire()` 可能要等池里空闲连接。宁可承认失败, 也不
+                        // 把用户的请求挂住 —— PG 失败会被单独计数, 不是静默。
+                        match tokio::time::timeout(PG_DLQ_WRITE_TIMEOUT, sink.store(&rec)).await {
+                            Err(_) => {
+                                let n =
+                                    EVENTS_DLQ_PG_WRITE_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+                                tracing::error!(
+                                    dlq_id = %rec.dlq_id,
+                                    sink = sink.name(),
+                                    pg_dlq_write_failed_total = n,
+                                    timeout_ms = PG_DLQ_WRITE_TIMEOUT.as_millis(),
+                                    "PG DLQ write timed out"
+                                );
+                                Err(format!(
+                                    "PG DLQ write timed out after {PG_DLQ_WRITE_TIMEOUT:?}"
+                                ))
+                            }
+                            Ok(Err(e)) => {
+                                let n =
+                                    EVENTS_DLQ_PG_WRITE_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+                                tracing::error!(
+                                    dlq_id = %rec.dlq_id,
+                                    sink = sink.name(),
+                                    pg_dlq_write_failed_total = n,
+                                    error = %e,
+                                    "PG DLQ write failed (NATS 层可能仍接住了本条)"
+                                );
+                                Err(e)
+                            }
+                            Ok(Ok(())) => Ok(()),
+                        }
+                    }
+                };
+
+                // 合成: 至少一层成功 = 可恢复
+                // `pg` 为 `None` 的分支在上面已折成 `Ok(())` —— 与
+                // `combine_dlq_results(nats, None)` 等价(两者都直接返回 nats)。
+                combine_dlq_results(nats_res, Some(pg_res))
             }
         };
 
@@ -1011,6 +1228,97 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), total, "四个取值必须互不相同: {names:?}");
+    }
+
+    // ---- 两层 DLQ 的合成规则 (aux-08 §D.3) ----
+
+    /// 四种组合逐个断言, 因为**每一种的后果都不同**
+    ///
+    /// 第 2 行是本次增量的**全部意义**: NATS 挂掉而 PG 接住了 —— 事件**没丢**。
+    /// 若这一行判成失败, 那么 PG 层会在它唯一重要的场景里被自己拖累, 而这种
+    /// 缺陷**平时永远看不出来**(要 NATS 挂掉才触发)。
+    #[test]
+    fn dlq_is_recoverable_when_either_layer_accepts() {
+        let ok: Result<(), String> = Ok(());
+        let nats_bad: Result<(), String> = Err("nats down".into());
+        let pg_bad: Result<(), String> = Err("pg down".into());
+
+        // 1. 两层都成功
+        assert!(combine_dlq_results(ok.clone(), Some(ok.clone())).is_ok());
+        // 2. NATS 失败、PG 成功 -> **可恢复**(PG 层存在的意义)
+        assert!(
+            combine_dlq_results(nats_bad.clone(), Some(ok.clone())).is_ok(),
+            "NATS 挂掉但 PG 接住了 -> 事件没丢, 必须判可恢复"
+        );
+        // 3. NATS 成功、PG 失败 -> 可恢复(长留存副本没了, 但事件在 NATS 里)
+        assert!(
+            combine_dlq_results(ok.clone(), Some(pg_bad.clone())).is_ok(),
+            "NATS 接住了就还没丢 —— 丢了的是长留存副本, 那是另一件事"
+        );
+        // 4. 两层都失败 -> 永久丢失
+        assert!(
+            combine_dlq_results(nats_bad.clone(), Some(pg_bad.clone())).is_err(),
+            "两层都没接住才是永久丢失"
+        );
+    }
+
+    /// 未配 PG 层时, 判定退化成「只看 NATS」, 且 `None` 本身**不是失败**
+    ///
+    /// 两个方向都要锁:
+    /// - NATS 成功 + `None` -> 可恢复(没配不是「失败」)
+    /// - NATS 失败 + `None` -> **仍然丢失**。`None` 是一层**不存在**的层,
+    ///   不是一层**成功**的层; 若把它算成成功, 「没配 PG 且 NATS 挂了」会被
+    ///   误判成可恢复, 而那条事件其实没人接。
+    ///
+    /// 第一版实现正是踩了第二格: `None | Some(Ok(()))` 被合到一支, 于是
+    /// `Some(Ok(()))` 跟着 `None` 一起被判成「PG 无事发生」。本用例当时是红的。
+    #[test]
+    fn absent_pg_layer_does_not_rescue_a_failed_publish() {
+        let ok: Result<(), String> = Ok(());
+        let nats_bad: Result<(), String> = Err("nats down".into());
+
+        assert!(combine_dlq_results(ok.clone(), None).is_ok());
+        assert!(
+            combine_dlq_results(nats_bad, None).is_err(),
+            "没配 PG 层时, NATS 失败就是真的没接住 —— 没有第二层兜底"
+        );
+    }
+
+    /// 反例守卫: 两层都失败时, 错误串必须**同时**含两边的原因
+    ///
+    /// 只报一边, 排障的人就会去查那个健康的组件 —— 而真正的故障在另一边。
+    #[test]
+    fn both_layers_failing_reports_both_reasons() {
+        let err = combine_dlq_results(
+            Err("nats: timed out after 1s".into()),
+            Some(Err("pg: pool exhausted".into())),
+        )
+        .expect_err("两层都失败必须是 Err");
+        let e = err.to_string();
+        assert!(
+            e.contains("nats") && e.contains("pg"),
+            "错误串必须同时报出两层的原因, 实际: {e}"
+        );
+    }
+
+    /// 对照组: 合成函数**不能**退化成「忽略 PG 层」或「恒返回成功」
+    ///
+    /// 这两条退化方向都很难靠肉眼发现: 前者让第 2 行断言失效, 后者让第 4 行
+    /// 失效。故把「输入的 PG 结果确实改变了输出」显式钉住。
+    #[test]
+    fn dlq_combination_actually_reacts_to_the_pg_result() {
+        let nats_bad: Result<(), String> = Err("nats down".into());
+        let pg_ok: Result<(), String> = Ok(());
+        let pg_bad: Result<(), String> = Err("pg down".into());
+
+        let with_ok = combine_dlq_results(nats_bad.clone(), Some(pg_ok));
+        let with_bad = combine_dlq_results(nats_bad, Some(pg_bad));
+
+        assert!(
+            with_ok.is_ok() && with_bad.is_err(),
+            "同样的 NATS 失败, PG 成功与 PG 失败必须给出不同结论 —— \
+             否则说明 PG 层的结果根本没参与判定"
+        );
     }
 
     #[tokio::test]

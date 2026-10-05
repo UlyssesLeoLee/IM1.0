@@ -58,10 +58,23 @@ const EXPECTED_TABLES: &[&str] = &[
     "messages",
     "message_reactions",
     "audit_logs",
+    // 2026-10-06 新增(0008): aux-08 §D.3 的 DLQ 长留存层。
+    // 见 migrations/0008_create_dlq_records.sql 顶部「为什么是专表」。
+    "dlq_records",
 ];
 
 /// 0007 新增的 partial 索引
 const EXPECTED_0007_INDEXES: &[&str] = &["uniq_users_env_username", "idx_users_username"];
+
+/// 0008 新增的 3 条索引 —— 名字按 aux-01 §D **逐字拼出列名**
+///
+/// 这组断言顺带钉住一件容易被悄悄破坏的事: 新表**不该**再欠一笔「索引名缩写」。
+/// 既有 12 个缩写的索引见台账 §1.33(重命名触及迁移历史, 不在本次范围)。
+const EXPECTED_0008_INDEXES: &[&str] = &[
+    "idx_dlq_records_original_task_failed_at",
+    "idx_dlq_records_failed_at",
+    "idx_dlq_records_pending_replay_failed_at",
+];
 
 /// 未设 `DATABASE_URL` 时返回 `None`, 调用方据此跳过。
 fn database_url() -> Option<String> {
@@ -144,7 +157,7 @@ async fn seed_env(p: &sqlx::PgPool) -> uuid::Uuid {
 // ============================================================================
 
 #[tokio::test]
-async fn all_14_tables_exist_in_real_pg() {
+async fn all_expected_tables_exist_in_real_pg() {
     let Some(p) = pool().await else {
         eprintln!("SKIP: 无 DATABASE_URL, 跳过真 PG 表存在性验证");
         return;
@@ -239,6 +252,77 @@ async fn migration_0007_partial_indexes_exist() {
             assert!(
                 def.contains("UNIQUE"),
                 "uniq_users_env_username 应是 UNIQUE 索引, 实际: {def}"
+            );
+        }
+    }
+}
+
+// ============================================================================
+// 3b. 0008 的 dlq_records 索引建成, 且名字逐字拼出列名 (aux-01 §D)
+// ============================================================================
+
+/// 0008 的 3 条索引确实建成; 且**名字里必须出现它索引的每一列**
+///
+/// 这条断言的价值不在「索引存在」, 而在**名字**。既有 12 个索引的
+/// `CREATE INDEX` 都把列写对了, 只是名字缩写(`idx_conversations_environment_id`
+/// 没写 `created_at`)。若日后有人新加一个缩写名字的索引, 这条会红。
+///
+/// 做法: 从 `pg_indexes.indexdef` 里**把列名抠出来**, 再逐个检查是否出现在
+/// 索引名里。这样断言的对象是 PG **实际建成**的索引, 不是我们希望的样子。
+#[tokio::test]
+async fn migration_0008_indexes_exist_and_spell_out_every_column() {
+    let Some(p) = pool().await else {
+        eprintln!("SKIP: 无 DATABASE_URL");
+        return;
+    };
+
+    for idx in EXPECTED_0008_INDEXES {
+        let row = sqlx::query(
+            "SELECT indexdef FROM pg_indexes \
+             WHERE schemaname='public' AND tablename='dlq_records' AND indexname=$1",
+        )
+        .bind(idx)
+        .fetch_optional(&p)
+        .await
+        .expect("查 pg_indexes 失败")
+        .unwrap_or_else(|| panic!("dlq_records 表缺少 0008 索引 `{idx}`"));
+
+        let def: String = row.get("indexdef");
+        assert!(
+            !def.contains("CREATE UNIQUE INDEX"),
+            "dlq_records 的索引不应是 UNIQUE —— 一条死信重放两次是**正常**的, \
+             UNIQUE 会让重放被幂等约束挡住。实际: {def}"
+        );
+
+        // 从 indexdef 抠出列名: 形如 ON public.dlq_records (col_a, col_b DESC)
+        let open = def
+            .find(" ON public.dlq_records (")
+            .unwrap_or_else(|| panic!("indexdef 形状变了, 请同步本测试: {def}"));
+        let tail = &def[open + " ON public.dlq_records (".len()..];
+        let close = tail
+            .find(')')
+            .unwrap_or_else(|| panic!("indexdef 缺右括号: {def}"));
+        let cols: Vec<String> = tail[..close]
+            .split(',')
+            .map(|c| {
+                c.split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_matches('"')
+                    .to_string()
+            })
+            .filter(|c| !c.is_empty())
+            .collect();
+
+        assert!(
+            !cols.is_empty(),
+            "从 indexdef 抠不出列名 —— 那会让下面的断言变成空转: {def}"
+        );
+        for col in &cols {
+            assert!(
+                idx.contains(col.as_str()),
+                "索引 `{idx}` 的列 `{col}` 没出现在索引名里 —— 违反 aux-01 §D \
+                 「索引名须拼出每个列名」。indexdef: {def}"
             );
         }
     }

@@ -127,7 +127,8 @@ pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpRe
     // `ws::hub::Audience` 过滤后的实际投递为准。
     let subs = hub.subscriber_count();
 
-    // 领域事件发布的五个计数 (D-3 实装于 2026-10-04, DLQ 增量于 2026-10-05)。
+    // 领域事件发布的**六个**计数 (D-3 实装于 2026-10-04, DLQ 增量于 2026-10-05,
+    // PG 长留存层于 2026-10-06)。
     //
     // 2026-10-03 只有一个 `dropped`, 用来让「事件在静默消失」这件事可见。
     // 2026-10-04 D-3 落地后必须**拆成三个**, 因为三种状态的处置完全不同:
@@ -140,7 +141,15 @@ pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpRe
     // 2026-10-05 补 DLQ 后再加两个 —— 它们回答「事件去哪了」:
     //
     //   dlq                 重试耗尽, 已落到可恢复的地方(待人工重放)
-    //   dlq_write_failed    连写 DLQ 都失败 —— 事件**真的永久没了**
+    //   dlq_write_failed    **两层都没接住** —— 事件**真的永久没了**
+    //
+    // 2026-10-06 补 PG 长留存层(aux-08 §D.3 第 2 层)后再加一个:
+    //
+    //   dlq_pg_write_failed  PG 副本没写上 —— 事件多半**仍在** NATS 层,
+    //                         丢的是「7 天后还能查」的那份长期副本
+    //
+    // `dlq_write_failed` 与 `dlq_pg_write_failed` **必须分开**: 前者是「正在丢
+    // 数据」(P1), 后者是「备份没做上」(P2), 处置完全不同。
     //
     // 把 failed 与 dropped 混成一个数, 会让「NATS 挂了」和「本来就配了 stub」
     // 在面板上长得一样, 于是真正的故障反而看不见了 —— 这正是原设计要消灭的
@@ -157,6 +166,7 @@ pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpRe
     // 的处置完全不同。
     let dlq = im_core::event::publisher::dlq_event_count();
     let dlq_write_failed = im_core::event::publisher::dlq_write_failed_count();
+    let dlq_pg_write_failed = im_core::event::publisher::dlq_pg_write_failed_count();
 
     // 2026-10-05(WS 投递索引改造)新增的三个 WS 指标。
     //
@@ -202,9 +212,12 @@ pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpRe
              # HELP im_events_dlq_total 重试耗尽后写入 NATS DLQ 的事件数(aux-08; 可恢复, 待人工重放)\n\
              # TYPE im_events_dlq_total counter\n\
              im_events_dlq_total {dlq}\n\
-             # HELP im_events_dlq_write_failed_total 连写 DLQ 都失败、事件**永久丢失**的次数; NATS 整体不可用时增长\n\
+             # HELP im_events_dlq_write_failed_total 连 NATS 连 PG 两层都没接住、事件**永久丢失**的次数\n\
              # TYPE im_events_dlq_write_failed_total counter\n\
-             im_events_dlq_write_failed_total {dlq_write_failed}\n"
+             im_events_dlq_write_failed_total {dlq_write_failed}\n\
+             # HELP im_events_dlq_pg_write_failed_total PG 长留存层(dlq_records)写入失败; 事件多半仍在 NATS 层, 但丢了长期副本\n\
+             # TYPE im_events_dlq_pg_write_failed_total counter\n\
+             im_events_dlq_pg_write_failed_total {dlq_pg_write_failed}\n"
         ))
 }
 
@@ -492,7 +505,11 @@ mod tests {
             "stub 同理不该动「永久丢失」计数"
         );
 
-        for name in ["im_events_dlq_total", "im_events_dlq_write_failed_total"] {
+        for name in [
+            "im_events_dlq_total",
+            "im_events_dlq_write_failed_total",
+            "im_events_dlq_pg_write_failed_total",
+        ] {
             assert!(
                 text.contains(name),
                 "/metrics 必须暴露 {name}: 事件发布失败若没进 DLQ, 没有任何外部表征。\
