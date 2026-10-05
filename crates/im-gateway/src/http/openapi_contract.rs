@@ -289,21 +289,39 @@ fn app_parts() -> (AppState, sqlx::PgPool, crate::ws::hub::WsHub) {
 
 /// 搭出与 `main.rs:243-252` 结构一致的 App。
 ///
-/// 写成宏而不是返回 `impl Service<...>`: 那个返回类型需要 `actix_http` 在作用域里,
-/// 而本 crate 没有直接依赖它。用宏则两个测试**共用同一份装配代码** —— 路由结构
-/// 只可能有一份, 不存在「两个测试各搭一份、悄悄搭得不一样」。
-macro_rules! openapi_router {
-    () => {{
-        let (state, pool, ws_hub) = app_parts();
-        App::new()
-            .app_data(web::Data::new(state))
-            .app_data(web::Data::new(pool))
-            .app_data(web::Data::new(ws_hub))
-            .service(web::scope("/v1").configure(crate::http::configure))
-            .route("/healthz", web::get().to(crate::health::healthz))
-            .route("/readyz", web::get().to(crate::health::readyz))
-            .route("/metrics", web::get().to(crate::health::metrics))
-    }};
+/// ## 为什么是带显式返回类型的 `fn`, 而不是宏
+///
+/// 初版写成 `macro_rules!`, 在调用点就地展开 `App::new()...`。**结果是 24 条
+/// operation 全部返回 `404 + 空 body`** —— 也就是这个 App **一条路由都没装上**。
+/// 原因: 宏在 `test::init_service(openapi_app()).await` 的位置就地展开时,
+/// `App::new()` 的类型参数 `T` 没有被任何东西钉住, 被推断成了别的 `T`;
+/// 而 `App<T>` 的路由是随 `T` 的 `ServiceFactory` 一起被组装的, `T` 一旦不是
+/// 预期的那个, 注册上去的 service 就不生效。
+///
+/// 显式写出返回类型 `App<impl ServiceFactory<ServiceRequest, Config = (), ...>>`
+/// 就把 `T` 钉死了。**这正是本仓 `friends.rs::tests::friends_app` 用的写法**
+/// (它也有一大段注释解释为什么需要这个返回类型), 与邻居保持一致。
+///
+/// 注: 需要显式返回类型的是 **App 本身**, 不是 `init_service` 的产物 ——
+/// 后者确实要 `actix_http` 才能命名, 但那与本函数无关。
+fn openapi_app() -> actix_web::App<
+    impl actix_web::dev::ServiceFactory<
+        actix_web::dev::ServiceRequest,
+        Config = (),
+        Response = actix_web::dev::ServiceResponse,
+        Error = actix_web::Error,
+        InitError = (),
+    >,
+> {
+    let (state, pool, ws_hub) = app_parts();
+    App::new()
+        .app_data(web::Data::new(state))
+        .app_data(web::Data::new(pool))
+        .app_data(web::Data::new(ws_hub))
+        .service(web::scope("/v1").configure(crate::http::configure))
+        .route("/healthz", web::get().to(crate::health::healthz))
+        .route("/readyz", web::get().to(crate::health::readyz))
+        .route("/metrics", web::get().to(crate::health::metrics))
 }
 
 // ---------------------------------------------------------------------------
@@ -393,7 +411,7 @@ async fn every_documented_operation_routes() {
         "规范里一条 operation 都没有 —— openapi.json 的 paths 是不是被清空了?"
     );
 
-    let app = actix_web::test::init_service(openapi_router!()).await;
+    let app = actix_web::test::init_service(openapi_app()).await;
 
     // 逐条探测; 收集全部结果而不是遇错即停 —— 一次跑完才知道漂移是 1 条还是 12 条。
     let mut probes = Vec::with_capacity(ops.len());
@@ -441,7 +459,7 @@ async fn undocumented_path_is_not_routed() {
         "对照组失效: 规范里出现了探针路径 {CONTROL_PATH}。换个探针路径。"
     );
 
-    let app = actix_web::test::init_service(openapi_router!()).await;
+    let app = actix_web::test::init_service(openapi_app()).await;
 
     for method in [Method::GET, Method::POST] {
         let p = probe!(&app, method.as_str(), CONTROL_PATH);
