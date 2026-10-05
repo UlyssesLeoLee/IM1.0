@@ -5,7 +5,7 @@ title_zh: 协议帧样例集 (IM1.0)
 phase: 04-detailed-design-aux
 owners: Tech Lead
 status: Filled (v1.0.0)
-version: 1.1.1
+version: 1.1.2
 related_activities: 46 API 详细, 28 API 仕様, 29 IF 詳細
 patch_note: |
   2026-09-01 B-4 协议冻结补丁 [PROTOCOL-FROZEN-PATCH]:
@@ -65,6 +65,18 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
   "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
 }
 ```
+
+> **首帧的 `req_id` 可以整个省略**(`"req_id": null` 亦可):生产路径的首帧由
+> gateway 私有 `AuthFrame` 解析,其 `req_id` 是
+> `#[serde(default)] Option<Uuid>`(`crates/im-gateway/src/ws/handler.rs:121-122`),
+> 而非 `ClientFrame::Auth` 里那个必填的 `Uuid`(`ws_frames.rs:32`)。省略时
+> 服务端回的 `auth_ok.req_id` 为 `null`。
+>
+> 鉴权**之后**再发 `auth` 会被判为重复鉴权并回错误帧(`handler.rs:416-425`),
+> 那种情况下走的是 `ClientFrame::Auth`,`req_id` 必填。
+>
+> 首帧不是 `auth` 时,服务端回 `VALIDATION_ERROR` 后关闭连接
+> (`handler.rs:400-409`)。
 
 #### 1.1.2 `send_message`(发消息)
 
@@ -407,6 +419,48 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 | 重连 | 客户端负责,使用 `after_sequence` 增量拉取(不在 WS 层做服务端补发) |
 | 顺序保证 | 同一会话内消息 `sequence` 单调递增;WS 帧顺序按服务端发送顺序 |
 | 错误语义 | `IDEMPOTENCY_CONFLICT` 走成功语义(详见 §1.2.3);其他错误 `ok=false` |
+| 未知字段 | **被静默忽略** —— `im-protocol` 全库无 `deny_unknown_fields`,多写的键通过校验(详见下) |
+
+### 1.4 接入方须知的三条实现事实
+
+以下三条是**代码事实**,与上文样例的「理想形状」不同。不写清楚,接入方会在
+联调时踩空。三条都**不**通过改代码消除 —— 属规范/实现裁决范围,见 §11。
+
+**1) 未知字段被静默忽略。** `crates/im-protocol` 全库无 `deny_unknown_fields`、
+无 `flatten`、无 `untagged`、无手写 `Serialize`(已 grep 确认),因此:
+
+```json
+{ "type": "send_message", "...": "...", "typo_field": 1 }
+```
+
+会**通过**校验,拼写错误不会在连接层被发现,而是在业务层以「字段没生效」的
+形式表现出来。接入方**不要**依赖服务端拒绝未知字段;严格校验须自己实现。
+反过来说,服务端未来增删字段不会打断旧客户端,这也是当前不加
+`deny_unknown_fields` 的代价。
+
+**2) 同一 wire `type:"auth"` 有两套形状,`req_id` 可选与否取决于发的是第几帧。**
+
+| 场景 | 解析类型 | `req_id` |
+|---|---|---|
+| 连接后**首帧**(鉴权) | gateway 私有 `AuthFrame`(`handler.rs:117-125`) | `#[serde(default)] Option<Uuid>` —— **可省略 / 可为 null** |
+| 鉴权**之后**再发 `auth` | `ClientFrame::Auth`(`ws_frames.rs:32`) | `Uuid` —— **必填** |
+
+生产路径的首帧只走前者(`handler.rs:331` 的 `from_str::<AuthFrame>`),故
+§1.1.1 的样例里 `req_id` **应当可以整个省略**;省略时服务端回的
+`auth_ok.req_id` 为 `null`。鉴权后再发 `auth` 会被判为重复鉴权
+(`handler.rs:416`)。
+
+**3) `auth_ok` 不在 `ServerFrame` 枚举里,本文档不给它 schema。**
+鉴权成功后服务端回的是 `{"type":"auth_ok","req_id":...}`,由
+`crates/im-gateway/src/ws/handler.rs:381-384` 的裸 `serde_json::json!`
+构造并直发,**绕过整个 `im_protocol` 类型体系** —— 它不是 `ServerFrame`
+的任何变体,本文档 §1.2 也从未定义它(§1.2.1 定义的是 `connected`)。
+因此本表**没有**它的规范文本可供校验,本文档**不**为它编造 schema,接入方
+**自行构造**并按「`type` 恒为 `auth_ok` + 回显 `req_id`(可 null)」处理即可。
+它是否本应是 `connected`(或某个新帧类型)属规范级裁决,见 §11。
+
+> 鉴权**失败**时服务端**不回** `auth_ok`,而是回一条 `ok=false` 的 `ack`
+> 帧(§1.2.4)并关闭连接。
 
 ## 2. gRPC 消息 (im-gateway ⇄ im-core, package `im.core.v1`)
 
@@ -1042,3 +1096,20 @@ grpcurl -plaintext -d '{"access_token":"eyJ..."}' \
 | 1.0.0 | YYYY-MM-DD | (模板初版) | 初版通用模板 |
 | 1.1.0 | 2026-08-23 | Mavis 辅助 | 填实 IM1.0:§1 WS 12 个帧(双向);§2 gRPC 4 个核心 RPC + proto 示例;§3 REST 7 个端点 + 错误通用格式;§4 JSON Schema 6 种 kind + Conversation metadata 命名空间;§5 调试命令 wscat/grpcurl/curl;§6 协议版本与冻结流程;全表命名从 `room_id`/`chat_rooms` 改为 `conversation_id`/`conversations` 对齐 aux-01 |
 | 1.1.1 | 2026-09-01 | 架构师 (Mavis 接手 agent per DEC-008) | **[PROTOCOL-FROZEN-PATCH]** B-4 补丁(aux-13 §7 流程豁免,理由:补缺失样例非新元素):新增 §2.5 gRPC `RespondFriendRequest` 样例 + proto 块(原错误映射表 §2.5 → §2.6);新增 §3.7 REST `POST /v1/friends/requests/{id}/respond` 接受/拒绝 curl + 204/404/403/409 错误样例(原通用错误格式 §3.7 → §3.8);修复 ImplementationSpec §16 P2-3 已知缺口;不新增协议元素,端点与 RPC 早在 2026-08-26 [PROTOCOL-FROZEN] (commit 12c7662) 冻结 |
+| 1.1.2 | 2026-10-06 | Mavis (lane/proto-doc-align) | **样例与代码对齐**(不改任何 Rust 代码, 帧集合仍为 8 + 10):①全部 `content` 样例补内层 `"kind"`(`MessageContent` 是标记枚举, 缺则被 `from_value::<MessageContent>` 拒为 `VALIDATION_ERROR`);②WS 错误体补必填 `ts`, `trace_id` 更正为恒空串(非 `tr_01HXY...`);③`pong.ts` 更正为非严格回显(省略时回 `0`);④标注 `message_new.reactions` 恒为 `[]`;⑤标注外层 `kind` 与 `content.kind` 不互相校验(外层只能声明 `type: string`);⑥新增 §1.4 三条实现事实(未知字段静默忽略 / `auth` 首帧 `req_id` 可选 / `auth_ok` 不在枚举内);⑦新增 §11 待裁决开放项;⑧标注 `message_edited`/`reaction_added`/`connected` 生产代码不发送。逐条依据见各小节内联的 `文件:行号` |
+
+## 11. 待规范所有者裁决的开放项
+
+以下 4 项**不是**实现缺陷,是规范与实现之间的未决分歧。实现方**未**擅自
+变更 wire 形状,仅在本文档中如实标注现状。
+
+| # | 开放项 | 现状(代码事实) | 为何不由实现方拍板 |
+|---|---|---|---|
+| 1 | `auth_ok` 是否应为 `connected`,或另立帧类型 | 生产回 `auth_ok`(`handler.rs:381-384`),`connected` 生产不发 | 改它变动客户端可见的 wire 形状 |
+| 2 | `message_edited` / `reaction_added` 是否补 `conversation_id` | 两帧无该字段,故 `Undeliverable`(`hub.rs:361-366`),生产不发送 | 补字段属 wire 形状变更(协议变更) |
+| 3 | 外层 `kind` 是否应校验与 `content.kind` 一致 | 外层是自由 `String`(`ws_frames.rs:38`),不校验,可不一致并原样下行 | 收紧会拒掉当前合法的既有客户端帧 |
+| 4 | WS 侧 `trace_id` 恒为空串 | `handler.rs:148` 写死 `""` | 补 trace 需引入链路追踪基建,非本表范围 |
+
+`docs/api/asyncapi.json` 已把上述事实(及 WS/REST 错误体字段集差异)逐字段
+建模为机器可读描述,接入方可直接引用。该文件经本次逐条复核**已与代码对齐**,
+故未作改动。
