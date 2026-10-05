@@ -2824,6 +2824,102 @@ Commit: `83252bc`
 
 ---
 
+### 1.33 `/v1/ws` 声明了 4 个**不可能发生**的错误码, 而唯一真会发生的 400 没写 (2026-10-05)
+
+#### 先更正一处我自己写错的记录
+
+`04c2993` 的 commit message 里写「§1.26 记的『9 个索引名未拼出列名』是**伪
+命题**, 实测 18 条 `CREATE INDEX` 都显式写了列」。**这个判断是错的**, 在此更正。
+
+错在把两个不同的问题当成一个:
+
+- `aux-01 §D` 要求的是**索引名**要拼出**每一个列名**(示例
+  `uniq_users_environment_id_external_identity`)
+- 我去核实的是**索引定义**有没有写列 —— 那是本来就有的东西, 与 §D 无关
+
+按 §D 的字面口径重新逐条核(脚本解析 `migrations/` 全部具名约束与显式命名索引):
+
+| 项 | 实测 |
+|---|---|
+| 具名约束 / 显式命名索引总数 | **21** |
+| 名字漏拼了至少一个列名的 | **12** |
+
+例: `uniq_users_env_extid UNIQUE (environment_id, external_identity)`、
+`uniq_messages_idem UNIQUE (conversation_id, sender_id, idempotency_key)`、
+`idx_conversations_environment_id ON conversations(environment_id, created_at DESC)`。
+
+故 §1.26 的**实质结论成立**(名字确实缩写), 但**计数过时** —— 当时记的「9」是
+更早一轮的统计口径。**未作任何代码改动**。
+
+教训与本轮另两次同类: 量具/口径错了, 结论会看起来同样完整(那次是变异统计说
+「RED(0 failed)」, 一次是备份脚本写了没跑导致还原静默失效)。**「我核实过了」
+这句话本身需要说明核实的是哪个问题。**
+
+#### 缺陷
+
+`GET /v1/ws` 是 25 个 operation 里**唯一一个**「在 `x-error-codes` 列了错误码、
+却一个对应响应形状都没给」的端点。它列的是 `UNAUTHORIZED` / `FORBIDDEN` /
+`NOT_FOUND` / `RATE_LIMITED`, 而这 4 个码**在握手阶段一个都不会出现**:
+
+| 码 | 为什么不可能 |
+|---|---|
+| `UNAUTHORIZED` / `FORBIDDEN` | 鉴权在**第一帧** `auth` 帧完成, 失败以 WS 帧回报(`error` / `ack.error`), 不是 HTTP 状态码 |
+| `NOT_FOUND` | `/v1` scope **没有**统一鉴权层(鉴权逐路由加), 握手不查任何资源 |
+| `RATE_LIMITED` | 仓内**没有任何限流实现**(见 §2 对应行) |
+
+握手阶段**唯一**可能的非 101 响应是 **400** —— 请求不带 WebSocket upgrade 头时
+`actix_ws::handle` 失败(`ws/handler.rs:170-176`)—— 它**没被写进规范**。
+
+对集成方的后果很具体: 照规范写的 401/429 处理是永远不触发的死代码, 而真实会
+拿到的 400 无据可查。
+
+#### 改动
+
+- `/v1/ws` 的 `responses` 加 `400`, 复用既有 `components/responses/BadRequest`
+- description 写清那 4 个码是**带内**帧错误(保留它们 —— 它们是真的, 只是不
+  作为 HTTP 状态码), 并说明 400 的唯一来源
+
+#### 三条新断言(「测试 6」)
+
+- `ws_handshake_declares_exactly_the_one_status_it_can_return` —— 非 101 响应
+  集合必须**恰好**是 `{400}`
+- `ws_declared_error_codes_are_marked_as_in_band` —— description 必须明确
+  **否定**「这些码是 HTTP 状态码」这个读法, 而不只是列出它们
+- `plain_get_on_the_ws_endpoint_really_returns_400` —— **运行时**打一次不带
+  upgrade 头的 GET 断言真 400。前两条只是读规范; 若代码改成对非 upgrade 请求
+  返 101 或 404, 规范会立刻变成假话。零 PG 依赖(`app_parts()` 用
+  `connect_lazy` 死池, 握手在任何查询之前就失败)
+
+#### 门禁鉴别力: 实测喂过 4 次失败输入
+
+| 变异 | 结果 |
+|---|---|
+| 删掉 `400` 响应 | **RED** |
+| `400` 换成 `403`(名字在, 指向变了) | **RED** |
+| description 删掉「带内」 | **RED** |
+| description 删掉「不会作为 HTTP 状态码返回」 | **RED** |
+| 还原后 | **GREEN**(11 passed), SHA256 与变异前**逐字节一致** |
+
+首轮两个变异被**跳过**: `"400": { "$ref": ... BadRequest }` 片段在 **16 个**
+operation 里都出现, 不加锚点会改到别的端点。唯一命中断言把它拦住了; 改用
+`/v1/ws` 独有的 `101` 行做锚点后 4 条全红。
+
+#### 验证
+
+- `cargo test -p im-gateway --bins` → **140 passed / 0 failed**(基线 137 + 3)
+- `cargo fmt --all -- --check` exit 0
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` exit 0
+- `scripts/check-openapi.ps1` exit 0(24 routes / 24 ops / 21 aux-03 codes)
+
+#### 位置
+
+- `docs/api/openapi.json` (`/v1/ws` 的 responses + description)
+- `crates/im-gateway/src/http/openapi_contract.rs` (新增「测试 6」)
+
+Commit: `04c2993`
+
+---
+
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
