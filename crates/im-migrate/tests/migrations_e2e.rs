@@ -213,7 +213,17 @@ async fn probe(url: String) -> Result<(), String> {
             .fetch_one(&pool)
             .await
             .map_err(|e| format!("count again: {e}"))?;
-    assert_eq!(applied2, 7, "重跑不得新增历史行");
+    //
+    // 2026-10-06: 这里**曾经**写死 7, 于是加 0008 时只改了上面 line 177 的那个
+    // 8, 忘了这个副本 —— CI 红。而这条断言要表达的根本不是「历史里该有 7 条」,
+    // 是「**重跑不改变条数**」。写死常量让意图与数字脱钩: 迁移一变就得同步两处,
+    // 漏一处就红, 且红的原因(7) 指向不到真正的意图。
+    //
+    // 故改为引用第一次的值。迁移数量变化时这条**永不需要**再改。
+    assert_eq!(
+        applied2, applied,
+        "重跑不得新增历史行: 第一次 {applied} 条, 第二次 {applied2} 条"
+    );
 
     pool.close().await;
     Ok(())

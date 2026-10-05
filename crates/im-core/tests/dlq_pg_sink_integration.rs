@@ -107,7 +107,32 @@ async fn pg_sink_persists_the_record_and_it_can_be_read_back() {
 
     use sqlx::Row;
     assert_eq!(row.get::<String, _>("original_task"), "im.message.created");
-    assert_eq!(row.get::<i32, _>("error_http_response_code"), 503);
+    //
+    // 这一格**必须**按 SMALLINT(i16) 解, 不能图省事写 i32。
+    //
+    // 2026-10-06 实测踩到: 0008 里这列是 `SMALLINT`(INT2), 我写了
+    // `row.get::<i32, _>()`, 结果不是"值不相等", 而是 panic 在
+    // `sqlx-core-0.9.0/src/row.rs:74`。
+    //
+    // 机制(读 sqlx 0.9 源码确认, 不是推测):
+    //   - `Row::get::<T>` 是**泛型**的, 任何 `T: Decode + Type` 都编译得过;
+    //   - 它就是 `self.try_get::<T, I>(index).unwrap()`(row.rs:74);
+    //   - `try_get` 在 row.rs:122 做 `T::compatible(&ty)` —— 这是**运行时**
+    //     类型检查, 不是编译期。INT4 列配 `i32` 通过; SMALLINT 配 `i32` 判负,
+    //     走 `Error::ColumnDecode { source: mismatched_types::<_, T>(&ty) }`;
+    //   - 那个 Err 被 `get` 的 `.unwrap()` 变成 panic。
+    // (真正不查类型的是 `get_unchecked`。)
+    //
+    // 为什么 review 看不出来: 读到这里时脑子里是"我存的就是 503, 断言 503",
+    // 值完全对得上, 而 `i32`/`i16` 的**宽度**不在注意范围里 —— 一个编译期
+    // 看起来毫无问题的泛型参数, 把一次类型错误推迟到了只有真库才跑得到的地方。
+    //
+    // 用 `try_get` 是因为它把同一个错变成可携带的消息: 错配时这里会直接说
+    // "INT2 与 i16/i32 哪个不匹配", 而 `get` 只会停在一个孤零零的泛型参数上。
+    let http_code: i16 = row.try_get("error_http_response_code").unwrap_or_else(|e| {
+        panic!("解 error_http_response_code 失败(列是 SMALLINT, 必须用 i16): {e}")
+    });
+    assert_eq!(http_code, 503, "DlqRecord::new 恒写 503(发布侧不可用)");
     assert_eq!(row.get::<i32, _>("context_attempt_count"), 4);
     assert_eq!(
         row.get::<String, _>("dlq_destination"),
