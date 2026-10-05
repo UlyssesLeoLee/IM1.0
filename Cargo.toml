@@ -8,6 +8,7 @@ members = [
     "crates/im-presence",
     "crates/im-media",
     "crates/im-migrate",
+    "crates/jobctl",
     "crates/extension-runtime",
     "crates/im-testkit",
 ]
@@ -142,6 +143,9 @@ im-core = { path = "crates/im-core" }
 im-gateway = { path = "crates/im-gateway" }
 im-presence = { path = "crates/im-presence" }
 im-media = { path = "crates/im-media" }
+# 2026-10-06 新增: `jobctl` 复用 `database_url()` / `connect()` —— 让运维 CLI 与
+# 迁移器共用同一套「连接串从哪来、缺失时报什么」的约定, 而不是各自长出第二个。
+im-migrate = { path = "crates/im-migrate" }
 extension-runtime = { path = "crates/extension-runtime" }
 im-testkit = { path = "crates/im-testkit" }
 

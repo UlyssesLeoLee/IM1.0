@@ -3074,6 +3074,110 @@ Commit: `2b73080`
 
 ---
 
+### 1.35 `jobctl` —— 给 `dlq_records` 补上**读与处置**的出口 (2026-10-06)
+
+#### 起因: §1.34 那层是**只写不读**的
+
+`2b73080` 建了 `dlq_records` 长留存层并让 `PgDlqSink` 往里写。但写完之后
+**没有任何办法看到「到底哪些事件死了」, 也没有办法把它们重新发出去** ——
+运维看得见 `im_events_dlq_write_failed_total` 在涨, 却只能手动敲 SQL。
+手动 SQL 的实际后果是: `SELECT * FROM dlq_records` 在死信量大时会把运维的
+终端淹掉, 而人会习惯性 `| head` —— 于是后面的行根本没人看见, 工具反而
+制造了「已处置」的错觉。
+
+这正是 `aux-08 §K GAP-1` 写的: 「`jobctl` CLI 工具 V1+ 实装, MVP 阶段手动
+跑 SQL/API —— **运维无可视化**」。本次只补上 `dlq_records` 这一半的可视化,
+不去实装批处理那一半(见下)。
+
+#### 范围决定: 只做 `dlq` 子树
+
+`aux-08 §G` 的模板里还有 `status` / `reset` / `run` / `verify` 四条, 它们针对
+JOB-001..004 四个**定时批处理**。而 §A.1 明写「**MVP 阶段不实装**
+JOB-001 ~ JOB-004; 本表为 V1+ 设计占位」—— 批处理本身都不存在, 给不存在的
+作业做 `run`, 只会造出一个永远报「作业不存在」的命令。故这四条**刻意不实装**,
+敲到时明确报错并说明原因(有单测钉住: 解析器必须报错, 不能退化成「少做一点
+事还成功」)。
+
+#### 最容易写错的一处: 载荷的反变换是不对称的
+
+`PgDlqSink` 写 `original_payload`(JSONB)时用的是**解析结果**:
+合法 JSON 存成对象; **不是 JSON 时把原始字节塞进一个 JSON 字符串**
+(`DlqRecord` 的设计: 形状不统一好过丢数据)。
+
+于是 `replay` 不能无脑再序列化:
+
+```text
+库里存的是   "\"hello\""            (JSON 字符串, 内容 hello)
+直接 to_vec  "\"\\\"hello\\\"\""    (双重编码!)
+```
+
+错的后果**不是「重放失败」, 而是「重放成功地把一条坏数据又发了出去」** ——
+下游拿到 `\"hello\"`, 业务上却看不出任何异常。故 `payload_bytes` 显式区分两种
+形态, 并有 `replay_of_an_unparseable_payload_sends_the_raw_bytes_not_double_encoded`
+在**真库上**走完整闭环(用 `PgDlqSink` 写入 → jobctl 读出 → 逐字节对拍)。
+
+> 手法: 集成测试**用真正的生产者写入**而不是手写 INSERT。手写 INSERT 只能证明
+> 「我写的和我读的一致」; 用 `PgDlqSink` 才能测到真正的**生产者→消费者闭环** ——
+> 若哪天 `DlqRecord` 改了存法而 jobctl 没跟上, 手写 INSERT 那套永远绿。
+
+#### 一个必须选边的顺序问题: 先发布还是先标记
+
+`replay` 的「发出去」与「标记 `replayed_at`」哪个先做, 两种顺序各有各的坏处:
+
+- **先标记后发布**: 发布失败 → 该行被标成「已重放」但其实没发出去。而
+  `dlq list` 默认只看待处置, 于是它从运维视野里**永久消失** —— 静默丢数据,
+  正是这一整层要防的那件事。
+- **先发布后标记**: 标记失败 → 事件被发出去两次。
+
+选后者。依据是 `aux-08 §E.2` 幂等矩阵: 「NATS 事件推送按 event_id 去重
+(消费者维护 seen_set)」, 重复投递有归处; 而「标了已重放却没发」没有。
+代价被如实报成 `PublishedButNotMarked` 并打 warn, **不藏**。
+有单测 `a_failed_publish_leaves_the_row_pending_but_counts_the_attempt` 钉住
+「失败绝不标记」。
+
+#### 顺带查清的一件事: OpenAPI 与路由早已一一对应
+
+原以为「广告了但没路由」是集成体验的洞, 实测**不是**: `openapi.json` 24 个
+operation, 路由 24 条, 精确一一对应; 那 3 个未实装端点(`GET /v1/friends` 与
+两个 media)**没有被广告**。而门禁 `openapi_contract::every_documented_operation_routes`
+(带阳性对照 + `undocumented_path_is_not_routed` 对照组)早已把这条不变量钉住 ——
+它**能**抓到 `/v1/ws` 变成 `/v1/ws/ws` 那类错。故本次**没有**新建门禁。
+(差点重复造轮子: 写之前先读了那个文件。)
+
+#### 这次**没有**做、但记下来的新缺口
+
+1. **丢弃痕迹落不到 `audit_logs`**。`aux-08 §D.4` 步骤 4 要求「必须留 audit
+   记录」, 但 `migrations/0006:18` 给 `audit_logs.target_type` 加了 6 值 CHECK,
+   **不含** `dlq`/`event`; 要写进去就得加第 7 个值, 那是 schema 变更, 需 DB
+   owner 拍板(与当初 `dlq_records` 选择独立成表同一原因)。当前痕迹落在
+   `dlq_records.discarded_at` 这一行上。
+2. **「被谁丢弃」答不了**。`dlq_records` 没有 `discarded_by` 列, 而 0008 已进
+   迁移历史, 按 `aux-01 §H`「永远追加, 不改历史」不能就地加列。要补得开 0009。
+3. **`aux-08 §K GAP-12` 的「二次确认 + 双人审批」未实装**。当前 `discard` 无确认。
+
+#### 验证
+
+- 12 个单测(纯逻辑: 解析 / 载荷反变换 / 状态判定 / SQL 列名)+ 9 个真 PG
+  集成测试(写入用 `PgDlqSink`, 读出用 jobctl)
+- 变异实测 **7 处有效 RED**(M1 载荷反变换 / M2 `--limit` 放过 0 / M3 list 默认
+  含已处置 / M4 `--database-url` 只读不移 / M5 任意子命令当 list / M6 去掉
+  `--limit` 上界 / M8 `--since` 接受裸日期)
+- 另有 **2 处如实标记作废**: 变异后**编译/链接不过**(link.exe 1104)的不能算
+  RED —— 它什么也没证明, 换了能编译的等价破坏才重测
+- 一处变异片段在真实文件里**命中 0 次**(中文 + 反引号经 PowerShell 拼接对不上),
+  改用单行片段后成功
+
+#### 位置
+
+- `crates/jobctl/src/lib.rs`(参数解析, 纯函数) / `src/dlq.rs`(读写与处置) /
+  `src/main.rs`(薄分派)
+- `crates/jobctl/tests/dlq_pg.rs`(真 PG, 9 个)
+- `Cargo.toml`(workspace members + `im-migrate` 内部依赖)
+
+Commit: `08d0f07`
+
+---
+
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |
