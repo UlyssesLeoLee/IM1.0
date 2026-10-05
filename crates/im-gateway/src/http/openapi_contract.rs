@@ -598,10 +598,15 @@ fn route_table_baseline() {
 
 /// `/metrics` 真实暴露的指标条数。
 ///
-/// 4 条 WS(`im_ws_*`) + 3 条领域事件(`im_events_{published,publish_failed,dropped}_total`)
-/// + 2 条 DLQ(`im_events_dlq_total` / `im_events_dlq_write_failed_total`, aux-08,
-/// 2026-10-05 加) = **9**。数法: `health.rs::metrics` 里 `# HELP` 注释行逐条数
-/// —— 每个指标恰好一条。
+/// 4 条 WS(`im_ws_*`)、3 条领域事件(`im_events_published_total` /
+/// `im_events_publish_failed_total` / `im_events_dropped_total`)、2 条 DLQ
+/// (`im_events_dlq_total` / `im_events_dlq_write_failed_total`, aux-08,
+/// 2026-10-05 加), 合计 **9**。数法: `health.rs::metrics` 里 `# HELP` 注释行
+/// 逐条数 —— 每个指标恰好一条。
+///
+/// (此处刻意不在行首写 `+` / `*` / `-` / 数字加点: 那些都是 markdown 列表
+/// 标记, 会被 clippy 的 `doc_lazy_continuation` 判为「列表项未缩进」而
+/// 在 `-D warnings` 下编译失败 —— 见 run 37286932482。)
 ///
 /// 这个基线的作用不是「防止指标变多」, 而是**防止抽取逻辑坏掉**:
 /// 集合比较里两个空集合是相等的, 若两边都抽不出东西, `assert_eq!(doc, live)`

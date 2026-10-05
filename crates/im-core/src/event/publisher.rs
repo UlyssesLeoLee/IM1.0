@@ -850,10 +850,24 @@ mod tests {
     /// 否则 libtest 的并行执行会让「clear 之后数长度」读到别人的数据。
     static ATTEMPTS: std::sync::Mutex<Vec<Duration>> = std::sync::Mutex::new(Vec::new());
 
+    /// 取 [`ATTEMPTS`] 的 guard, **对 poison 免疫**
+    ///
+    /// 2026-10-05 实测踩到: `assert_eq!(attempts().len(), 4)` 在
+    /// 断言 panic 时, 那把 `Mutex` 的 guard **仍在存活**(临时值到语句结束才
+    /// drop), 于是锁被 poison。此后每一个 `lock().unwrap()` 都炸
+    /// `PoisonError` —— 一个断言失败被伪装成**一串**与它无关的失败,
+    /// 真正的原因反而被埋掉了。
+    ///
+    /// 这里的豁免是安全的: `Vec<Duration>` 里没有任何需要跨 panic 保持一致的
+    /// 不变量, 每个用例进来都先 `clear()`。
+    fn attempts() -> std::sync::MutexGuard<'static, Vec<Duration>> {
+        ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[tokio::test(start_paused = true)]
     async fn succeeds_on_first_attempt_and_never_touches_dlq() {
         let _guard = COUNTER_LOCK.lock().await;
-        ATTEMPTS.lock().unwrap().clear();
+        attempts().clear();
         let dlq_before = dlq_event_count();
         let mut dlq_writes: Vec<DlqRecord> = Vec::new();
 
@@ -862,7 +876,7 @@ mod tests {
             b"{}",
             &RetryPolicy::for_tests(),
             |deadline| async move {
-                ATTEMPTS.lock().unwrap().push(deadline);
+                attempts().push(deadline);
                 Ok::<(), String>(())
             },
             |rec| {
@@ -873,7 +887,7 @@ mod tests {
         .await;
 
         assert!(res.is_ok(), "第一次成功就不该返回失败: {res:?}");
-        assert_eq!(ATTEMPTS.lock().unwrap().len(), 1, "只该尝试一次");
+        assert_eq!(attempts().len(), 1, "只该尝试一次");
         assert!(dlq_writes.is_empty(), "成功时绝不该写 DLQ");
         assert_eq!(dlq_event_count(), dlq_before, "成功时 DLQ 计数不该动");
     }
@@ -881,7 +895,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn retries_until_success_without_ever_writing_dlq() {
         let _guard = COUNTER_LOCK.lock().await;
-        ATTEMPTS.lock().unwrap().clear();
+        attempts().clear();
         let dlq_before = dlq_event_count();
         let mut dlq_writes = 0usize;
 
@@ -892,7 +906,7 @@ mod tests {
             &RetryPolicy::for_tests(),
             |deadline| {
                 let n = {
-                    let mut g = ATTEMPTS.lock().unwrap();
+                    let mut g = attempts();
                     g.push(deadline);
                     g.len()
                 };
@@ -906,13 +920,13 @@ mod tests {
             },
             |_rec| {
                 dlq_writes += 1;
-                async { Ok(()) }
+                async { Ok::<(), String>(()) }
             },
         )
         .await;
 
         assert!(res.is_ok(), "第 3 次成功就该返回 Ok: {res:?}");
-        assert_eq!(ATTEMPTS.lock().unwrap().len(), 3, "应恰好尝试 3 次");
+        assert_eq!(attempts().len(), 3, "应恰好尝试 3 次");
         assert_eq!(dlq_writes, 0, "成功了就绝不该写 DLQ");
         assert_eq!(dlq_event_count(), dlq_before, "成功时 DLQ 计数不该动");
     }
@@ -920,7 +934,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn exhausts_retries_then_writes_exactly_one_dlq_record() {
         let _guard = COUNTER_LOCK.lock().await;
-        ATTEMPTS.lock().unwrap().clear();
+        attempts().clear();
         let dlq_before = dlq_event_count();
         let failed_before = dlq_write_failed_count();
         let mut records: Vec<DlqRecord> = Vec::new();
@@ -929,10 +943,13 @@ mod tests {
             "im.message.recalled",
             br#"{"message_id":"11111111-1111-4111-8111-111111111111"}"#,
             &RetryPolicy::for_tests(),
-            |_deadline| async { Err("always down".to_string()) },
+            |deadline| {
+                attempts().push(deadline);
+                async { Err::<(), String>("always down".to_string()) }
+            },
             |rec| {
                 records.push(rec);
-                async { Ok(()) }
+                async { Ok::<(), String>(()) }
             },
         )
         .await;
@@ -940,11 +957,7 @@ mod tests {
         assert!(res.is_err(), "全失败必须返回 Err");
         // aux-08 §C.3「3 次」= 1 次首发 + 3 次重试上限由 backoffs 长度决定;
         // for_tests 的 3 档退避 -> 最多 4 次尝试
-        assert_eq!(
-            ATTEMPTS.lock().unwrap().len(),
-            4,
-            "应为首发 + 3 次重试(aux-08 §C.3)"
-        );
+        assert_eq!(attempts().len(), 4, "应为首发 + 3 次重试(aux-08 §C.3)");
         assert_eq!(records.len(), 1, "必须**恰好**写 1 条 DLQ 记录");
         assert_eq!(dlq_event_count(), dlq_before + 1, "DLQ 计数应 +1");
         assert_eq!(
@@ -981,10 +994,10 @@ mod tests {
             "im.message.created",
             b"not json at all <<<",
             &RetryPolicy::for_tests(),
-            |_d| async { Err("down".into()) },
+            |_d| async { Err::<(), String>("down".into()) },
             |rec| {
                 records.push(rec);
-                async { Ok(()) }
+                async { Ok::<(), String>(()) }
             },
         )
         .await;
@@ -1009,8 +1022,8 @@ mod tests {
             "im.message.created",
             b"{}",
             &RetryPolicy::for_tests(),
-            |_d| async { Err("down".into()) },
-            |_rec| async { Err("dlq is down too".into()) },
+            |_d| async { Err::<(), String>("down".into()) },
+            |_rec| async { Err::<(), String>("dlq is down too".into()) },
         )
         .await;
 
@@ -1039,7 +1052,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn budget_caps_total_attempts_when_each_attempt_is_slow() {
         let _guard = COUNTER_LOCK.lock().await;
-        ATTEMPTS.lock().unwrap().clear();
+        attempts().clear();
 
         // 每次尝试都吃满 3s ack 上界, 而总预算只有 4s
         let policy = RetryPolicy {
@@ -1057,16 +1070,16 @@ mod tests {
             b"{}",
             &policy,
             |deadline| async move {
-                ATTEMPTS.lock().unwrap().push(deadline);
+                attempts().push(deadline);
                 tokio::time::sleep(deadline).await; // 吃满
                 Err::<(), String>("timeout".into())
             },
-            |_rec| async { Ok(()) },
+            |_rec| async { Ok::<(), String>(()) },
         )
         .await;
 
         assert!(res.is_err());
-        let n = ATTEMPTS.lock().unwrap().len();
+        let n = attempts().len();
         assert!(
             n < 4,
             "4s 预算装不下 4 次 x 3s 的尝试, 应当更早转 DLQ, 实际尝试 {n} 次"
@@ -1078,24 +1091,20 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn generous_budget_uses_every_backoff_slot() {
         let _guard = COUNTER_LOCK.lock().await;
-        ATTEMPTS.lock().unwrap().clear();
+        attempts().clear();
 
         let _ = orchestrate_publish(
             "im.message.created",
             b"{}",
             &RetryPolicy::for_tests(), // 60s 预算, 极短退避
             |deadline| async move {
-                ATTEMPTS.lock().unwrap().push(deadline);
+                attempts().push(deadline);
                 Err::<(), String>("fast failure".into())
             },
-            |_rec| async { Ok(()) },
+            |_rec| async { Ok::<(), String>(()) },
         )
         .await;
 
-        assert_eq!(
-            ATTEMPTS.lock().unwrap().len(),
-            4,
-            "预算充足时应走满 1 次首发 + 3 档退避"
-        );
+        assert_eq!(attempts().len(), 4, "预算充足时应走满 1 次首发 + 3 档退避");
     }
 }
