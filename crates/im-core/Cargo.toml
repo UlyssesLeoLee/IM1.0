@@ -74,3 +74,11 @@ parking_lot = { workspace = true }
 mockall = { workspace = true }
 proptest = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
+# 2026-10-06: 量化 aux-06 A-001 / A-010 的 token 签发与校验, 并给「5s 缓存」
+# 这个未落地的规范优化量一个价。见 benches/auth_hotpath.rs。
+criterion = { workspace = true }
+
+[[bench]]
+name = "auth_hotpath"
+path = "benches/auth_hotpath.rs"
+harness = false

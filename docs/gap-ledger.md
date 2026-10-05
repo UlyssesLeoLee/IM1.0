@@ -3223,6 +3223,116 @@ Commit: `2543479`
 
 ---
 
+### 1.36 性能: 第一次真的跑了基准, 并**推翻了自己写过的性能模型** (2026-10-06)
+
+#### 起因: 「测量优先」写在规范里, 而测量设施是零
+
+`aux-06 §E 性能优化原则`第一条是「**测量优先**: 不优化未测量的代码」。但同一份
+文档的 `§D 实测 vs 目标` 13 项**全是「(待测)」**, 且:
+
+- `criterion` 早已在 `Cargo.toml` 声明(`0.5` + `html_reports`) —— **全仓零使用**,
+  连一个 `benches/` 目录都没有;
+- 于是 §E 那条原则**没有可执行的落点**, 而 §D 的空栏看上去像「还没来得及测」,
+  实际是「缺基础设施」。
+
+本次建了 2 套基准(只覆盖**不依赖 PG/NATS/Valkey/S3** 的纯 CPU 路径), 跑出
+真数字, 并据此改写 §B/§D/§H/§K。
+
+#### 发现 1: §B A-001 的性能模型**高估约 1000 倍**
+
+原文写「单次校验 = JWT 解析 1ms + HMAC verify 0.5ms + claim 提取 0.5ms = ~2ms」。
+实测(criterion, release, sample-size 20):
+
+| 项 | 实测均值 | 区间 |
+|---|---|---|
+| A-001 校验(单密钥) | **1.89 µs** | 1.86~1.92 µs |
+| A-010 校验(双密钥) | **1.91 µs** | 1.87~1.96 µs |
+| A-001 签发 | **1.08 µs** | 1.06~1.10 µs |
+
+目标 `< 5ms` 比实测高约 **2600 倍**。原分项拆解(「JSON 解析 200 字节 claims
+要 1ms」)没有依据 —— 实测在**微秒**量级。
+
+> 这条的意义不止于一个数: §D 其余 10 项的模型同样从未被验证过。既然 A-001 的
+> 估算错了三个数量级, **其余各项的估算也应默认不可信**, 直到实测。这已写进 §D。
+
+#### 发现 2: 「Auth_Middleware 5s 内存缓存」这个优化**不该做**
+
+`aux-06` A-001 的「优化策略」第 1 条把它列为首选, 并称「已纳入
+`ImplementationSpec §7.5` 设计」。逐条核对:
+
+1. `ImplementationSpec.md` 里**搜不到** `Auth_Middleware` / `5s 缓存` ——
+   「已纳入 §7.5」**不成立**;
+2. `crates/im-gateway/src/http/auth.rs` 的 `AuthedUser` extractor **每个请求
+   完整跑一次校验**, 无缓存 —— 该优化**从未落地**;
+3. 实测它也**不值得**落地: 缓存命中下界 ~62 ns, 相比 1.89 µs **每请求只省
+   ~1.83 µs**(相对 5ms 目标是 0.04%), 代价是**登出/吊销后最多 5s 内 token
+   仍然有效** —— 而 `POST /v1/auth/logout` 是真会吊销 device session 的。
+
+**判定: 不实装。** 缺标比错标安全, 且这正是 §E「不优化未测量的代码」要防的
+情形 —— 照着一个从没验证过的模型去加一个削弱安全语义的缓存。
+
+#### 发现 3: 一条**否定结论** —— 双层 serde 内部标记不是瓶颈
+
+原本怀疑 WS 帧解析的开销来自**两层** `#[serde(tag)]` 内部标记
+(`ClientFrame` 按 `type`, 嵌在 `content` 里的 `MessageContent` 再按 `kind`):
+
+| 基准 | 实测均值 |
+|---|---|
+| `ping`(1 层, 极小载荷) | 104 ns |
+| `message_content`(1 层) | 127 ns |
+| `send_message`(2 层, 真实主路径) | **727 ns** |
+
+目标 `< 1ms` 比实测高约 **3 个数量级** → **不是瓶颈, 不为它改设计**。
+
+两条诚实标注: ① 三个用例**载荷不同**, 差值里混着载荷差异, **不可**反推
+「第二层标记的代价」(要隔离得另做一组载荷一致、只变嵌套层数的对照); ②
+A-008 的完整算法是「帧路由 + 成员过滤」, 后半段在 `im-gateway`, 而
+**`im-gateway` 是 bin-only crate**(无 `[lib]]`), criterion 只能挂在 lib 上
+—— 故只测到解析半段, 已在 §D.3 与基准模块文档里写明。
+
+#### 发现 4: `harness = false` 的 bench 里, `#[test]` **从不执行**
+
+两个基准文件里都写了 `#[test]` 反例守卫(「夹具必须是合法帧 / 合法 token,
+否则基准量的是错误路径」)。实测发现:
+
+- `cargo test -p im-protocol` —— 连 bench 二进制都不构建;
+- `cargo test -p im-protocol --benches` —— 构建了, 但输出里**没有守卫的名字**。
+
+即 `harness = false`(criterion 必需)使 cargo 不做 libtest 集成, 那些守卫是
+**死代码**。「写了守卫但它永远不跑」比「没有守卫」更坏: 后者让人知道缺什么,
+前者让人以为已经有了。
+
+故守卫搬到 `crates/{im-protocol,im-core}/tests/bench_fixture_guards.rs`, 随
+`cargo test --workspace` 进 CI; 并各加一条**反向守卫**(坏夹具必须真的走到
+`Err`), 否则「恒返 `Err` 的 `from_str`」也能让正向守卫全绿。
+
+#### 一处标注纠正: A-010 是**下界**不是最坏情况
+
+原拟用双密钥做「最坏情况」基准, 但 `issue_access_token` **恒用
+`signing_keys[0]`**(`token.rs:152`), 本仓签出的 token `kid` **永远是 v1**,
+线性扫描第一轮即命中。真正的最坏情况(旧 token 的 kid 落在 `["v2","v1"]` 的
+末位)走不到第 2 轮 —— 需外部签发, 当前 API 造不出。故 1.91 µs 是双密钥场景的
+下界。**这个误标是被那条反例守卫的断言当场抓到的**, 不是事后复盘发现的。
+
+#### 位置
+
+- `crates/im-core/benches/auth_hotpath.rs` + `crates/im-core/tests/bench_fixture_guards.rs`
+- `crates/im-protocol/benches/ws_frame_parse.rs` + `crates/im-protocol/tests/bench_fixture_guards.rs`
+- `docs/templates/04-detailed-design/auxiliary/aux-06-algorithm-performance-model.md`
+  (§B A-001 / §D / §H / §K 1.2.0)
+
+#### 验证
+
+- `cargo fmt --all -- --check` exit 0
+- `cargo clippy --workspace --all-targets --locked -- -D warnings` exit 0
+  (bench 已被 `--all-targets` 纳入)
+- 守卫 6 条全过(im-protocol 4 + im-core 2), 含 2 条反向守卫
+- 已确认 `cargo test --workspace` **不会**执行 bench 二进制(无 `Benchmarking`
+  输出), 故新增 bench 不会拖慢 CI
+- 基准数字为**单台机器**的相对值, 不作 NFR 基线(§H 仍待 POC 校准)
+
+---
+
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |

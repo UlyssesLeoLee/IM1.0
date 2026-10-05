@@ -80,18 +80,44 @@ related_activities: 14 NFR, 45 逻辑设计, 80 性能试验
 - 空间: O(1) (单 token 不留缓存条目 < 200 字节)
 
 **性能模型**:
-- 单次校验延迟 = JWT 解析 1ms + HMAC verify 0.5ms + claim 提取 0.5ms = ~2ms
-- 5s 缓存命中时: < 0.1ms(纯 hashmap lookup)
-- **P99 目标**: < 5ms(无缓存); < 1ms(命中缓存)
+- ⚠️ **本模型已于 2026-10-06 被实测推翻, 下行为实测值, 原估算见后**
+- **实测单次校验 ≈ 1.89 µs**(criterion, 区间 1.86~1.92 µs)
+- 实测签发 ≈ 1.08 µs;双密钥(v1+v2 并存)≈ 1.91 µs, 即**轮换期几乎不增加成本**
+  (线性扫描第一轮即命中)
+- 「5s 缓存」若实现的收益上限: 1.89 µs → ~0.062 µs, 即**每请求省 ~1.83 µs**
+- **P99 目标**: < 5ms(无缓存); < 1ms(命中缓存) —— 实测比目标低约 **2600 倍**
+- ~~原估算: 单次校验延迟 = JWT 解析 1ms + HMAC verify 0.5ms + claim 提取 0.5ms
+  = ~2ms~~ **← 高估约 1000 倍。** JSON 解析 200 字节 claims 实测在**微秒**量级
+  而非毫秒量级, 原分项拆解没有依据
+
+**⚠️ 由此产生的一条结论: 那个「5s 缓存」优化**不该做**
+
+原「优化策略」第 1 条把 Auth_Middleware 5s 内存缓存列为首选优化, 并称
+「已纳入 `ImplementationSpec §7.5` 设计」。2026-10-06 逐条核对:
+
+1. `ImplementationSpec.md` 里**搜不到** `Auth_Middleware` 或 `5s 缓存` ——
+   那句「已纳入 §7.5」**不成立**;
+2. `crates/im-gateway/src/http/auth.rs` 的 `AuthedUser` extractor **每个请求
+   完整跑一次校验**, 无任何缓存 —— 该优化**从未落地**;
+3. 实测显示它也**不值得**落地: 每请求收益 ~1.83 µs(相对 5ms 目标是 0.04%),
+   代价是**登出/吊销后最多 5s 内 token 仍然有效** —— 而
+   `POST /v1/auth/logout` 是真会吊销 device session 的。
+
+**该优化不实装。** 缺标比错标安全(per 本文档 §K 抬头), 且 §E「测量优先:
+不优化未测量的代码」正是为了防住「照着没测过的模型去优化」。
 
 **优化策略**:
-1. **Auth_Middleware 5s 内存缓存**(已纳入 `ImplementationSpec §7.5` 设计)
-2. JSON 解析用 `serde_json::from_slice` 避免 `String` 分配
-3. JWKS 不预加载(单 secret,直接读 env)
+1. ~~**Auth_Middleware 5s 内存缓存**(原称「已纳入 `ImplementationSpec §7.5`
+   设计」)~~ → **不实装**, 理由见上。2026-10-06 实测收益 ~1.83 µs/请求, 不值得
+   换取 5s 的吊销宽限
+2. JSON 解析用 `serde_json::from_slice` 避免 `String` 分配 —— 保持现状;
+   实测显示解析开销在**亚微秒**量级, 本条亦无需变更
+3. JWKS 不预加载(单 secret,直接读 env) —— 保持现状
 
 **NFR 链接**: IM-NFR-001 (待 WBS H-4 校准,POC-01 后回填)
 
-**关联实现**: `crates/im-core/identity/token.rs::TokenService::validate_access_token` (待 C-3 实装)
+**关联实现**: `crates/im-core/identity/token.rs::TokenService::validate_access_token`;
+基准 `crates/im-core/benches/auth_hotpath.rs`
 
 ---
 
@@ -490,23 +516,73 @@ related_activities: 14 NFR, 45 逻辑设计, 80 性能试验
 
 ## D. 实测 vs 目标
 
-> MVP 阶段**未跑压测**,本表预留位置;WBS E-1/E-2 完成后回填。
+> **2026-10-06 更新**: 首次真正跑了基准。此前 13 项全是"(待测)", 而 §E 却写着
+> 「测量优先」—— 测量设施(criterion 已在 `Cargo.toml` 声明)**全仓零使用**,
+> 连一个 `benches/` 目录都没有。本次建了 2 套基准, 覆盖**不依赖 PG/NATS** 的
+> 纯 CPU 路径, 并把其余各项**为什么测不了**逐条写明 —— 而不是继续留"(待测)"
+> 让它看起来像是「还没来得及测」, 实际是「缺基础设施」。
 
-| 算法 | 目标 | 实测平均 | 实测 P99 | 状态 |
+### D.1 已实测(3 项)
+
+数据来源: `cargo bench -p im-core --bench auth_hotpath` 与
+`cargo bench -p im-protocol --bench ws_frame_parse`; criterion 0.5.1,
+`--sample-size 20 --measurement-time 2`, release profile, Windows x64。
+**这是单台机器的相对数字, 不作为 NFR 基线**(NFR 仍按 §H 待 POC 校准)。
+
+| 算法 | 目标 | 实测平均 | 实测区间 | 状态 |
 |---|---|---|---|---|
-| A-001 Token 校验 | < 5ms | (待测) | (待测) | ⏳ POC-01 |
-| A-002 Refresh 旋转 | < 50ms | (待测) | (待测) | ⏳ POC-01 |
-| A-003 Sequence 分配 | < 10ms | (待测) | (待测) | ⏳ POC-02 |
-| A-004 幂等键查重 | < 5ms | (待测) | (待测) | ⏳ POC-01 |
-| A-005 DM 创建幂等 | < 20ms | (待测) | (待测) | ⏳ POC-01 |
-| A-006 消息增量拉取 | < 50ms | (待测) | (待测) | ⏳ POC-01 |
-| A-007 好友列表 | < 50ms | (待测) | (待测) | ⏳ POC-01 |
-| A-008 WS 帧路由 | < 1ms | (待测) | (待测) | ⏳ POC-01 |
-| A-009 限流判定 | < 2ms | (待测) | (待测) | ⏳ POC-01 |
-| A-010 双密钥 JWT | < 5ms | (待测) | (待测) | ⏳ POC-03 |
-| A-011 好友申请查询 | < 20ms | (待测) | (待测) | ⏳ POC-01 |
-| A-012 媒体预签 | < 50ms | (待测) | (待测) | ⏳ V1+ |
-| A-013 WS 心跳 | < 1ms | (待测) | (待测) | ⏳ POC-01 |
+| A-001 Token 校验 | < 5ms | **1.89 µs** | 1.86~1.92 µs | ✅ 比目标低约 2600 倍 |
+| A-010 双密钥 JWT | < 5ms | **1.91 µs** | 1.87~1.96 µs | ✅ 轮换期几乎不增加成本 |
+| A-008 WS 帧路由(**仅解析半段**) | < 1ms | **727 ns** | 716~744 ns | ✅ 比目标低约 3 个数量级 |
+
+参考值(不属 §A 13 项, 但为上面两项提供对照):
+
+| 项 | 实测平均 | 说明 |
+|---|---|---|
+| A-001 签发 access token | 1.08 µs | 区间 1.06~1.10 µs |
+| A-001「5s 缓存命中」下界 | **62 ns** | 纯 HashMap get; 该优化已判定不实装, 见 §B A-001 |
+| A-008 `ping` 帧解析(1 层标记) | 104 ns | 区间 99.9~107.7 ns |
+| A-008 `message_content` 解析(1 层标记) | 127 ns | 区间 123.9~129.1 ns |
+
+### D.2 尚未实测的 10 项 —— 以及**为什么**
+
+留空理由分三类, 不再统称"待测":
+
+| 类别 | 涉及 | 缺什么 |
+|---|---|---|
+| **需要真 PG** | A-002 A-003 A-004 A-005 A-006 A-007 A-011 | criterion 基准跑不了异步 DB 往返; 需 criterion-async 或自建计时 harness + CI 的 PG service container(Docker 目前在本机不可用) |
+| **需要 Valkey(限流未实装)** | A-009 | `aux-08 §K GAP-8`;用户 2026-10-06 已拍板**限流维持现状**, 无实现可测 |
+| **需要对象存储** | A-012 | 无 MinIO/S3(§B A-012 自身写明 V1+ 才实装) |
+| **需要 WS 连接** | A-013 | 与 A-008 同因, 见 D.3(bin-only crate) |
+
+### D.3 结构性缺口: A-008 / A-013 只测到一半
+
+A-008 的完整算法是「**帧路由 + 成员过滤**」, 后半段在
+`crates/im-gateway/src/ws/handler.rs`; A-013(心跳 ping/pong)整体也在
+`im-gateway` 内。而 **`im-gateway` 是 bin-only crate**(`Cargo.toml` 只有
+`[[bin]]`, 无 `[lib]]`), criterion 的 bench 只能挂在 lib 上 —— 故这两项的
+主体**当前无法基准化**。
+
+最接近的可用代理是上表 A-008 的 `ping` 帧解析 104 ns, 但**它只是心跳帧的
+解析半段**, 不含服务端回帧与连接状态机, 不能当成 A-013 的实测值。
+
+已在 `crates/im-protocol/benches/ws_frame_parse.rs` 的模块文档里写明这个边界,
+不假装它被覆盖了。要真正覆盖需给 `im-gateway` 拆一个 `[lib]` target ——
+属结构性改动, 未擅自做。
+
+> 顺带一条**否定结论**: 原本怀疑「`#[serde(tag)]` 内部标记」(`ClientFrame` 与
+> `MessageContent` **两层**嵌套) 会是 WS 热路径的开销来源。实测 727 ns, 距
+> `< 1ms` 目标差 3 个数量级 —— **不是瓶颈, 不为它改设计**。
+> (注意: 三个用例载荷不同, 不可用差值反推「第二层标记的代价」; 真要隔离得
+> 另做一组载荷完全一致、只变嵌套层数的对照。)
+
+### D.4 关于 A-010 的一个标注纠正
+
+`TokenService::issue_access_token` 恒用 `signing_keys[0]`(`token.rs:152`),
+故本仓签出的 token `kid` **永远是 v1**, 线性扫描第一轮即命中。真正的最坏情况
+(轮换期旧 token 的 kid 落在 `["v2","v1"]` 的**末位**)走不到第 2 轮 —— 那需要
+外部签发, 当前 API 造不出来。故上表 A-010 的 1.91 µs 是双密钥场景的**下界**。
+这个误标是被基准文件里的反例守卫断言抓到的, 不是事后想起来的。
 
 ## E. 性能优化原则
 
@@ -533,12 +609,15 @@ related_activities: 14 NFR, 45 逻辑设计, 80 性能试验
 
 ## H. 验收标准 (Acceptance Criteria)
 
-- [ ] 13 项关键算法(§A 表)有性能模型(算法 / 复杂度 / 性能 / 优化)
+- [x] 13 项关键算法(§A 表)有性能模型(算法 / 复杂度 / 性能 / 优化)
 - [ ] 每项算法引用具体 Rust trait + SQL 索引 + 配置项
-- [ ] POC 编号明确(§G 表)且关联到 WBS H-3
+- [x] POC 编号明确(§G 表)且关联到 WBS H-3
 - [ ] 不变量测试引用 `ImplementationSpec §10.3` 10 条
-- [ ] 实测位置预留 §D 表,WBS E-1/E-2 完成后回填
+- [x] §D 表已回填**可测的 3 项**(A-001 / A-008 解析半段 / A-010, 2026-10-06);
+      其余 10 项按「缺什么基础设施」分类写明(§D.2 / §D.3), 不再统称"待测"
 - [ ] 容量 NFR 矩阵 (§C) 标注"待 POC 校准",避免编造未验证数字
+- [x] §E「测量优先」有了可执行的落点: `benches/` 此前为**零**, 现 2 套;
+      **并且实测推翻了 §B A-001 的性能模型(高估约 1000 倍)与「5s 缓存」优化**
 
 ## I. 关联文档 (References)
 
@@ -572,3 +651,4 @@ related_activities: 14 NFR, 45 逻辑设计, 80 性能试验
 |---|---|---|---|
 | 1.0.0 | YYYY-MM-DD | (模板初版) | 初版通用模板 |
 | 1.1.0 | 2026-09-01 | 架构师 (Mavis 接手 agent per DEC-008) | 填实 IM1.0 13 项关键算法(A-001~A-013);每项含算法/复杂度/性能模型/优化策略/NFR 链接;§C NFR 矩阵占位待 POC 校准;§D 实测表预留;§G POC-01/02/03/04 编号与 WBS H-3 + 132-wbs.md 关联;§J 10 项已知缺口;引用 ImplementationSpec §3/§4.5/§6/§7.4/§10 + migrations 索引 + aux-02/03/04 完整交叉引用 |
+| 1.2.0 | 2026-10-06 | Mavis | **首次真正跑基准并回填 §D**。新增 `crates/im-core/benches/auth_hotpath.rs` + `crates/im-protocol/benches/ws_frame_parse.rs`(criterion 0.5.1, 此前该依赖在 workspace 已声明但**全仓零使用**)。**实测推翻 §B A-001 的性能模型**: 原估「~2ms」实为 1.89 µs(高估约 1000 倍), 目标 `< 5ms` 低了约 2600 倍。**并据此判定「Auth_Middleware 5s 内存缓存」优化不实装** —— 收益 ~1.83 µs/请求, 换不起 5s 的吊销宽限; 且原注「已纳入 `ImplementationSpec §7.5`」经查**不成立**(该文档无此内容)。§D 拆为 D.1 已实测 3 项 / D.2 未测 10 项按缺失基础设施分类 / D.3 A-008·A-013 因 `im-gateway` 是 bin-only crate 只能测解析半段 / D.4 纠正 A-010 标注(签发恒用第一把 key, 1.91 µs 是下界非最坏情况)。**一条否定结论**: 双层 `#[serde(tag)]` 内部标记曾被怀疑是 WS 热路径开销, 实测 727 ns 距 1ms 目标差 3 个数量级, **不是瓶颈, 不改设计** |

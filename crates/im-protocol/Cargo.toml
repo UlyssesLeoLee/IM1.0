@@ -17,3 +17,13 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# 2026-10-06: 量化 aux-06 A-008 的帧解析开销。criterion 此前是 workspace 级
+# 声明但**全仓零使用**(连一个 benches/ 目录都没有) —— 现在开始真正用它。
+criterion = { workspace = true }
+
+[[bench]]
+name = "ws_frame_parse"
+path = "benches/ws_frame_parse.rs"
+harness = false
