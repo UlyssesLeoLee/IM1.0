@@ -114,13 +114,38 @@ pub async fn metrics(hub: actix_web::web::Data<crate::ws::hub::WsHub>) -> HttpRe
     let failed = im_core::event::publisher::failed_event_count();
     let dropped = im_core::event::publisher::dropped_event_count();
 
+    // 2026-10-05(WS 投递索引改造)新增的三个 WS 指标。
+    //
+    // 为什么不沿用上一版的 `Lagged`: 上一版是单个 `broadcast` 通道, 慢客户端
+    // 会撞上 `RecvError::Lagged`, 那是天然的可观测点。改成 per-connection 出站
+    // 通道后没有 broadcast 就没有 Lagged, 若不另设计数, **丢帧会完全静默** ——
+    // 客户端只会以为「对方没发言」, 服务端毫无线索。所以 `dropped` 不是锦上添花,
+    // 是把丢掉的那份可观测性补回来。
+    //
+    // 另两个是为了让「投递索引」本身可观察:
+    // - `im_ws_authenticated_connections` 能回答「连接都建好了却一个都没鉴权」
+    //   这类问题(上一版区分不了: 建连与鉴权都只是一个 broadcast 订阅者)
+    // - `im_ws_indexed_conversations` 是索引规模, 它的异常增长/归零都能看出来
+    let ws_authed = hub.authenticated_count();
+    let ws_indexed_convs = hub.indexed_conversation_count();
+    let ws_dropped = hub.dropped_broadcast_count();
+
     HttpResponse::Ok()
         .content_type("text/plain; version=0.0.4")
         .body(format!(
             "# MVP: prometheus exporter not yet enabled (set IM_PROMETHEUS_BIND to enable)\n\
-             # HELP im_ws_broadcast_subscriptions 已订阅 WS 广播的连接数\n\
+             # HELP im_ws_broadcast_subscriptions 已建出站通道的 WS 连接数(含尚未鉴权的)\n\
              # TYPE im_ws_broadcast_subscriptions gauge\n\
              im_ws_broadcast_subscriptions {subs}\n\
+             # HELP im_ws_authenticated_connections 已进入投递索引的 WS 连接数\n\
+             # TYPE im_ws_authenticated_connections gauge\n\
+             im_ws_authenticated_connections {ws_authed}\n\
+             # HELP im_ws_indexed_conversations 投递索引中登记的会话数\n\
+             # TYPE im_ws_indexed_conversations gauge\n\
+             im_ws_indexed_conversations {ws_indexed_convs}\n\
+             # HELP im_ws_broadcast_dropped_total 因收件端出站通道写满而丢弃的帧数(慢客户端; 客户端需经 REST 补齐)\n\
+             # TYPE im_ws_broadcast_dropped_total counter\n\
+             im_ws_broadcast_dropped_total {ws_dropped}\n\
              # HELP im_events_published_total 成功发布并拿到 JetStream ack 的领域事件数\n\
              # TYPE im_events_published_total counter\n\
              im_events_published_total {published}\n\

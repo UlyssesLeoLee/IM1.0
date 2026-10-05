@@ -63,8 +63,12 @@
 //!
 //! 已于 2026-10-03 结清:
 //! - 曾列为缺口 3 的「ForceDisconnect broadcast: 占位 broadcast channel」——
-//!   该「占位物」**其实根本不存在**(文档说有、代码没有)。现已实装 `ws::hub::WsHub`:
-//!   单个 `broadcast` 通道, `main.rs` 以 `web::Data` 注入为进程内单例。
+//!   该「占位物」**其实根本不存在**(文档说有、代码没有)。现已实装 `ws::hub::WsHub`,
+//!   `main.rs` 以 `web::Data` 注入为进程内单例。
+//!   **2026-10-05 改造**: 上一版是「单个 `broadcast` 通道 + 连接侧过滤」, 发一帧要往
+//!   **全部**连接各写一格缓冲(1 万连接发 2 人私聊 = 1 万次写)。现改为 hub 侧按
+//!   `conversation_id` 建索引, 只投递给该会话成员, 且序列化只做一次(`Arc<str>`
+//!   共享)。详见 `ws::hub` 的模块文档。
 //! - 曾列为缺口 4 的「`ServerFrame` 缺 `message_new` 变体」—— 已补
 //!   `ServerFrame::MessageNew { message: WireMessage }`(aux-13 §1.2.5),
 //!   并由 `handle_send_message` 在**新落库**后经 `WsHub::publish` 广播。
@@ -86,7 +90,6 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use actix_ws::{CloseCode, CloseReason, Message};
 use futures::StreamExt;
 use serde::Deserialize;
-use tokio::sync::broadcast;
 use tokio::time::interval;
 use uuid::Uuid;
 
@@ -194,11 +197,19 @@ pub async fn ws_handler(
             &app_for_loop,
             &hub_for_loop,
             &mut ws_session,
+            session_id,
         )
         .await
         {
             tracing::warn!(error = ?e, session_id = %session_id, "ws loop ended");
         }
+        // 2026-10-05: 从投递索引里摘掉本连接。
+        //
+        // 放在**循环返回之后**而不是循环内部各 return �� —— 后者每加一个退出
+        // 分支就得记得补一次, 漏一处索引就只增不减(内存泄漏, 且每次 publish
+        // 都会对着一个已死通道 try_send)。收敛到唯一出口才漏不掉。
+        hub_for_loop.detach(session_id);
+
         // 关闭 session
         let _ = session
             .close(Some(CloseReason {
@@ -212,12 +223,17 @@ pub async fn ws_handler(
 }
 
 /// WS 主循环 (per C-11 范围)
+///
+/// `conn_id` 是本连接在 `WsHub` 投递索引里的主键: 建连时用它 `attach` 出站
+/// 通道, 鉴权成功后用它 `mark_authenticated` 进入索引。`detach` 由调用方
+/// (`ws_handler`) 在本函数返回**之后**统一做。
 async fn run_ws_loop(
     ws_session: &mut actix_ws::Session,
     msg_stream: &mut actix_ws::MessageStream,
     app: &web::Data<AppState>,
     hub: &super::hub::WsHub,
     state: &mut WsSession,
+    conn_id: Uuid,
 ) -> Result<(), AppError> {
     // 2026-10-03 修(缺口 #H): 心跳 tick 原先放在一个独立后台 task 里, 但
     // 那个 task 只 `tracing::info!` + `break` —— `actix_ws::Session` 归本主循环
@@ -227,10 +243,12 @@ async fn run_ws_loop(
     // 主循环用 select! 直接判定并退出(退出后由 ws_handler 统一走 close)。
     let mut tick = interval(HEARTBEAT_TICK);
 
-    // 广播订阅**必须在进入循环前**完成: broadcast 通道只向「订阅之后」的
-    // 接收者投递, 若在循环内首次收到帧时才订阅, 连接建立到进入循环之间的
-    // 广播会被静默漏掉。
-    let mut hub_rx = hub.subscribe();
+    // 出站通道**必须在进入循环前**建立: `attach` 既分配通道也登记连接, 若在
+    // 循环内首次要收时��� attach, 建连到进入循环之间的广播会被静默漏掉。
+    //
+    // 注意此时连接**还没有**进投递索引(未鉴权), 所以即便有人对它 `publish`,
+    // 也找不到它 —— 旁听防护是结构性的, 不依赖任何运行时检查。
+    let mut hub_rx = hub.attach(conn_id);
 
     loop {
         // biased: 有帧时优先处理帧。客户端持续发帧时 tick 分支不会命中是**正确**
@@ -254,27 +272,18 @@ async fn run_ws_loop(
                 }
                 continue;
             }
-            b = hub_rx.recv() => {
-                match b {
-                    Ok(frame) => {
-                        deliver_broadcast(ws_session, state, frame).await?;
+            o = hub_rx.recv() => {
+                match o {
+                    Some(outbound) => {
+                        deliver_broadcast(ws_session, state, &outbound).await?;
                     }
-                    // Lagged: 慢客户端漏掉了最旧的若干帧。这里**只记不补** ——
-                    // 补齐要按 conversation 逐个拉 REST, 属于另一个量级的逻辑。
-                    // 但必须留痕: 静默跳过会让客户端以为「对方没发言」。
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // 所有 Sender 都被丢弃: 正常路径下只有 hub 被整体销毁才会发生
+                    // (连接自己的 detach 在循环**返回之后**才跑, 见 ws_handler)。
+                    // 此时本连接不可能再收到任何广播, 留着只是静默挂着的空连接。
+                    None => {
                         tracing::warn!(
                             session_id = %state.session_id(),
-                            skipped,
-                            "ws broadcast lagged; client must resync via GET /v1/conversations/{{id}}/messages"
-                        );
-                    }
-                    // Closed: hub 已被销毁, 不会再有任何广播。这条连接已失去意义,
-                    // 继续留着只会变成一个永远静默的连接。
-                    Err(broadcast::error::RecvError::Closed) => {
-                        tracing::warn!(
-                            session_id = %state.session_id(),
-                            "ws hub closed, terminating connection"
+                            "ws outbox closed (hub dropped), terminating connection"
                         );
                         state.force_close();
                         return Ok(());
@@ -356,6 +365,12 @@ async fn run_ws_loop(
                                     state.set_conversation_ids(super::hub::membership_set(
                                         conv_ids.iter(),
                                     ));
+                                    // 进入投递索引 —— 与上面的 `set_conversation_ids`
+                                    // 用**同一份** `conv_ids` 快照, 两者不会互相矛盾。
+                                    // 放在回 auth_ok **之前**: 若连接没能进索引, 它能
+                                    // 收发自己的消息却收不到任何别人的, 且**没有报错**,
+                                    // 用户只会以为对方没发言。
+                                    hub.mark_authenticated(conn_id, conv_ids.iter().copied());
                                     tracing::info!(
                                         user_id = %uid,
                                         session_id = %state.session_id(),
@@ -867,24 +882,30 @@ fn publish_new_message(hub: &super::hub::WsHub, msg: &im_core::message::reposito
 /// 过滤判定本身在 `ws::hub::should_deliver`(纯函数, 有单测); 本函数只负责
 /// 「判完之后把帧写出去」。**不在这里写过滤逻辑** —— 两处各写一遍过滤, 早晚会
 /// 漂移, 而漂移的那一侧就是数据泄漏。
+///
+/// ## 2026-10-05: 这里不再序列化
+///
+/// 上一版每个收件人各自 `serde_json::to_string(&frame)`。现在序列化在
+/// `WsHub::publish` 里**只做一次**, 结果以 `Arc<str>` 随 `Outbound` 一起
+/// 投递 —— 一个 100 人的群发一条消息, 从 100 次序列化降到 1 次。
+///
+/// 顺带少掉了一个错误分支: 序列化失败现在在 `publish` 里统一处理并记账, 不再
+/// 由每个收件人各报一次同一个错误。
 async fn deliver_broadcast(
     ws_session: &mut actix_ws::Session,
     state: &WsSession,
-    frame: ServerFrame,
+    outbound: &super::hub::Outbound,
 ) -> Result<(), AppError> {
-    let audience = super::hub::Audience::of(&frame);
-    if !super::hub::should_deliver(&audience, state) {
-        // 只在「不可投递」时留痕: 过滤掉绝大多数帧是正常现象(非成员), 逐帧 warn
-        // 会把日志淹掉。而 Undeliverable 是**帧本身的性质问题**, 值得每次记录。
-        if let super::hub::Audience::Undeliverable(why) = &audience {
-            tracing::warn!(%why, "broadcast frame is not deliverable; dropped");
-        }
+    // 纵深防御: 投递索引已按 `audience` 选过收件人, 这里再用**会话自己的**
+    // 成员快照判一次。索引与快照同源, 但安全边界不该单点依赖 —— 索引若因任何
+    // bug 多收了连接, 这一层仍能拦住。
+    if !super::hub::should_deliver(&outbound.audience, state) {
         return Ok(());
     }
-    let body = serde_json::to_string(&frame)
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("ws broadcast serialize: {e}")))?;
     ws_session
-        .text(body)
+        // 用 `&*` 而不是 `.as_ref()`: `Arc<str>` 既有 `AsRef<str>` 又可解引用到
+        // `str`, `as_ref()` 的目标类型要靠下游推断, 这里直接取确定的 `&str`。
+        .text(&*outbound.payload)
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("ws broadcast send: {e}")))?;
     Ok(())
