@@ -591,3 +591,376 @@ fn route_table_baseline() {
         "规范里 /v1 之外的 path 应恰好是 main.rs 挂在 App 根的那三条"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 测试 4: /metrics 的 description 与真实输出必须对得上
+// ---------------------------------------------------------------------------
+
+/// `/metrics` 真实暴露的指标条数(2026-10-05 手工核对)。
+///
+/// 4 条 WS(`im_ws_*`) + 3 条领域事件(`im_events_*`)。数法: `health.rs::metrics`
+/// 里 `# HELP` 注释行逐条数 —— 每个指标恰好一条。
+const EXPECTED_METRIC_COUNT: usize = 7;
+
+/// 从 markdown 反引号跨度里挑出形如 `` `im_xxx` `` 的**指标名**。
+///
+/// ## 为什么要自己写, 而不用正则库
+///
+/// `/metrics` 的 description 是**给人读的散文**, 不是结构化字段 —— 它同时含
+/// 指标名、环境变量名、URL。所以「哪些反引号跨度算指标名」必须被一条明确
+/// 写死的规则回答, 而不是让某个正则的运气决定。这个规则是三段合取:
+/// ① 在反引号里(按 `` ` `` 切开后取奇数下标) ② 以 `im_` 开头 ③ 剩余字符全部
+/// 是 `[a-z0-9_]`。
+///
+/// 第 ③ 条同时排掉两类真实存在的干扰项:
+/// - `` `IM_EVENT_PUBLISHER_KIND` `` —— 环境变量名, **大写**, 必须被排除
+/// - `` `GET /v1/conversations/{id}/messages` `` —— 含斜杠与大写字母, 被排除
+///
+/// 两条都**不是**假想敌: 它们此刻就写在同一段 description 里。规则若只写
+/// 「以 im_ 开头」, 大写的那个已经匹配不到了(PowerShell/JS 的 startsWith 之类
+/// 默认大小写敏感), 但含 `/` 和 `{}` 的那个会被放过 —— 故 ③ 不可省。
+///
+/// ## 反引号个数为奇数(没闭合)会怎样
+///
+/// 下标奇偶会整体错位, 抽出来的名字变成乱码。此时测试 4 的**双向**集合比较
+/// 仍然会红(真实集合是 7 个已知名字), 所以这是个响亮的失败, 不是静悄悄的漏检。
+fn backticked_metric_names(text: &str) -> Vec<String> {
+    text.split('`')
+        .skip(1)
+        .step_by(2)
+        .filter(|span| {
+            span.len() > 3
+                && span.starts_with("im_")
+                && span
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        })
+        .map(str::to_string)
+        .collect()
+}
+
+/// 从真实 `/metrics` 响应体里取出**数据行**的指标名。
+///
+/// 跳过 `#` 开头的注释行(`# HELP` / `# TYPE` / 顶部那行 MVP 说明) —— 它们是
+/// 元信息, 名字会在同一指标上重复出现两三次, 混进来集合就不对了。
+/// 再按 `im_` 前缀滤一道, 免得将来有人在末尾加一行自由格式的说明文字。
+fn live_metric_names(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_whitespace().next())
+        .filter(|name| name.starts_with("im_"))
+        .map(str::to_string)
+        .collect()
+}
+
+fn metrics_operation_str(pointer: &str) -> String {
+    spec_value()
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| {
+            panic!(
+                "规范里 /metrics 的 GET operation 缺少 {pointer}。\
+                 少了它, 测试 4 就退化成「什么都不检查」的空转断言。"
+            )
+        })
+        .to_string()
+}
+
+/// 规范与代码之间的指标名差异。
+///
+/// 只 derive `Debug`: 失败信息里直接 `{:?}` 打两个字段。其余 derive 未用到,
+/// 不写 —— 少一个 trait impl 少一处「以后有人以为它能用」的可能。
+#[derive(Debug)]
+struct MetricDrift {
+    /// 规范 description 里写了, 但 `health.rs` 实际没暴露
+    missing_in_code: Vec<String>,
+    /// `health.rs` 实际暴露了, 但规范 description 里没写
+    missing_in_spec: Vec<String>,
+}
+
+impl MetricDrift {
+    fn is_clean(&self) -> bool {
+        self.missing_in_code.is_empty() && self.missing_in_spec.is_empty()
+    }
+}
+
+/// **双向**比较两份指标名清单, 返回两个方向的差异。
+///
+/// 为什么是双向而不是「文档 ⊆ 实际」: 单向漏掉「代码加了指标、规范没写」——
+/// 而那恰好是集成方真正会踩的坑(规范是他们唯一的依据, 规范没写就等于不存在)。
+///
+/// 比较前两侧都排序, 故**顺序无关**: 调换 description 里指标的排列顺序不该
+/// 让测试变红 —— 那是排版问题, 不是契约问题。
+fn compare_metric_names(documented: &[String], exposed: &[String]) -> MetricDrift {
+    let mut doc = documented.to_vec();
+    let mut live = exposed.to_vec();
+    doc.sort();
+    live.sort();
+    MetricDrift {
+        missing_in_code: doc.iter().filter(|n| !live.contains(n)).cloned().collect(),
+        missing_in_spec: live.iter().filter(|n| !doc.contains(n)).cloned().collect(),
+    }
+}
+
+/// 反例守卫 —— 抽取规则本身必须经得起**故意构造的坏输入**。
+///
+/// 判别力的来源: 换一个极端输入, 结果**必须变**。
+/// 若把上面两个 `fn` 的规则改坏(比如去掉大小写/字符集限制), 本用例会红;
+/// 而如果它们退化成「返回全部反引号内容」或「恒返回空」, 本用例同样会红。
+#[test]
+fn metric_extraction_rejects_non_metrics_and_uppercase() {
+    // 反例 1: 大写环境变量名不是指标(它在真实 description 里就存在)。
+    assert!(
+        backticked_metric_names("丢弃数因 `IM_EVENT_PUBLISHER_KIND=stub`").is_empty(),
+        "`IM_EVENT_PUBLISHER_KIND` 是环境变量名, 绝不能被当成指标名"
+    );
+
+    // 反例 2: 含斜杠/大写/花括号的 URL 不是指标。
+    let url_span = "客户端需经 `GET /v1/conversations/{id}/messages` 补齐";
+    assert!(
+        backticked_metric_names(url_span).is_empty(),
+        "URL 跨度不是指标名"
+    );
+
+    // 反例 3: 没有反引号 = 没有可抽的东西(不能靠「看起来像」就放行)。
+    assert!(
+        backticked_metric_names("im_ws_broadcast_subscriptions 是 WS 连接数").is_empty(),
+        "描述里没加反引号就该抽不到 —— 反引号是这个规则的前提, 不是装饰"
+    );
+
+    // 反例 4: 前缀对但混进非法字符, 仍然拒绝。
+    assert!(
+        backticked_metric_names("`im_bad-name` 与 `im_bad.name`").is_empty(),
+        "含 `-` / `.` 的不是合法 Prometheus 指标名"
+    );
+
+    // 阳性对照: 真实形态必须抽得出(否则上面四条可能是因为「什么都抽不出」而绿)。
+    let good = "`im_ws_indexed_conversations` (gauge) 与 `im_events_dropped_total` (counter)";
+    assert_eq!(
+        backticked_metric_names(good),
+        vec![
+            "im_ws_indexed_conversations".to_string(),
+            "im_events_dropped_total".to_string()
+        ],
+        "合法指标名必须按出现顺序抽全"
+    );
+
+    // `live_metric_names` 的阳性对照: 注释行不得混进集合, 否则每个名字会出现 3 次。
+    let body = "\
+# MVP: prometheus exporter not yet enabled
+# HELP im_ws_indexed_conversations 投递索引中登记的会话数
+# TYPE im_ws_indexed_conversations gauge
+im_ws_indexed_conversations 0
+";
+    assert_eq!(
+        live_metric_names(body),
+        vec!["im_ws_indexed_conversations".to_string()],
+        "只应取数据行; # HELP / # TYPE / 顶部说明都必须跳过"
+    );
+}
+
+/// `/metrics` 的 description 是一份**手写的散文**, 逐字复制 `health.rs` 里的
+/// `# HELP` 文本。它没有任何东西守着 —— 于是每加一个指标就必然产生一次漂移:
+/// 代码里有、规范里没有, 集成方按规范接进来就少一个可用指标, 而**没有任何
+/// 测试会红**。这与「规范里写了路由但代码没注册」是同一类缺陷, 只是方向是
+/// 散文 → 代码, 不在 `check-openapi.ps1`(静态比对路由表)也不在测试 1~3 的
+/// 覆盖范围内。测试 4 就是补这个洞。
+#[actix_web::test]
+async fn metrics_description_matches_the_live_exposition() {
+    let description = metrics_operation_str("/paths/~1metrics/get/description");
+    let example =
+        metrics_operation_str("/paths/~1metrics/get/responses/200/content/text~1plain/example");
+
+    let app = actix_web::test::init_service(openapi_app()).await;
+    let live = probe!(&app, "get", "/metrics");
+    assert_eq!(
+        live.status,
+        StatusCode::OK,
+        "/metrics 必须返回 200 —— 它是规范里 3 条根级 operation 之一。{}",
+        live.describe()
+    );
+    let body = String::from_utf8_lossy(&live.body).into_owned();
+
+    // --- 计数基线(阳性对照) -------------------------------------------------
+    // 放在集合比较**之前**: 两个空集合是相等的, 若抽取逻辑坏掉导致两边都是空,
+    // 下面的 assert_eq!(doc, live) 会**恒真通过**。先用一条独立基线把「确实抽到
+    // 了东西」钉住, 集合比较才有意义。
+    let live_names = live_metric_names(&body);
+    assert_eq!(
+        live_names.len(),
+        EXPECTED_METRIC_COUNT,
+        "health.rs 实际暴露的指标数从 {EXPECTED_METRIC_COUNT} 变成了 {}({live_names:?})。\
+         有意增删时请同步改 EXPECTED_METRIC_COUNT, 并**同时**更新 /metrics 的 description, \
+         否则下面那条双向比较会红。",
+        live_names.len()
+    );
+
+    // --- 双向比较 -----------------------------------------------------------
+    // 双向(set 相等)而不是单向(「文档 ⊆ 实际」): 单向漏掉「代码加了指标、
+    // 规范没写」—— 而那恰好是集成方真正会踩的坑(规范是他们唯一的依据)。
+    let drift = compare_metric_names(&backticked_metric_names(&description), &live_names);
+
+    assert!(
+        drift.is_clean(),
+        "/metrics 的 description 与真实输出漂移了。\n\
+         规范写了但代码没暴露: {:?}\n\
+         代码暴露了但规范没写: {:?}\n\
+         \n\
+         两种修法: 改 `health.rs::metrics` 补齐指标, 或改 openapi.json 的 \
+         `/metrics` description 去掉它。\n\
+         真实输出:\n{body}",
+        drift.missing_in_code,
+        drift.missing_in_spec,
+    );
+
+    // --- example 的逐字核对 -------------------------------------------------
+    // description 里的中文散文无法逐字机器校验(那是给人读的), 但 example 里的
+    // `# HELP` 行是可以的 —— 逐行要求它**原样**出现在真实输出中。
+    let absent = help_lines_absent_from(&example, &body);
+    assert!(
+        absent.is_empty(),
+        "example 里的 `# HELP` 行与真实输出**逐字不符**: {absent:?}\n\
+         它必须是 health.rs 里那一行的原样复制(不要改标点/空格/全半角)。\n\
+         真实输出:\n{body}"
+    );
+}
+
+/// 返回 example 里那些**没有原样**出现在真实输出中的 `# HELP` 行。
+///
+/// 「原样」= 整行字符串相等, 不是包含、不是去空白后相等。半角/全角括号、
+/// 逗号后有没有空格都会被抓到 —— 这些正是「手抄一份 HELP 文本」最容易漂的
+/// 地方, 而它们对读 `/metrics` 的人是可见的。
+fn help_lines_absent_from(example: &str, body: &str) -> Vec<String> {
+    example
+        .lines()
+        .filter(|l| l.starts_with("# HELP "))
+        .filter(|line| !body.lines().any(|actual| actual == *line))
+        .map(str::to_string)
+        .collect()
+}
+
+/// example 里 `# HELP` 行的条数 —— 反例守卫要拿它当基线。
+fn help_line_count(example: &str) -> usize {
+    example.lines().filter(|l| l.starts_with("# HELP ")).count()
+}
+
+/// 变异守卫 —— 对**真实 spec 文本**做内存变异, 逐条证明测试 4 的判别力。
+///
+/// ## 为什么做成常驻测试, 而不是一次性脚本
+///
+/// 「门禁在故意注入缺陷时会红」这件事, 若只在我本机跑一次就扔掉, 下一个改动
+/// 它照样能悄悄退化。留在这里, 它就是这条契约的**永久**反例守卫 —— 与
+/// `undocumented_path_is_not_routed` 同一思路: 判别式本身必须被看守。
+///
+/// 变异全部作用在**从 `SPEC_JSON` 读出来的真实字符串**上, 不另造样本: 造样本
+/// 只能证明「比较函数对假数据成立」, 而真实 spec 里那些干扰项(大写环境变量名、
+/// 嵌在散文里的 URL)恰恰是最可能让抽取规则失手的地方。
+#[actix_web::test]
+async fn metrics_gate_rejects_mutated_specs() {
+    let description = metrics_operation_str("/paths/~1metrics/get/description");
+    let example =
+        metrics_operation_str("/paths/~1metrics/get/responses/200/content/text~1plain/example");
+
+    let app = actix_web::test::init_service(openapi_app()).await;
+    let live = probe!(&app, "get", "/metrics");
+    let body = String::from_utf8_lossy(&live.body).into_owned();
+    let live_names = live_metric_names(&body);
+
+    // --- 阳性对照: 未变异必须干净 -------------------------------------------
+    // 若这一步就红, 说明下面的「变异被抓」没有意义(是常红的废物)。
+    assert!(
+        compare_metric_names(&backticked_metric_names(&description), &live_names).is_clean(),
+        "未变异的真实 spec 与真实输出就已经漂移了 —— 变异用例的前提不成立"
+    );
+    assert_eq!(
+        backticked_metric_names(&description).len(),
+        EXPECTED_METRIC_COUNT,
+        "对照组失效: 未变异时抽出的指标名就不是 {EXPECTED_METRIC_COUNT} 个"
+    );
+    assert!(
+        help_line_count(&example) > 0,
+        "对照组失效: example 里一条 `# HELP` 都没有, 逐字核对成了空转"
+    );
+    assert!(
+        help_lines_absent_from(&example, &body).is_empty(),
+        "对照组失效: 未变异的 example 已经与真实输出逐字不符"
+    );
+
+    // --- 变异 A: 规范少写一个指标(代码里有、规范没有) ----------------------
+    // 这是集成方真正会踩的方向: 他按规范接, 规范没写的指标等于不存在。
+    let dropped = "im_events_dropped_total";
+    let mutated_a = description.replace(&format!("`{dropped}`"), "(该指标已下线)");
+    assert_ne!(
+        mutated_a, description,
+        "变异 A 没生效: description 里找不到 `{dropped}`, 说明这条变异已过时, 请重写"
+    );
+    let drift_a = compare_metric_names(&backticked_metric_names(&mutated_a), &live_names);
+    assert_eq!(
+        drift_a.missing_in_spec,
+        vec![dropped.to_string()],
+        "变异 A 必须被抓, 且要指出「代码暴露了但规范没写」这一个名字"
+    );
+
+    // --- 变异 B: 规范多写一个不存在的指标 ----------------------------------
+    let ghost = "im_ghost_metric";
+    let mutated_b = format!("{description} 另有 `{ghost}` (gauge)");
+    let drift_b = compare_metric_names(&backticked_metric_names(&mutated_b), &live_names);
+    assert_eq!(
+        drift_b.missing_in_code,
+        vec![ghost.to_string()],
+        "变异 B 必须被抓, 且要指出「规范写了但代码没暴露」这一个名字"
+    );
+    assert!(
+        drift_b.missing_in_spec.is_empty(),
+        "变异 B 只应在一个方向有差异, 另一方向不该被牵连"
+    );
+
+    // --- 变异 C: 改名 —— 两个方向同时被抓 ----------------------------------
+    // 真实世界最常见的形态: health.rs 里把 `foo` 改名成 `bar`, 规范忘了跟。
+    // 此时**不是**简单少一个, 而是「少 foo + 多 bar」, 只报一个方向会误导人。
+    let mutated_c = description.replace(
+        "`im_ws_indexed_conversations`",
+        "`im_ws_conversations_indexed`",
+    );
+    let drift_c = compare_metric_names(&backticked_metric_names(&mutated_c), &live_names);
+    assert_eq!(
+        drift_c.missing_in_code,
+        vec!["im_ws_conversations_indexed".to_string()],
+        "变异 C: 改名后的新名字应报为 missing_in_code"
+    );
+    assert_eq!(
+        drift_c.missing_in_spec,
+        vec!["im_ws_indexed_conversations".to_string()],
+        "变异 C: 被换掉的旧名字应报为 missing_in_spec"
+    );
+
+    // --- 变异 D: example 的 `# HELP` 改一个字 ------------------------------
+    // 逐字核对这一路与上面三路独立: 名字集合完全没变, 只有描述文字漂了。
+    // 少了它, 「名字对上了就算过」会让 HELP 文本永远无人看守。
+    let mutated_d = example.replacen("已进入投递索引的 WS 连接数", "已进入索引的 WS 连接数", 1);
+    assert_ne!(
+        mutated_d, example,
+        "变异 D 没生效: example 里找不到那段 HELP 文本, 请重写这条变异"
+    );
+    assert!(
+        !help_lines_absent_from(&mutated_d, &body).is_empty(),
+        "变异 D 必须被抓: 只改一个字而指标名集合不变, 正是逐字核对存在的意义"
+    );
+    // 反向自检: 逐字核对不能「什么都判不合」—— 未变异时必须是干净的。
+    assert!(
+        help_lines_absent_from(&example, &body).is_empty(),
+        "反例守卫: 逐字核对在未变异时误报, 说明它恒红"
+    );
+
+    // --- 反例: 纯排版变化**不得**被抓 --------------------------------------
+    // 调整 description 里指标的排列顺序, 以及去掉多余空格, 都不改变契约。
+    // 若这些让测试变红, 开发者就会开始绕过测试 —— 那比漏检更糟。
+    let reordered = description
+        .replace(" (gauge)", "")
+        .replace(" (counter)", "");
+    assert!(
+        compare_metric_names(&backticked_metric_names(&reordered), &live_names).is_clean(),
+        "去掉 (gauge)/(counter) 标注不应被判成漂移 —— 指标名集合没变"
+    );
+}

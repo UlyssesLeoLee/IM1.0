@@ -92,7 +92,7 @@
         "tags": ["ops"],
         "operationId": "metrics",
         "summary": "Prometheus 文本指标",
-        "description": "Prometheus text exposition format v0.0.4。四个指标:\n\n- `im_ws_broadcast_subscriptions` (gauge) 已订阅广播的连接数\n- `im_events_published_total` (counter) 成功发布并拿到 JetStream ack 的事件数\n- `im_events_publish_failed_total` (counter) 发布失败数; **当前无 DLQ, 这些事件已丢失**\n- `im_events_dropped_total` (counter) 因 `IM_EVENT_PUBLISHER_KIND=stub` 被丢弃数 (配置问题, 非故障)",
+        "description": "Prometheus text exposition format v0.0.4。\n\nWS 连接类(4 项):\n- `im_ws_broadcast_subscriptions` (gauge) 已建出站通道的 WS 连接数, 含尚未鉴权的\n- `im_ws_authenticated_connections` (gauge) 已进入投递索引的 WS 连接数\n- `im_ws_indexed_conversations` (gauge) 投递索引中登记的会话数\n- `im_ws_broadcast_dropped_total` (counter) 因收件端出站通道写满而丢弃的帧数; 客户端需经 `GET /v1/conversations/{id}/messages` 补齐\n\n领域事件类(3 项):\n- `im_events_published_total` (counter) 成功发布并拿到 JetStream ack 的事件数\n- `im_events_publish_failed_total` (counter) 发布失败数; **当前无 DLQ, 这些事件已丢失**\n- `im_events_dropped_total` (counter) 因 `IM_EVENT_PUBLISHER_KIND=stub` 被丢弃数 (配置问题, 非故障)",
         "x-error-codes": [],
         "responses": {
           "200": {
@@ -100,7 +100,7 @@
             "content": {
               "text/plain": {
                 "schema": { "type": "string" },
-                "example": "# HELP im_ws_broadcast_subscriptions 已订阅 WS 广播的连接数\n# TYPE im_ws_broadcast_subscriptions gauge\nim_ws_broadcast_subscriptions 0\n"
+                "example": "# HELP im_ws_broadcast_subscriptions 已建出站通道的 WS 连接数(含尚未鉴权的)\n# TYPE im_ws_broadcast_subscriptions gauge\nim_ws_broadcast_subscriptions 0\n# HELP im_ws_authenticated_connections 已进入投递索引的 WS 连接数\n# TYPE im_ws_authenticated_connections gauge\nim_ws_authenticated_connections 0\n"
               }
             }
           }
