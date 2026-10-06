@@ -3444,6 +3444,128 @@ Commit: `46fdf7b`
 
 ---
 
+### 1.38 编辑/表情终于能实时同步; `auth_ok` 收进枚举 (2026-10-07, Ulysses 拍板)
+
+#### 起因: 不是「功能没写完」, 是安全上的两难
+
+`hub.rs` 把 `MessageEdited` / `ReactionAdded` 归为 `Audience::Undeliverable`,
+理由写得很直白: 语义属于某会话、但 wire 形状不带 `conversation_id`, **无从
+判断接收方是否成员, 按「发给所有人」处理就是跨会话泄漏**。代价是编辑消息与
+表情**完全没有实时同步**, 客户端只能轮询 REST。本节由 Ulysses 拍板落地。
+
+#### 关键决定: 单态, **不是** `Option<Uuid>`
+
+仓里**踩过一次**: 二态 `Option` 版本在 `None` 时退化成「发给所有人」, 造成
+跨会话泄漏, 于是又退回不发送。`hub.rs` 的
+`frames_without_conversation_id_are_never_delivered` 就是那次事故的守门。
+
+选 `conversation_id: Uuid`(必填单态)把它**从类型上根除**: 不存在
+「没有 conversation_id 的 MessageEdited」这种值, 于是也不存在
+「拿不到会话 → 发给所有人」这条分支。那条测试**没有删除**, 而是被反转成
+`session_scoped_frames_are_delivered_only_to_members` —— 断言的仍是
+**非会话成员绝不收**, 那才是防泄漏的闸门。
+
+> 判据: 修复「二态退化」这类问题时, 正确做法是**消掉那种状态**, 不是在
+> 判定里加分支。后者只是把同一个坑挪了个位置。
+
+#### 成本: 零额外查询(数据本来就在手上)
+
+- **edit**: `edit_message` 返回的 `Message` 实体已含 `conversation_id`
+- **react**: `ReactionService::add_reaction_with_context` 从它**第 2 步就已经
+  加载**的 message 里带出 —— 该值第 3 步的成员校验正在用(`service.rs:94`)
+
+新增 `add_reaction_with_context` 而**没有**改 `add_reaction` 的返回值: 后者会
+波及 8 个调用点(REST handler + 6 处集成测试)去取一个它们用不到的字段。
+一个 4 行的转发方法换掉 8 处改动, 是划算的。
+
+#### 一条注释变成了实际生效的分支
+
+`handle_react` 里「幂等重放不广播」此前**只是一条注释**, 原文:
+
+> 该判断保留成注释是因为**将来补上 conversation_id 后**立刻要用 —— 届时
+> 漏掉它就是一个「重复 reaction 被广播多次」的 bug。
+
+现在广播真做起来了, 它已是真实分支。**当时写下这句的人预见了这次改动,
+并把守卫留在了正确的位置** —— 这是仓里少见的「注释即路线图」。
+
+#### `auth_ok`: 收进枚举, wire 逐字节不变
+
+此前是 `serde_json::json!({"type":"auth_ok","req_id":…})` 手工构造、**完全
+绕过**整个枚举与 serde。后果: 不受任何门禁/契约测试/`im-testkit` 覆盖, 且
+serde 定义若变它不会跟着变(它压根不经过 serde)。它当初成为孤例, 正是因为
+「规范只给样例 JSON, 实现方无从登记」。
+
+**一处必须小心的细节**: `req_id` 用 `Option<Uuid>` **且不加
+`skip_serializing_if`**。上行首帧走私有的 `AuthFrame`, 其 `req_id` 可省略,
+手工构造时产出的是 `"req_id": null` —— **键仍在**。加 skip 就变成键消失,
+那不是「wire 不变」而是改形状。契约测试为此加了 `req_id: None` 的用例钉住。
+
+判据: 「wire 不变」这句话要落到**具体字节**上才可信。`Option` + 不 skip 与
+`Option` + skip 在「都叫 Option」的字面上没有区别, 在 wire 上差一个键。
+
+#### 门禁自己抓到了自己
+
+`check-asyncapi.ps1` 的 fail-closed 断言先于一切发现变体数 10→11, 并打印出
+正确的解析结果 —— 正是它当初被设计成「解析不到就判失败而不是当成无漂移」的价值。
+
+同时把 `$DeclaredOnlyServerFrames` 清空: `auth_ok` 过去因为「没有枚举变体」
+被列进去从而**跳过**双向对拍, 现在它有变体了, 留着就是门禁上的一个洞。
+
+> 判据: 任何「例外名单」都是**债**。加进去容易, 移除要有人记得 —— 所以清空
+> 名单时要在注释里说明「曾经有过这个例外, 已因 X 解决」, 而不是在 diff 里
+> 悄悄变空。
+
+#### 本机环境: cargo 全面不可用, 与代码无关
+
+`cargo-fmt.exe` / `cargo-clippy.exe` / E: 盘上的 build-script 全部
+**拒绝执行**(`os error 5`)。换全新 target 目录、换 D: 盘均失败; 改用工具链
+目录里的 `rustfmt.exe` 直跑成功 —— 故**是 E: 卷被某个执行策略拦了**。
+`cargo clippy` 因此**没能本地验证**, 交给 CI。
+
+同一个策略让 2 个 im-testkit **doctest** 失败, 报错是
+`Couldn't run the test: 拒绝访问 (os error 5) - maybe your tempdir is mounted
+with noexec?` —— doctest 要从 tempdir 执行一个 exe。与本次改动无关。
+
+#### 查出一个既有乱码, 但**没有**猜它原本是什么
+
+`handler.rs` 208 / 247 行注释里有 **5 个 U+FFFD 替换字符**。用
+`git cat-file` 取出 HEAD 版本做**字节级**比对确认: HEAD 里已有同样 5 个,
+本次 diff 的 `EF BF BD` 计数为 0 —— **不是本次引入**。
+
+原文已不可考, 故**不擅自改写**: 猜一个「看起来通顺」的说法, 比留着乱码更坏
+—— 后者至少不会让人以为那是某条真实决策的依据。
+
+> 判据: 「文件是合法 UTF-8」**不等于**「文件里没有乱码」。`UTF8Encoding` 严格
+> 解码会通过, 因为 U+FFFD 本身就是合法 UTF-8。要判乱码必须扫**字节**
+> `EF BF BD`。同理, 用 PowerShell 读 `git show` 的输出再计数是不可信的 ——
+> 那份输出会被当前控制台编码重新解码, 我第一次就是这么得出「HEAD 是 0」的
+> 错误结论的。
+
+#### 位置
+
+- `crates/im-protocol/src/ws_frames.rs`(`MessageEdited` / `ReactionAdded` 加字段;
+  新增 `AuthOk` 变体)
+- `crates/im-gateway/src/ws/{hub.rs, handler.rs}`(定向投递 + 两处广播接线)
+- `crates/im-core/src/reaction/service.rs`(`add_reaction_with_context`)
+- `crates/im-protocol/tests/ws_frames_contract.rs`(`AuthOk` 用例 + 变体数 11)
+- `crates/im-testkit/src/{assertions.rs, mock_ws_frames.rs}`
+- `docs/api/{asyncapi.json, QUICKSTART.md}`
+- `scripts/check-asyncapi.ps1`(基线 10→11; 例外名单清空)
+- `.gitignore`(`**/.cargo-target/`, 同型于 §1.36 的 `benches/` 误伤)
+
+#### 验证
+
+- `cargo check --workspace --all-targets --locked` exit 0
+- `cargo test -p im-protocol -p im-testkit -p im-common -p im-gateway`
+  全部单测/集成测试通过; 2 个 doctest 因上述环境原因失败
+- `rustfmt --check` 对 `git diff --name-only '*.rs'` 枚举出的**全部 7 个文件**通过
+- 8 个门禁全部 exit 0; `check-asyncapi` 报 11 个 server discriminators,
+  与 11 个 Rust 变体一致
+
+Commit: `e0a1ba7`
+
+---
+
 ## 2. 后续新增 (无字母编号, 2026-10-03 标注时未分配编号)
 
 | 位置 | 缺口内容 (摘自代码注释) | 接线条件 / 依赖 |

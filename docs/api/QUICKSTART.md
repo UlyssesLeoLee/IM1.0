@@ -105,8 +105,14 @@ wscat -c ws://localhost:8080/v1/ws
 
 - **无速率限制**。`aux-08 §K GAP-8` 的 MVP 计划就是「Valkey 不可用即放行所有请求」，当前**根本没有限流**。请在接入侧自己做配额。
 - **已读回执没有下行 WS 帧**。`mark_read` 成功即更新服务端状态，但**不会**推送给对端，对端需自己拉 `?after_sequence=`。
-- **`MessageEdited` / `ReactionAdded` 广播不跨会话**。这两帧的 wire 形状不带 `conversation_id`，广播中枢无法判断接收方是否该会话成员，故**不做广播**（避免跨会话泄漏）。**待规范补字段**。
-- **无 `auth_ok` 的正式定义**。握手成功后服务端回 `{"type":"auth_ok"}`，但 `aux-13 §1.2` 定义的是 `connected`。**待规范确认**。
+- **`message_new` 的 `reactions` 恒为 `[]`**（`hub.rs` 硬编码空数组）。刚发出的表情**不会**出现在随后某条消息的 `message_new` 里；实时到达请用 `reaction_added` 帧，或自己拉消息列表。
+- **`auth_ok` 仍无规范定义**。2026-10-07 起它是 `ServerFrame::AuthOk` 枚举变体、纳入门禁与契约测试覆盖，但 `aux-13 §1.2` 仍未定义它（§1.2.1 定义的是 `connected`）。wire 形状**未变**，接入方不受影响；「它是否本应是 `connected` 的别名」待规范裁决。
+
+> **2026-10-07 更新**：编辑与表情**已有实时同步**。`message_edited` /
+> `reaction_added` 此前因 wire 形状不带 `conversation_id` 而无法定向投递
+> （广播给所有人即跨会话泄漏），现已补上**必填单态** `conversation_id`，
+> 与 `message_new` 走同一条「仅投递给会话成员」的路径。幂等重放的反应
+> **不广播**，以免所有在线端看到同一个表情被重复动画一次。
 
 ---
 
@@ -114,9 +120,14 @@ wscat -c ws://localhost:8080/v1/ws
 
 客户端 → 服务端 **8 类**：`auth` / `send_message` / `edit_message` / `recall_message` /
 `react` / `mark_read` / `typing` / `ping`
-服务端 → 客户端 **10 类**：`connected` / `ack`（成功/幂等冲突/错误 3 态）/ `message_new` /
+服务端 → 客户端 **11 类**：`auth_ok` / `connected` / `ack`（成功/幂等冲突/错误 3 态）/ `message_new` /
 `message_edited` / `message_recalled` / `reaction_added` / `presence_update` / `typing` /
 `pong` / `force_disconnect`
+
+其中生产代码**实际会发出** 8 类：`auth_ok` / `ack` / `message_new` / `message_edited` /
+`message_recalled` / `reaction_added` / `typing` / `pong`。
+`connected` / `presence_update` / `force_disconnect` 三类登记在协议里但**不会下发**
+（`im-testkit` 的 mock server 会用 `connected`）。
 
 完整形状见 [`aux-13`](../templates/04-detailed-design/auxiliary/aux-13-protocol-frame-samples.md) §1 与
 [`asyncapi.json`](asyncapi.json)。
