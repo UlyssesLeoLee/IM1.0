@@ -73,6 +73,7 @@ pub fn assert_client_frame_shape(actual: &ClientFrame, expected_kind: &str) {
 fn server_frame_kind(frame: &ServerFrame) -> &'static str {
     match frame {
         ServerFrame::Connected { .. } => "connected",
+        ServerFrame::AuthOk { .. } => "auth_ok",
         ServerFrame::Ack { .. } => "ack",
         ServerFrame::MessageNew { .. } => "message_new",
         ServerFrame::MessageEdited { .. } => "message_edited",

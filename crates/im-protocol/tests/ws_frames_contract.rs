@@ -379,6 +379,15 @@ fn every_server_frame_with_none_options_matches_the_spec() {
             serde_json::to_value(ServerFrame::Connected { session_id: id }).unwrap(),
         ),
         (
+            // 2026-10-07 新增。本用例的价值恰恰是**钉住 wire 不变**:
+            // `req_id` 为 `None` 时键**仍在**且为 `null` —— 若将来有人给本字段
+            // 加 `skip_serializing_if`, 这个断言会立刻红, 而那正是「wire 不变」
+            // 被悄悄破坏的信号。
+            "ServerFrame::AuthOk",
+            "auth_ok",
+            serde_json::to_value(ServerFrame::AuthOk { req_id: None }).unwrap(),
+        ),
+        (
             "ServerFrame::Ack",
             "ack",
             serde_json::to_value(ServerFrame::Ack {
@@ -414,6 +423,7 @@ fn every_server_frame_with_none_options_matches_the_spec() {
             "message_edited",
             serde_json::to_value(ServerFrame::MessageEdited {
                 message_id: id,
+                conversation_id: id,
                 content: MessageContent::Text { text: "hi".into() },
                 edited_at: now,
             })
@@ -433,6 +443,7 @@ fn every_server_frame_with_none_options_matches_the_spec() {
             "reaction_added",
             serde_json::to_value(ServerFrame::ReactionAdded {
                 message_id: id,
+                conversation_id: id,
                 user_id: id,
                 emoji: "👍".into(),
             })
@@ -473,8 +484,8 @@ fn every_server_frame_with_none_options_matches_the_spec() {
 
     assert_eq!(
         cases.len(),
-        10,
-        "ServerFrame 应有 10 个变体; 数量对不上说明本测试漏了或多了某个变体"
+        11,
+        "ServerFrame 应有 11 个变体(2026-10-07 起 AuthOk 计入); 数量对不上说明本测试漏了或多了某个变体"
     );
     for (label, wire, v) in cases {
         assert_all_none_frame_matches_required(label, "server", "type", wire, &v);

@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use im_common::ids::{MessageId, UserId};
+use im_common::ids::{ConversationId, MessageId, UserId};
 use im_common::AppError;
 
 use super::repository::{Reaction, ReactionRepository};
@@ -60,12 +60,39 @@ impl ReactionService {
     /// 返回 `(Reaction, bool)`: 第二个值 `true` 表示**这次真的插入了新行**,
     /// `false` 表示「本来就有」(幂等重放)。调用方据此决定要不要广播 ——
     /// 对一条已存在的 reaction 再广播一次, 会让所有在线端看到重复的表情动画。
+    ///
+    /// 需要**广播**的调用方请用 [`Self::add_reaction_with_context`] —— 那个
+    /// 版本额外返回 `conversation_id`。本方法保留是为了不改动既有 8 个调用点
+    /// (REST handler + 集成测试), 它们本来就不广播。
     pub async fn add_reaction(
         &self,
         message_id: MessageId,
         user_id: UserId,
         emoji: &str,
     ) -> Result<(Reaction, bool), AppError> {
+        self.add_reaction_with_context(message_id, user_id, emoji)
+            .await
+            .map(|(r, inserted, _conv)| (r, inserted))
+    }
+
+    /// 同 [`Self::add_reaction`], 但额外返回该消息所属的 `conversation_id`。
+    ///
+    /// ## 为什么单独开一个方法而不是改原方法的返回值
+    ///
+    /// 广播 `ServerFrame::ReactionAdded` 需要 `conversation_id`(否则广播中枢
+    /// 无从判断接收方是不是会话成员, 发给所有人就是跨会话泄漏)。而这个值
+    /// **本方法已经查出来了** —— 第 2 步为「消息必须存在」而 `find_by_id` 时
+    /// 就拿到了, 第 3 步的成员校验正是拿 `msg.conversation_id` 比的。
+    ///
+    /// 所以另开一个方法把它带出来, 比让调用方**再查一次**便宜, 也比把既有
+    /// 8 个调用点全改掉更保守 —— 后者会为了一个它们用不到的字段去动 REST
+    /// handler 与集成测试, 徒增这次改动的波及面。
+    pub async fn add_reaction_with_context(
+        &self,
+        message_id: MessageId,
+        user_id: UserId,
+        emoji: &str,
+    ) -> Result<(Reaction, bool, ConversationId), AppError> {
         // 1. emoji 先判: 便宜的校验放最前, 避免为一个空字符串查两次库
         if emoji.trim().is_empty() {
             return Err(AppError::Validation("emoji must not be empty".into()));
@@ -109,7 +136,9 @@ impl ReactionService {
             .any(|r| r.user_id == user_id && r.emoji == emoji);
 
         let reaction = self.reactions.add(message_id, user_id, emoji).await?;
-        Ok((reaction, !already))
+        // `msg` 是第 2 步为「消息必须存在」而加载的, 它的 `conversation_id`
+        // 在第 3 步已被用于成员校验 —— 这里把它带出来给广播用, **不再查一次**。
+        Ok((reaction, !already, msg.conversation_id))
     }
 
     /// 移除 reaction(幂等 —— 不存在也视为成功, 返回 `false`)

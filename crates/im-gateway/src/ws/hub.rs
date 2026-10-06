@@ -329,13 +329,23 @@ pub enum Audience {
 
     /// **不可安全投递 —— 一律不发。**
     ///
-    /// 用于两类帧:
-    /// 1. 语义属于某会话、但 wire 形状不带 `conversation_id` 的帧
-    ///    (`MessageEdited` / `ReactionAdded`) —— 无从判断接收方是否成员,
-    ///    按「发给所有人」处理就是跨会话泄漏;
-    /// 2. **单连接响应**(`Ack` / `Connected` / `Pong`) —— 它们承载的是某个
-    ///    请求的 `req_id` 或某条连接自己的握手结果, 广播出去等于把别人的
-    ///    请求回执塞给无关客户端。
+    /// 只剩**单连接响应**(`Ack` / `AuthOk` / `Connected` / `Pong`)落在这一态:
+    /// 它们承载的是某个请求的 `req_id` 或某条连接自己的握手结果, 广播出去等于
+    /// 把别人的请求回执塞给无关客户端。
+    ///
+    /// ## 「语义属于某会话但形状不带 `conversation_id`」已不再是本变体的成因
+    ///
+    /// 2026-10-07 前, `MessageEdited` / `ReactionAdded` 落在这里 —— 因为
+    /// aux-13 §1.2.6/§1.2.8 的 wire 形状不带 `conversation_id`, 无从判断
+    /// 接收方是否成员, 而「发给所有人」就是跨会话泄漏。后果是**编辑与表情
+    /// 完全没有实时同步**。
+    ///
+    /// 现已给两帧补上**必填单态** `conversation_id`(用户拍板), 它们与
+    /// `MessageNew` 走同一条 `Audience::Conversation` 定向投递路径。
+    ///
+    /// 那个二态 `Option` 版本踩过一次坑(`None` 退化成发给所有人 = 泄漏),
+    /// 故现在用**单态**从类型上根除: 不存在「没有 conversation_id 的帧」这种
+    /// 值, 于是也不存在「拿不到会话就发给所有人」这条分支。
     ///
     /// 携带 `&'static str` 是为了在丢弃时留下可 grep 的原因, 而不是静默吞掉。
     Undeliverable(&'static str),
@@ -358,13 +368,16 @@ impl Audience {
             ServerFrame::PresenceUpdate { .. } => Audience::All,
             ServerFrame::ForceDisconnect { .. } => Audience::All,
 
-            ServerFrame::MessageEdited { .. } => {
-                Audience::Undeliverable("aux-13 §1.2.6 MessageEdited 不带 conversation_id")
-            }
-            ServerFrame::ReactionAdded { .. } => {
-                Audience::Undeliverable("aux-13 §1.2.8 ReactionAdded 不带 conversation_id")
-            }
+            ServerFrame::MessageEdited {
+                conversation_id, ..
+            } => Audience::Conversation(ConversationId(*conversation_id)),
+
+            ServerFrame::ReactionAdded {
+                conversation_id, ..
+            } => Audience::Conversation(ConversationId(*conversation_id)),
+
             ServerFrame::Ack { .. } => Audience::Undeliverable("ack 是单连接响应, 不得广播"),
+            ServerFrame::AuthOk { .. } => Audience::Undeliverable("auth_ok 是单连接响应, 不得广播"),
             ServerFrame::Connected { .. } => Audience::Undeliverable("connected 是单连接响应"),
             ServerFrame::Pong { .. } => Audience::Undeliverable("pong 是单连接响应"),
         }
@@ -511,31 +524,80 @@ mod tests {
     }
 
     #[test]
-    fn frames_without_conversation_id_are_never_delivered() {
-        // 回归: 二态 `Option` 版本把这类帧当 `None` → 发给所有人 → 跨会话泄漏。
-        // 这三个测试是那次设计的守门。
+    fn session_scoped_frames_are_delivered_only_to_members() {
+        // 2026-10-07: 本测试是**反转**后的版本。
+        //
+        // 此前叫 `frames_without_conversation_id_are_never_delivered`, 断言
+        // `MessageEdited` / `ReactionAdded` 必须 `Undeliverable` —— 那是在给
+        // 「两帧没有 conversation_id 所以不能发」这个**权宜之计**站岗。
+        //
+        // 用户拍板给两帧补了**必填单态** `conversation_id`, 它们现在必须
+        // **定向投递给会话成员**, 且**非成员绝不收**(这才是跨会话泄漏的闸门)。
+        //
+        // 「没有 conversation_id 的帧」已不可能存在 —— 那是单态字段带来的
+        // 类型级保证, 所以这里断言的是**成员/非成员**而不是「可不可投递」。
+        let conv = ConversationId(uuid::Uuid::new_v4());
+        let other = ConversationId(uuid::Uuid::new_v4());
+
         let edited = ServerFrame::MessageEdited {
             message_id: uuid::Uuid::new_v4(),
+            conversation_id: conv.0,
             content: MessageContent::Text { text: "x".into() },
             edited_at: chrono::Utc::now(),
         };
         let react = ServerFrame::ReactionAdded {
             message_id: uuid::Uuid::new_v4(),
+            conversation_id: conv.0,
             user_id: UserId::new().0,
             emoji: "👍".into(),
         };
-        let ack = ServerFrame::Ack {
-            req_id: uuid::Uuid::new_v4(),
-            ok: true,
-            data: None,
-            error: None,
-        };
 
-        for frame in [edited, react, ack] {
+        for frame in [edited, react] {
+            let a = Audience::of(&frame);
+            assert!(
+                matches!(a, Audience::Conversation(c) if c == conv),
+                "两帧现在必须定向投递到所属会话, 实际 {a:?}"
+            );
+            // 成员收得到
+            assert!(
+                should_deliver(&a, &authed_session(&[conv, other])),
+                "会话成员应当收到"
+            );
+            // **非成员收不到** —— 这条才是防跨会话泄漏的闸门
+            assert!(
+                !should_deliver(&a, &authed_session(&[other])),
+                "非会话成员绝不能收到 {a:?} —— 这就是跨会话泄漏"
+            );
+        }
+    }
+
+    #[test]
+    fn single_connection_responses_are_never_broadcast() {
+        // `AuthOk` 于 2026-10-07 加入本集合: 它是**鉴权回执**, 语义上只对
+        // 那一条连接成立, 广播出去等于把别人的握手结果塞给无关客户端。
+        //
+        // 此前 `auth_ok` 是手工构造的裸 JSON, 根本不经过 `Audience::of` ——
+        // 所以它此前**无法**被这条闸门覆盖。现在它有类型了, 才谈得上「判定
+        // 它不该被广播」。
+        for frame in [
+            ServerFrame::Ack {
+                req_id: uuid::Uuid::new_v4(),
+                ok: true,
+                data: None,
+                error: None,
+            },
+            ServerFrame::AuthOk {
+                req_id: Some(uuid::Uuid::new_v4()),
+            },
+            ServerFrame::Connected {
+                session_id: uuid::Uuid::new_v4(),
+            },
+            ServerFrame::Pong { ts: 0 },
+        ] {
             let a = Audience::of(&frame);
             assert!(
                 matches!(a, Audience::Undeliverable(_)),
-                "应判为不可投递, 实际 {a:?}"
+                "单连接响应应判为不可投递, 实际 {a:?}"
             );
             // 即便连接是「全员」(拥有所有会话), 也**不得**收到
             assert!(

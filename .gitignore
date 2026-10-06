@@ -1,5 +1,11 @@
 # ===== Rust =====
 target/
+# 2026-10-07 加: 本地诊断时用过的**另一个** target 目录。
+# `.gitignore` 的 `target/` 只匹配名为 `target` 的目录, 匹配不到 `.cargo-target` ——
+# 而 `git add -A` 对**未被忽略**的目录是照单全收的, 于是它会以 `?? .cargo-target/`
+# 出现在 status 里, 一次 `git add -A` 就可能把整份构建产物提交进仓库
+# (与 §1.36 那次 `benches/` 误伤同型的坑: 产物目录没被忽略 → 被当成源码提交)。
+**/.cargo-target/
 **/*.rs.bk
 Cargo.lock.bak
 # 2026-08-26 加:Day 1 GATE 补签过程 backup (dot-file 形式,不与上面 Cargo.lock.bak 冲突)

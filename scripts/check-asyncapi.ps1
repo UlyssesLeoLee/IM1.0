@@ -54,18 +54,30 @@ $WsFramesPath = Join-Path $RepoRoot 'crates/im-protocol/src/ws_frames.rs'
 $ContentPath = Join-Path $RepoRoot 'crates/im-protocol/src/content.rs'
 $ErrorBodyPath = Join-Path $RepoRoot 'crates/im-protocol/src/error_body.rs'
 
-# Hand-verified baselines (counted by hand against the Rust on 2026-10-05).
+# Hand-verified baselines (counted by hand against the Rust on 2026-10-05;
+# ServerFrame recounted on 2026-10-07 when AuthOk was added).
 $ExpectedClientVariants = 8
-$ExpectedServerVariants = 10
+# 11 since 2026-10-07: `AuthOk` joins the enum. wire is byte-identical to the
+# hand-built JSON it replaced; the point is that it is now covered here.
+$ExpectedServerVariants = 11
 $ExpectedContentVariants = 6
 $ExpectedMessages = 19
 
 # Server frames that intentionally have no ServerFrame enum variant.
-# `auth_ok` is built by a raw serde_json::json! in im-gateway and is not
-# declared in aux-13 either; it is documented as a known deviation, so the
-# bidirectional check must not flag it. Anything else added here is a hole in
-# the gate - keep the list minimal and justify each entry.
-$DeclaredOnlyServerFrames = @('auth_ok')
+#
+# 2026-10-07: this list is now EMPTY and must stay that way. `auth_ok` used to be
+# here because it was built by a raw `serde_json::json!` in im-gateway and had no
+# enum variant — which is precisely why it escaped every gate and every contract
+# test. It now IS `ServerFrame::AuthOk`, so it is checked like any other frame.
+#
+# Adding a frame to this list makes the bidirectional check skip it entirely.
+# That is a hole, not a convenience: keep the list minimal and justify each
+# entry in writing. If it is empty, say so out loud rather than deleting the
+# variable, so the next person knows the case existed and was resolved.
+$DeclaredOnlyServerFrames = @()
+if ($DeclaredOnlyServerFrames.Count -eq 0) {
+    Write-Host 'note: DeclaredOnlyServerFrames is empty — every documented server frame has a ServerFrame variant.'
+}
 
 # Fields whose required-ness is governed by a DIFFERENT Rust type than the enum
 # being checked. Key format: "<wire>.<field>".

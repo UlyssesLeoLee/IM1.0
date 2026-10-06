@@ -75,6 +75,48 @@ pub enum ClientFrame {
 pub enum ServerFrame {
     /// WS 握手成功
     Connected { session_id: Uuid },
+    /// 鉴权成功回执 (2026-10-07 新增, 用户拍板)
+    ///
+    /// ## 为什么加这个变体
+    ///
+    /// 此前 `im-gateway` 在鉴权成功后用 `serde_json::json!({"type":"auth_ok",
+    /// "req_id":…})` **手工构造**并直发, 完全绕过本枚举 —— 于是这一帧:
+    ///
+    /// - 不受 `ServerFrame` 的任何门禁/契约测试/`im-testkit` 覆盖;
+    /// - `AsyncAPI` 只能靠人手写一段散文描述它;
+    /// - 将来 serde 定义若变, 它**不会跟着变**(它压根不经过 serde)。
+    ///
+    /// 它当初成为孤例正是因为「规范只给样例 JSON, 实现方无从登记」。
+    ///
+    /// ## wire 形状**逐字节不变**
+    ///
+    /// `{"type":"auth_ok","req_id":"<uuid>"}` —— 与手工构造的完全一致,
+    /// 接入方看不到任何变化。变的只是「这段 JSON 现在由 serde 从枚举生成」。
+    ///
+    /// ## 与 `Connected` 的关系仍未裁决
+    ///
+    /// `aux-13` §1.2.1 规定的是 `connected`, 而代码实际发 `auth_ok`, 两边
+    /// 对不上且**无任何文档说明哪个才是原意**。本变体**只**让现状变得有类型、
+    /// 有测试、可被 AsyncAPI 建模, **不**主张 `auth_ok` 就是 `connected` 的别名
+    /// —— 那仍是规范所有者的裁决。`Connected` 保留不动(`im-testkit` 的 mock
+    /// server 在用)。
+    AuthOk {
+        /// 回显上行 `auth.req_id`。
+        ///
+        /// ## 这里是 `Option` 但**恒出现在 wire 上** —— 与本变体「必填单态」
+        /// 的其它字段刻意不同
+        ///
+        /// 上行首帧走 gateway 私有的 `AuthFrame`, 其 `req_id` 是
+        /// `#[serde(default)] Option<Uuid>`, 即客户端**可以省略**。
+        /// 此前手工构造的 `json!({"type":"auth_ok","req_id": req_id})`
+        /// 在 `req_id` 为 `None` 时产出的是 `"req_id": null` —— **键仍在**。
+        ///
+        /// 所以本字段**不能**加 `skip_serializing_if`: 加了就变成键消失,
+        /// 那就不是「wire 不变」而是改形状了。此处保持 `Option` +
+        /// `#[serde(default)]` 无 skip, 使序列化结果与改造前**逐字节相同**。
+        #[serde(default)]
+        req_id: Option<Uuid>,
+    },
     /// 请求响应(成功)
     Ack {
         req_id: Uuid,
@@ -105,6 +147,27 @@ pub enum ServerFrame {
     /// 消息被编辑
     MessageEdited {
         message_id: Uuid,
+        /// **必填单态**(2026-10-07 补, 用户拍板)。
+        ///
+        /// 此前本帧不带 `conversation_id`(aux-13 §1.2.6 也未定义), 于是广播
+        /// 中枢无法判断接收方是不是该会话成员 —— 发给所有人就是跨会话泄漏,
+        /// 故 `hub.rs` 只能把本帧归为 `Audience::Undeliverable`, 即**生产代码
+        /// 从不发送本帧**(编辑消息没有任何实时同步)。
+        ///
+        /// ## 为什么是**单态**而不是 `Option<Uuid>`
+        ///
+        /// 仓里**踩过一次**: 二态 `Option` 版本在 `None` 时退化成「发给所有人」,
+        /// 造成跨会话泄漏, 于是又退回不发送。`hub.rs` 里那个
+        /// `frames_without_conversation_id_are_never_delivered` 测试就是那次
+        /// 事故的守门(现已改为断言「本帧必属某会话」)。
+        ///
+        /// 单态把那个事故**从类型上根除**: 不存在「没有 conversation_id 的
+        /// MessageEdited」这种值, 所以也就不存在「拿不到会话 → 发给所有人」
+        /// 这条分支。`Audience::of` 里它与 `MessageNew` 走同一条定向投递路径。
+        ///
+        /// wire 兼容性: 本帧此前**从未被发送过**, 平台也尚未发布, 故加字段
+        /// 不破坏任何已部署的接入方。
+        conversation_id: Uuid,
         content: MessageContent,
         edited_at: chrono::DateTime<chrono::Utc>,
     },
@@ -116,6 +179,8 @@ pub enum ServerFrame {
     /// 新 reaction
     ReactionAdded {
         message_id: Uuid,
+        /// 必填单态, 理由同 `MessageEdited::conversation_id`
+        conversation_id: Uuid,
         user_id: Uuid,
         emoji: String,
     },

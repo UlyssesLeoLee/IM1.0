@@ -1100,16 +1100,15 @@ grpcurl -plaintext -d '{"access_token":"eyJ..."}' \
 
 ## 11. 待规范所有者裁决的开放项
 
-以下 4 项**不是**实现缺陷,是规范与实现之间的未决分歧。实现方**未**擅自
-变更 wire 形状,仅在本文档中如实标注现状。
+2026-10-07, 原 4 项中的 **#1 与 #2 已由 Ulysses 拍板落地**(见下行), 余 2 项仍开放。
+实现方在拍板前**未**擅自变更 wire 形状, 只如实标注现状。
 
-| # | 开放项 | 现状(代码事实) | 为何不由实现方拍板 |
+| # | 开放项 | 状态 | 现状(代码事实) |
 |---|---|---|---|
-| 1 | `auth_ok` 是否应为 `connected`,或另立帧类型 | 生产回 `auth_ok`(`handler.rs:381-384`),`connected` 生产不发 | 改它变动客户端可见的 wire 形状 |
-| 2 | `message_edited` / `reaction_added` 是否补 `conversation_id` | 两帧无该字段,故 `Undeliverable`(`hub.rs:361-366`),生产不发送 | 补字段属 wire 形状变更(协议变更) |
-| 3 | 外层 `kind` 是否应校验与 `content.kind` 一致 | 外层是自由 `String`(`ws_frames.rs:38`),不校验,可不一致并原样下行 | 收紧会拒掉当前合法的既有客户端帧 |
-| 4 | WS 侧 `trace_id` 恒为空串 | `handler.rs:148` 写死 `""` | 补 trace 需引入链路追踪基建,非本表范围 |
+| 1 | `auth_ok` 是否应为 `connected`,或另立帧类型 | ✅ **已拍板 2026-10-07** | 采纳「另立帧类型」: 新增 `ServerFrame::AuthOk { req_id }`, **wire 逐字节不变**。`connected` 保留不动(`im-testkit` mock server 在用)。**`auth_ok` 是否本应是 `connected` 的别名仍未裁决** —— 收进枚举只让现状有类型/有测试/可被 AsyncAPI 建模, 不主张二者等同 |
+| 2 | `message_edited` / `reaction_added` 是否补 `conversation_id` | ✅ **已拍板 2026-10-07** | 采纳: 两帧补**必填单态** `conversation_id`, 并启用定向广播。**选单态而非 `Option`** —— 仓里踩过一次二态的坑(`None` 退化成「发给所有人」= 跨会话泄漏); 单态从类型上根除那条分支。wire 兼容性: 两帧此前**从未被发送过`, 加字段不破坏任何已部署接入方 |
+| 3 | 外层 `kind` 是否应校验与 `content.kind` 一致 | ⏳ 仍开放 | 外层是自由 `String`(`ws_frames.rs`), 不校验, 可不一致并原样下行 | 收紧会拒掉当前合法的既有客户端帧 |
+| 4 | WS 侧 `trace_id` 恒为空串 | ⏳ 仍开放 | `handler.rs:148` 写死 `""` | 补 trace 需引入链路追踪基建, 非本表范围 |
 
-`docs/api/asyncapi.json` 已把上述事实(及 WS/REST 错误体字段集差异)逐字段
-建模为机器可读描述,接入方可直接引用。该文件经本次逐条复核**已与代码对齐**,
-故未作改动。
+`docs/api/asyncapi.json` 已把上述事实(含 WS/REST 错误体字段集差异、`auth_ok`
+的 `req_id` 可为 `null` 且键恒存在)逐字段建模为机器可读描述, 接入方可直接引用。

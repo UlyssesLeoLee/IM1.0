@@ -66,7 +66,7 @@
     "serverToClient": {
       "action": "receive",
       "title": "服务端 → 客户端",
-      "description": "服务端下行的全部帧。`serverAuthOk` 之后的帧才带业务载荷。\n\n注意: 本列表里 5 个帧类型当前**不会被生产代码发出**(见各消息的 `x-im-implementation-status`)。它们登记在此是为了让接入方知道协议预留了这些形状, 而不是为了让人去等它们。",
+      "description": "服务端下行的全部帧。`serverAuthOk` 之后的帧才带业务载荷。\n\n注意: 本列表里 3 个帧类型当前**不会被生产代码发出**(`presence_update` / `force_disconnect` / `connected`, 见各消息的 `x-im-implementation-status`)。它们登记在此是为了让接入方知道协议预留了这些形状, 而不是为了让人去等它们。`message_edited` 与 `reaction_added` 已于 2026-10-07 起真正下发。",
       "channel": { "$ref": "#/channels/ws" },
       "messages": [
         { "$ref": "#/channels/ws/messages/serverAuthOk" },
@@ -164,10 +164,10 @@
       },
       "serverAuthOk": {
         "name": "auth_ok",
-        "title": "鉴权成功(非枚举帧)",
+        "title": "ServerFrame::AuthOk",
         "summary": "鉴权通过",
         "contentType": "application/json",
-        "description": "**本帧不在 `ServerFrame` 枚举里**, 由 `handler.rs:381` 的裸 `serde_json::json!` 构造并直发, 绕过了整个 `im_protocol` 类型体系。aux-13 §1.2 没有定义它(§1.2.1 定义的是 `connected`)。本文件按代码事实登记, 但**不**裁决它是否本应是 `connected` —— 改它会变动客户端可见的 wire 形状, 且无证据表明 `connected` 就是原意。见 `docs/gap-ledger.md` §1.8.2。\n\n鉴权**失败**时服务端不回 `auth_ok`, 而是回一条 `ack.ok=false` 的帧。",
+        "description": "2026-10-07 起本帧是 `ServerFrame::AuthOk` 枚举变体, **wire 形状逐字节不变**(`{\"type\":\"auth_ok\",\"req_id\":…}`) —— 接入方看不到任何变化。此前它由 `handler.rs` 的裸 `serde_json::json!` 构造、**完全绕过** `im_protocol` 类型体系, 于是不受任何门禁/契约测试/`im-testkit` 覆盖, 且 serde 定义若变它不会跟着变。\n\naux-13 §1.2 仍未定义它(§1.2.1 定义的是 `connected`), 本文件**不**裁决它是否本应是 `connected` —— 收进枚举只让现状变得有类型、有测试、可被建模, 不主张二者是同一个东西。见 `docs/gap-ledger.md` §1.8.2。\n\n鉴权**失败**时服务端不回 `auth_ok`, 而是回一条 `ack.ok=false` 的帧。",
         "payload": { "$ref": "#/components/schemas/ServerAuthOkFrame" },
         "x-im-spec-status": "undeclared",
         "x-im-implementation-status": "emitted",
@@ -270,26 +270,24 @@
       "serverMessageEdited": {
         "name": "message_edited",
         "title": "ServerFrame::MessageEdited",
-        "summary": "消息被编辑(保留未发出)",
+        "summary": "消息被编辑",
         "contentType": "application/json",
-        "description": "**生产代码从不发送本帧。** wire 形状缺 `conversation_id`(aux-13 §1.2.6 未定义该字段), 广播中枢无从判断接收方是否该会话成员, 于是 `hub.rs:362` 把本帧归为 `Audience::Undeliverable` 并在 `publish` 里直接短路。后果: **编辑消息没有实时同步**, 客户端只能靠 `GET /v1/conversations/{id}/messages` 拉取。\n\n补 `conversation_id` 属**协议变更**, 不由实现方拍板。见 `docs/gap-ledger.md` §1.10 / §1.13。",
+        "description": "**生产代码已发送本帧**(2026-10-07 起)。此前 wire 形状缺 `conversation_id`(aux-13 §1.2.6 未定义该字段), 广播中枢无从判断接收方是否该会话成员, 于是 `hub.rs` 把本帧归为 `Audience::Undeliverable` 并在 `publish` 里直接短路, 后果是**编辑消息没有实时同步**。\n\n现已给本帧补上**必填单态** `conversation_id`(用户拍板), 它与 `message_new` 走同一条定向投递路径, **非会话成员绝不收到**。选单态而非 `Option`: 仓里踩过一次二态的坑(`None` 退化成「发给所有人」= 跨会话泄漏), 单态从类型上根除了那条分支。\n\nwire 兼容性: 本帧此前**从未被发送过**, 加字段不破坏任何已部署的接入方。",
         "payload": { "$ref": "#/components/schemas/ServerMessageEditedFrame" },
-        "x-im-spec-status": "declared",
+        "x-im-spec-status": "amended-by-owner-2026-10-07",
         "x-im-spec-ref": "aux-13 §1.2.6",
-        "x-im-implementation-status": "reserved-not-emitted",
-        "x-im-ledger-ref": "docs/gap-ledger.md §1.10"
+        "x-im-implementation-status": "emitted"
       },
       "serverReactionAdded": {
         "name": "reaction_added",
         "title": "ServerFrame::ReactionAdded",
-        "summary": "新 reaction(保留未发出)",
+        "summary": "新 reaction",
         "contentType": "application/json",
-        "description": "**生产代码从不发送本帧**, 原因同 `message_edited`: 缺 `conversation_id`(aux-13 §1.2.8 未定义), `hub.rs:365` 归 `Undeliverable`。发给别人即跨会话泄漏, 故宁可不发。",
+        "description": "**生产代码已发送本帧**(2026-10-07 起)。此前缺 `conversation_id`, `hub.rs` 归 `Undeliverable` —— 发给别人即跨会话泄漏(且会顺带泄漏「谁对哪条消息点了什么表情」, 那是会话内的用户行为信息), 故宁可不发, reaction 只落库不同步。\n\n现已给本帧补上**必填单态** `conversation_id`(由 `ReactionService::add_reaction_with_context` 从它**已经加载**的 message 里带出, 不额外查库)。幂等重放(`inserted == false`)**不广播**, 否则所有在线端会看到同一个表情被重复动画一次。",
         "payload": { "$ref": "#/components/schemas/ServerReactionAddedFrame" },
-        "x-im-spec-status": "declared",
+        "x-im-spec-status": "amended-by-owner-2026-10-07",
         "x-im-spec-ref": "aux-13 §1.2.8",
-        "x-im-implementation-status": "reserved-not-emitted",
-        "x-im-ledger-ref": "docs/gap-ledger.md §1.10"
+        "x-im-implementation-status": "emitted"
       },
       "serverPresenceUpdate": {
         "name": "presence_update",
@@ -674,7 +672,7 @@
       "ServerAuthOkFrame": {
         "title": "auth_ok(非 ServerFrame 变体)",
         "type": "object",
-        "description": "由 `handler.rs:381` 的裸 `serde_json::json!` 构造, **不在 `ServerFrame` 枚举里**。它**不是** aux-13 §1.2.1 的 `connected`, 也不带 `ok` / `data` 字段。",
+        "description": "`ServerFrame::AuthOk` 的 payload。2026-10-07 起本帧**在** `ServerFrame` 枚举里(此前是 `handler.rs` 的裸 `serde_json::json!`, 不在枚举中)。它**不是** aux-13 §1.2.1 的 `connected`, 也不带 `ok` / `data` 字段。\n\n`req_id` 上行可省略(首帧 `auth.req_id` 是 `Option`), 此时 wire 上**键仍在且为 `null`** —— 刻意不加 `skip_serializing_if`, 否则键会消失, 那就不是「wire 不变」而是改形状了。",
         "properties": {
           "type": { "const": "auth_ok" },
           "req_id": {
@@ -715,14 +713,15 @@
       "ServerMessageEditedFrame": {
         "title": "ServerFrame::MessageEdited",
         "type": "object",
-        "description": "**缺 `conversation_id`**(aux-13 §1.2.6 未定义), 因此无法定向投递, 生产代码从不发送。",
+        "description": "`conversation_id` 于 2026-10-07 补入并**列为 required**: 缺它就无法定向投递, 而「发给所有人」是跨会话泄漏。**必填单态**是刻意的 —— 二态 `Option` 在仓里踩过一次(`None` 退化成发给所有人)。",
         "properties": {
           "type": { "const": "message_edited" },
           "message_id": { "$ref": "#/components/schemas/Uuid" },
+          "conversation_id": { "$ref": "#/components/schemas/Uuid" },
           "content": { "$ref": "#/components/schemas/MessageContent" },
           "edited_at": { "$ref": "#/components/schemas/DateTimeUtc" }
         },
-        "required": ["type", "message_id", "content", "edited_at"],
+        "required": ["type", "message_id", "conversation_id", "content", "edited_at"],
         "additionalProperties": true
       },
       "ServerMessageRecalledFrame": {
@@ -739,14 +738,15 @@
       "ServerReactionAddedFrame": {
         "title": "ServerFrame::ReactionAdded",
         "type": "object",
-        "description": "**缺 `conversation_id`**(aux-13 §1.2.8 未定义), 生产代码从不发送。",
+        "description": "`conversation_id` 于 2026-10-07 补入并**列为 required**, 理由同 `message_edited`: 缺它就无法定向投递, 而本帧广播出去会泄漏「谁对哪条消息点了什么表情」—— 那是会话内的用户行为信息。",
         "properties": {
           "type": { "const": "reaction_added" },
           "message_id": { "$ref": "#/components/schemas/Uuid" },
+          "conversation_id": { "$ref": "#/components/schemas/Uuid" },
           "user_id": { "$ref": "#/components/schemas/Uuid" },
           "emoji": { "type": "string" }
         },
-        "required": ["type", "message_id", "user_id", "emoji"],
+        "required": ["type", "message_id", "conversation_id", "user_id", "emoji"],
         "additionalProperties": true
       },
       "ServerPresenceUpdateFrame": {

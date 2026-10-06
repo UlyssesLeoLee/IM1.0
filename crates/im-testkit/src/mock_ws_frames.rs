@@ -328,6 +328,7 @@ pub fn wire_message_json() -> Value {
 pub fn message_edited_frame() -> ServerFrame {
     ServerFrame::MessageEdited {
         message_id: Uuid::parse_str(MESSAGE_ID_TEXT).expect("valid uuid"),
+        conversation_id: Uuid::parse_str(CONVERSATION_ID_DM).expect("valid uuid"),
         content: MessageContent::Text {
             text: "你好(已编辑)".into(),
         },
@@ -340,7 +341,8 @@ pub fn message_edited_json() -> Value {
     json!({
         "type": "message_edited",
         "message_id": MESSAGE_ID_TEXT,
-        "content": { "text": "你好(已编辑)" },
+        "conversation_id": CONVERSATION_ID_DM,
+        "content": { "kind": "text", "text": "你好(已编辑)" },
         "edited_at": "2026-08-23T00:01:00Z",
     })
 }
@@ -366,6 +368,7 @@ pub fn message_recalled_json() -> Value {
 pub fn reaction_added_frame() -> ServerFrame {
     ServerFrame::ReactionAdded {
         message_id: Uuid::parse_str(MESSAGE_ID_TEXT).expect("valid uuid"),
+        conversation_id: Uuid::parse_str(CONVERSATION_ID_DM).expect("valid uuid"),
         user_id: Uuid::parse_str(USER_ID_PEER).expect("valid uuid"),
         emoji: "👍".into(),
     }

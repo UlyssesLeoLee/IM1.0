@@ -377,15 +377,43 @@ async fn run_ws_loop(
                                         conversations = state.conversation_count(),
                                         "ws authenticated"
                                     );
-                                    // 鉴权成功 ack
-                                    let ack = serde_json::json!({
-                                        "type": "auth_ok",
-                                        "req_id": req_id,
-                                    });
-                                    if ws_session.text(ack.to_string()).await.is_err() {
-                                        return Err(AppError::Internal(anyhow::anyhow!(
-                                            "ws send failed"
-                                        )));
+                                    // 鉴权成功回执
+                                    //
+                                    // 2026-10-07: 此前这里是
+                                    //   `serde_json::json!({"type":"auth_ok","req_id":req_id})`
+                                    // —— 手工构造裸 JSON, **完全绕过** `ServerFrame`
+                                    // 枚举与 serde。后果: 这一帧不受任何门禁/契约测试/
+                                    // im-testkit 覆盖, 且 serde 定义若变它不会跟着变
+                                    // (它压根不经过 serde)。它当初成为孤例, 正是因为
+                                    // 「规范只给样例 JSON, 实现方无从登记」。
+                                    //
+                                    // 现改为由枚举生成, **wire 形状逐字节不变**
+                                    // (`{"type":"auth_ok","req_id":"<uuid>"}`), 接入方
+                                    // 看不到任何变化。
+                                    //
+                                    // 序列化失败在这里不可能发生(字段全是 Uuid), 但
+                                    // 仍走 send_error 而不是 unwrap —— 一个 panic
+                                    // 会连带杀掉整条 WS 连接。
+                                    match serde_json::to_string(&ServerFrame::AuthOk { req_id }) {
+                                        Ok(s) => {
+                                            if ws_session.text(s).await.is_err() {
+                                                return Err(AppError::Internal(anyhow::anyhow!(
+                                                    "ws send failed"
+                                                )));
+                                            }
+                                        }
+                                        Err(e) => {
+                                            send_error(
+                                                ws_session,
+                                                im_common::ErrorCode::InternalError,
+                                                &format!("auth_ok serialize failed: {e}"),
+                                                req_id,
+                                            )
+                                            .await;
+                                            return Err(AppError::Internal(anyhow::anyhow!(
+                                                "auth_ok serialize failed: {e}"
+                                            )));
+                                        }
                                     }
                                 }
                                 Err(e) => {
@@ -477,7 +505,7 @@ async fn run_ws_loop(
                     }
                     // C-9 已实装: edit_message
                     Ok(frame @ ClientFrame::EditMessage { .. }) => match state.user_id() {
-                        Some(uid) => handle_edit_message(ws_session, app, uid, frame).await,
+                        Some(uid) => handle_edit_message(ws_session, hub, app, uid, frame).await,
                         None => {
                             send_error(
                                 ws_session,
@@ -529,7 +557,7 @@ async fn run_ws_loop(
                     //     `ClientFrame::Ping` 解析成功, 却落进了 `Ok(_)`。
                     // C-9 已实装: react (per aux-13 §1.1.5)
                     Ok(frame @ ClientFrame::React { .. }) => match state.user_id() {
-                        Some(uid) => handle_react(ws_session, app, uid, frame).await,
+                        Some(uid) => handle_react(ws_session, hub, app, uid, frame).await,
                         None => {
                             send_error(
                                 ws_session,
@@ -780,13 +808,18 @@ async fn handle_send_message(
 /// sender 同样取自已鉴权的会话状态; service 内部会再校验「仅原 sender 可编辑」
 /// 与「已撤回/已删除不可编辑」。
 ///
-/// **不广播, 且这是 wire 形状的硬限制而非疏漏**: 对应的 `ServerFrame::MessageEdited`
-/// (aux-13 §1.2.6) 只带 `message_id` + `content` + `edited_at`, **不带
-/// `conversation_id`**。广播中枢因此无法判断接收方是不是该会话成员 ——
-/// 发给所有人就是跨会话泄漏, 不发则编辑无法实时同步。补 `conversation_id`
-/// 属协议变更, 不在本文件拍板范围(见 `ws::hub::Audience::Undeliverable`)。
+/// **2026-10-07 起广播 `message_edited`**(用户拍板)。此前**不广播**,
+/// 原因是 `ServerFrame::MessageEdited` 的 wire 形状不带 `conversation_id`
+/// (aux-13 §1.2.6 当时也未定义), 广播中枢无法判断接收方是不是该会话成员,
+/// 发给所有人就是跨会话泄漏, 于是宁可不发 —— 代价是**编辑消息完全没有实时
+/// 同步**, 客户端只能轮询 REST 拉。
+///
+/// 现已给该帧补上**必填单态** `conversation_id`, 它与 `MessageNew` 走同一条
+/// 定向投递路径。选单态而非 `Option`: 仓里踩过一次二态的坑(`None` 退化成
+/// 「发给所有人」= 泄漏), 单态从类型上根除了那条分支。
 async fn handle_edit_message(
     ws_session: &mut actix_ws::Session,
+    hub: &super::hub::WsHub,
     app: &web::Data<AppState>,
     sender_id: UserId,
     frame: ClientFrame,
@@ -828,6 +861,50 @@ async fn handle_edit_message(
                 false,
             )
             .await;
+
+            // 2026-10-07: 广播 `message_edited`(用户拍板)。
+            //
+            // 此前**不广播**, 原因是 wire 形状不带 `conversation_id` ——
+            // 广播中枢无法判断接收方是不是该会话成员, 发给所有人就是跨会话泄漏,
+            // 宁可不发(于是编辑消息完全没有实时同步)。现 `MessageEdited` 已带
+            // **必填单态** `conversation_id`, 它与 `MessageNew` 走同一条定向
+            // 投递路径。
+            //
+            // `msg` 就是 `edit_message` 的返回值, 它的 `conversation_id` **本来
+            // 就在手上** —— 不额外查库。
+            //
+            // 失败只记日志、不影响本帧的 ack: 编辑已落库, 广播失败影响的是
+            // 「别人什么时候看到」, 而离线接收方本来就靠 REST 拉取。
+            //
+            // `msg.edited_at` 是 `Option<DateTime>` 而帧上是必填 `DateTime`。
+            // 它**实际上**必为 `Some`: `MessageRepository::update_content` 的
+            // SQL 是 `SET content = $1, edited_at = now()`(pg.rs:199), 且
+            // `RETURNING` 带回的就是更新后的行。但类型系统证不出这一点,
+            // 所以走**带日志的回退**而不是 `expect` —— 一个 panic 会连带
+            // 杀掉整条 WS 连接, 而这里最坏只是广播里的时间戳取本机当前时间。
+            let edited_at = match msg.edited_at {
+                Some(t) => t,
+                None => {
+                    tracing::warn!(
+                        message_id = %msg.id.0,
+                        "edit succeeded but edited_at is NULL in the returned row; \
+                         falling back to now() for the broadcast timestamp"
+                    );
+                    chrono::Utc::now()
+                }
+            };
+            let frame = ServerFrame::MessageEdited {
+                message_id: msg.id.0,
+                conversation_id: msg.conversation_id.0,
+                content,
+                edited_at,
+            };
+            if hub.publish(frame) == 0 {
+                tracing::debug!(
+                    message_id = %msg.id.0,
+                    "message_edited broadcast: no subscribers (peers resync via REST)"
+                );
+            }
         }
         Err(e) => {
             let (code, detail) = map_service_error(&e);
@@ -1070,15 +1147,22 @@ async fn handle_mark_read(
 /// 权限边界在 `ReactionService` 内: 必须是**消息所属会话的成员**。
 /// `ReactionRepository` 只做 PK 幂等插入, 不校验任何东西 —— 绝不能直接暴露。
 ///
-/// **不广播, 且这是 wire 形状的硬限制**: 对应的 `ServerFrame::ReactionAdded`
-/// (aux-13 §1.2.8) 只有 `message_id` + `user_id` + `emoji`, **不带
-/// `conversation_id`**。广播中枢因此无法判断接收方是不是该会话成员 ——
+/// **2026-10-07 起广播 `reaction_added`**(用户拍板)。此前**不广播**, 原因是
+/// `ServerFrame::ReactionAdded` 只有 `message_id` + `user_id` + `emoji`,
+/// **不带 `conversation_id`** —— 广播中枢无法判断接收方是不是该会话成员,
 /// 发给所有人就是跨会话泄漏(而且会顺带泄漏「谁对哪条消息点了什么表情」,
-/// 那是会话内的用户行为信息)。故 reaction **落库但不同步**, 其它端靠
-/// `GET /v1/conversations/{id}/messages` 或 `WireMessage.reactions` 拿到。
-/// 补 `conversation_id` 属协议变更, 不在本文件拍板范围。
+/// 那是会话内的用户行为信息)。故 reaction **落库但不同步**。
+///
+/// 现已给该帧补上**必填单态** `conversation_id`(由
+/// `ReactionService::add_reaction_with_context` 从它**已经加载**的 message
+/// 里带出, 不额外查库), 它与 `MessageNew` 走同一条定向投递路径。
+///
+/// 幂等重放**不广播** —— 否则所有在线端会看到同一个表情被重复动画一次。
+/// 这条判断此前只是一条注释(「将来补上 conversation_id 后立刻要用」),
+/// 现在广播真做起来了, 它已是实际生效的分支。
 async fn handle_react(
     ws_session: &mut actix_ws::Session,
+    hub: &super::hub::WsHub,
     app: &web::Data<AppState>,
     user_id: UserId,
     frame: ClientFrame,
@@ -1094,10 +1178,10 @@ async fn handle_react(
 
     match app
         .reaction_service
-        .add_reaction(MessageId(message_id), user_id, &emoji)
+        .add_reaction_with_context(MessageId(message_id), user_id, &emoji)
         .await
     {
-        Ok((reaction, inserted)) => {
+        Ok((reaction, inserted, conv)) => {
             send_ack(
                 ws_session,
                 req_id,
@@ -1107,15 +1191,33 @@ async fn handle_react(
             )
             .await;
             // 幂等重放(`inserted == false`)时**不广播**, 否则所有在线端会看到
-            // 同一个表情被重复动画一次。但此处因 §上文 的 wire 限制本就不广播;
-            // 该判断保留成注释是因为**将来补上 conversation_id 后**立刻要用 ——
-            // 届时漏掉它就是一个「重复 reaction 被广播多次」的 bug。
+            // 同一个表情被重复动画一次。
+            //
+            // 2026-10-07: 这条判断此前是**注释**(「将来补上 conversation_id 后
+            // 立刻要用」)。现在 `ReactionAdded` 已带必填单态 `conversation_id`,
+            // 广播真的做起来了, 所以它从注释变成了实际生效的分支 ——
+            // 若漏掉, 就是一个「重复 reaction 被广播多次」的 bug。
             if !inserted {
                 tracing::trace!(
                     message_id = %reaction.message_id.0,
                     emoji = %reaction.emoji,
                     "react idempotent replay, not re-broadcasting"
                 );
+            } else {
+                // `conv` 由 service 从它**已经加载**的 message 里带出,
+                // 这里不额外查库。
+                let frame = ServerFrame::ReactionAdded {
+                    message_id: reaction.message_id.0,
+                    conversation_id: conv.0,
+                    user_id: reaction.user_id.0,
+                    emoji: reaction.emoji.clone(),
+                };
+                if hub.publish(frame) == 0 {
+                    tracing::debug!(
+                        message_id = %reaction.message_id.0,
+                        "reaction_added broadcast: no subscribers (peers resync via REST)"
+                    );
+                }
             }
         }
         Err(e) => {
