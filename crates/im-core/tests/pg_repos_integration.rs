@@ -1601,11 +1601,11 @@ async fn mark_read_clamps_absurd_sequence_to_the_real_max() {
     // 未读数从此失真且**无任何报错**。只断言「stored == 3」不够: 一个把它
     // 夹到 0 的实现也能让上面那条断言失败, 但读指针会退到 0, 同样是坏的。
     assert!(
-        svc.mark_read(conv, alice, 2).await.expect("mark_read 2") == false,
+        !svc.mark_read(conv, alice, 2).await.expect("mark_read 2"),
         "夹紧后读指针在 3, 上报更小的 2 不应推进"
     );
     assert!(
-        svc.mark_read(conv, alice, 3).await.expect("mark_read 3") == false,
+        !svc.mark_read(conv, alice, 3).await.expect("mark_read 3"),
         "上报当前值 3 是幂等重放, 不应推进"
     );
 }
