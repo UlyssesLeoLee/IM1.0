@@ -4251,3 +4251,66 @@ c `main.rs` 改用 `cfg.active_signing_keys()`, inactive 的密钥**既不签发
   但连接还活着」。修法是在心跳 tick 按 `exp` 定期复查 + 把 hub 连接表按
   `device_session_id` 建索引供 kick hook 主动踢。
 - `presence_update` 缺失需要 `im-presence` 整个实装, 超出本轮范围。
+
+## 1.48 【P1】DLQ 真值表第 4 行被调用点跳过 —— 「没配 PG 层」被当成「这一层成功」 (2026-10-08)
+
+`combine_dlq_results` 的真值表(`publisher.rs:726-732`)第 4 行写得很清楚:
+
+| nats | pg | 判定 |
+|---|---|---|
+| `Err` | **`None`** | **永久丢失 —— 没配 PG 层时没有东西接住它** |
+
+`absent_pg_layer_does_not_rescue_a_failed_publish` 也专门锁了这一格。
+
+但**调用点从来没把 `None` 传进来过**:
+
+```rust
+let pg_res = match &pg { None => Ok(()), Some(sink) => .. };  // 裸 Result
+combine_dlq_results(nats_res, Some(pg_res))                   // ← 在这里补上 Some
+```
+
+于是「没配 PG 层」变成 `Some(Ok(()))`, 落到真值表**第 2 行** `(Err, Some(Ok))`
+—— 判成「可恢复」。**真值表本身是对的, 接线是错的。**
+
+原注释还写着「`pg` 为 `None` 的分支已折成 `Ok(())`, 与
+`combine_dlq_results(nats, None)` 等价(两者都直接返回 nats)」——
+**这句话是反的**: `combine_dlq_results(Err, None)` 返回 `Err(nats_e)`,
+而那条实际路径返回 `Ok(())`。
+
+#### 影响
+
+**今天尚未触发**: 生产恒传 `Some`(`main.rs` 的 `IM_POSTGRES_URL` 是必填配置)。
+但这是留给下一个接线人的 fail-open —— 按 `publisher.rs:843` 行注释
+「生产下总是传 Some」去传 `None`, 就会得到「可恢复」的假结论: 事件其实没人接,
+而唯一能说出「数据真丢了」的 `EVENTS_DLQ_WRITE_FAILED` 计数器被绕过
+(`EVENTS_DLQ_TOTAL` 反而 +1), 故障期间查日志的人会得到相反的结论。
+
+#### 修法
+
+把 `match` 的返回类型改成 `Option<Result<(), String>>`, 让 `None` 从 match 里
+就带着「没配」出来, 而不是靠调用方补 `Some`:
+
+```rust
+let pg_res: Option<Result<(), String>> = match &pg {
+    None => None,                                  // 没配这一层 —— 不是「这一层成功」
+    Some(sink) => Some(/* .. */),
+};
+combine_dlq_results(nats_res, pg_res)
+```
+
+选这个而不是「加一个判定分支」, 是为了让退化状态**在类型上尽量不可表达**:
+想把裸 `Result` 塞进去必须先删掉那行类型标注, 编译器会逼人重新看一眼真值表。
+
+新增用例 `none_and_some_ok_must_not_be_interchangeable`: 真值表本身已被既有用例
+钉住, 本条钉的是**两行之间必须存在差异** —— 少了它, 有人把两个 arm 合并仍然全绿。
+
+#### 诚实的覆盖边界
+
+**调用点本身没有测试覆盖**: `dead_letter` 闭包需要真实 `jetstream::Context`,
+本机无 NATS(仅 CI 有), 端到端验证要串 NATS。纯函数用例在修复前后**同样绿**。
+所以这条的保护来自: (1) 类型标注、(2) 调用点上方 22 行的注释、(3) 本节记录。
+**不是**来自测试。
+
+> 判据: 修「判定里少了一个分支」这类缺陷时, 优先问「能不能让退化状态在类型上
+> 不可表达」, 而不是补一个测试。测试只能钉住你写下来的那个形状, 钉不住
+> 「接线有没有把值送对」—— 那是另一个层次的问题。

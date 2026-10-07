@@ -963,13 +963,35 @@ impl EventPublisher for NatsEventPublisher {
                     Ok(Ok(ack)) => ack.await.map(|_a| ()).map_err(|e| e.to_string()),
                 };
 
-                let pg_res = match &pg {
-                    None => Ok(()), // 该进程没配 PG 层, 不是失败
-                    Some(sink) => {
-                        // PG 写入给一个**更短**的上界: 它此刻在预算末尾, 而
-                        // `acquire()` 可能要等池里空闲连接。宁可承认失败, 也不
-                        // 把用户的请求挂住 —— PG 失败会被单独计数, 不是静默。
+                // 类型就是防线: 这层的结果**从 match 里就带着「有没有配」出来**。
+                //
+                // 2026-10-08 修正。此前是
+                //     let pg_res = match &pg { None => Ok(()), Some(s) => .. };  // 裸 Result
+                //     combine_dlq_results(nats_res, Some(pg_res))               // ← 这里补上 Some
+                // 「没配」被折成 `Some(Ok(()))`, 落到真值表的 `(Err, Some(Ok))` 行
+                // —— 判成「可恢复」, 而真值表第 4 行 `(Err, None)` 明写「永久丢失」。
+                //
+                // 原注释称「`pg` 为 None 的分支已折成 Ok(()), 与
+                // `combine_dlq_results(nats, None)` 等价(两者都直接返回 nats)」
+                // —— **这句话是反的**: `combine_dlq_results(Err, None)` 返回
+                // `Err(nats_e)`, 而那条实际路径返回 `Ok(())`。
+                //
+                // 今天生产恒传 `Some`(main.rs 的 IM_POSTGRES_URL 是必填), 所以
+                // 尚未被触发; 但它是留给下一个接线人的 fail-open: 按本文件
+                // 843 行注释「生产下总是传 Some」去传 `None`, 就会得到一个
+                // 「可恢复」的假结论 —— 事件其实没人接, 而唯一能说出「数据真
+                // 丢了」的 `EVENTS_DLQ_WRITE_FAILED` 计数器被绕过。
+                //
+                // 写成 `Option<Result<..>>` 而不是加一个判定分支, 是为了让退化
+                // 状态**在类型上不可表达**: 想把裸 `Result` 塞进去, 必须先去掉
+                // 这行类型标注, 那时编译器会逼着人重新看一眼真值表。
+                let pg_res: Option<Result<(), String>> = match &pg {
+                    None => None, // 没配这一层 —— 不是「这一层成功」
+                    Some(sink) => Some(
                         match tokio::time::timeout(PG_DLQ_WRITE_TIMEOUT, sink.store(&rec)).await {
+                            // PG 写入给一个**更短**的上界: 它此刻在预算末尾, 而
+                            // `acquire()` 可能要等池里空闲连接。宁可承认失败, 也不
+                            // 把用户的请求挂住 —— PG 失败会被单独计数, 不是静默。
                             Err(_) => {
                                 let n =
                                     EVENTS_DLQ_PG_WRITE_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
@@ -997,14 +1019,12 @@ impl EventPublisher for NatsEventPublisher {
                                 Err(e)
                             }
                             Ok(Ok(())) => Ok(()),
-                        }
-                    }
+                        },
+                    ),
                 };
 
                 // 合成: 至少一层成功 = 可恢复
-                // `pg` 为 `None` 的分支在上面已折成 `Ok(())` —— 与
-                // `combine_dlq_results(nats, None)` 等价(两者都直接返回 nats)。
-                combine_dlq_results(nats_res, Some(pg_res))
+                combine_dlq_results(nats_res, pg_res)
             }
         };
 
@@ -1296,6 +1316,29 @@ mod tests {
         assert!(
             combine_dlq_results(nats_bad, None).is_err(),
             "没配 PG 层时, NATS 失败就是真的没接住 —— 没有第二层兜底"
+        );
+    }
+
+    /// `None` 与 `Some(Ok(()))` **不可互换** —— 这一条专治「顺手简化」
+    ///
+    /// 2026-10-08 实测的 fail-open 正是这个简化: 调用点写
+    /// `let pg_res = match &pg { None => Ok(()), .. }` 再传 `Some(pg_res)`,
+    /// 把「没配这一层」伪装成「这一层写成功了」。两条路径在真值表里落在
+    /// **不同的行**, 合并即等于宣布「没配 PG 且 NATS 挂了 = 可恢复」。
+    ///
+    /// 真值表本身已被 `absent_pg_layer_does_not_rescue_a_failed_publish` 钉住;
+    /// 本条钉的是**两行之间必须存在差异** —— 少了它, 有人把两个 arm 合并
+    /// 仍然全绿(合并方向恰好与本条相反)。
+    #[test]
+    fn none_and_some_ok_must_not_be_interchangeable() {
+        let nats_bad: Result<(), String> = Err("nats down".into());
+        let absent = combine_dlq_results(nats_bad.clone(), None);
+        let nominally_succeeded = combine_dlq_results(nats_bad, Some(Ok(())));
+        assert_ne!(
+            absent.is_ok(),
+            nominally_succeeded.is_ok(),
+            "`None`(没配这一层)与 `Some(Ok(()))`(配了且写成功)被合并了 —— \
+             真值表第 4 行被跳过, 「没配 PG 且 NATS 挂了」会被误判成可恢复"
         );
     }
 
