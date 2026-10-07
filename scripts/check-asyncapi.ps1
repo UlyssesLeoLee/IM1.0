@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # =============================================================================
 # check-asyncapi.ps1 - AsyncAPI spec vs im-protocol serde definitions
 #

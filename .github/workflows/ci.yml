@@ -448,6 +448,19 @@ jobs:
         # 本检查为纯字节操作, 无需 Windows runner, ubuntu 上行为一致。
         shell: pwsh
         run: pwsh -NoProfile -File ./scripts/lint-ps1-encoding.ps1
+      - name: ps1 encoding lint 变异测试 (门禁自身会不会恒绿)
+        # 2026-10-07 实测: lint-ps1-encoding.ps1 曾因「排除模式拿绝对路径去
+        # match」而在**任何 worktree 内恒绿** —— $repoRoot 自身含 \.worktrees\,
+        # 每个文件的 FullName 都命中排除, 扫到 0 个文件并走「未发现 .ps1」分支
+        # 报 OK 退出。也就是说这个门禁从来没在子代理的工作树里检查过任何东西,
+        # 而 CI 一直在跑它、一直是绿的。
+        #
+        # 关键: **只跑一次正常路径证明不了这件事** —— 恒绿的旧代码同样会绿。
+        # 必须是「改坏 -> 必须红」, 且红在正确的位置(改 1 个只点名 1 个;
+        # 排除吃掉全部必须 exit 2 而不是 exit 0)。
+        # 门禁因此带了 -RepoRoot / -ExcludeSegments 两个仅供本测试使用的参数。
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/test-lint-ps1-encoding.ps1
       - name: package platform mapping regression (build-package 纯函数)
         # 2026-10-06 新增。`scripts/build-package.ps1` 里「平台 → 包名后缀/二进制
         # 扩展名」此前写死 win-x64 + .exe, 而 CI runner 是 Linux —— 即「CI 全绿

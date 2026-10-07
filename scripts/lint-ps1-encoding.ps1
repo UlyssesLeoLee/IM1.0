@@ -21,31 +21,84 @@
 #         需在有 pwsh 7 的环境下运行 (GitHub Actions ubuntu runner 自带)。
 #
 # 用法: pwsh scripts/lint-ps1-encoding.ps1
-# 输出: stdout + $LASTEXITCODE (0=全部合规, 1=存在违规文件)
+# 输出: stdout + $LASTEXITCODE (0=全部合规, 1=存在违规文件, 2=门禁自身失效)
+#
+# 参数仅供 scripts/test-lint-ps1-encoding.ps1 的变异测试使用, 正常使用不要传。
 # ============================================================================
+
+param(
+    [string]   $RepoRoot,
+    [string[]] $ExcludeSegments
+)
 
 $ErrorActionPreference = 'Stop'
 
-$repoRoot = Split-Path -Parent $PSScriptRoot
-if (-not $repoRoot) {
+if (-not $RepoRoot) {
+    $RepoRoot = Split-Path -Parent $PSScriptRoot
+}
+if (-not $RepoRoot) {
     Write-Host '[ERROR] 无法定位仓库根目录 ($PSScriptRoot 为空)' -ForegroundColor Red
     exit 1
 }
 
 Write-Host "=== ps1 编码合规检查 (要求: 含非 ASCII 字节的文件必须带 UTF-8 BOM) ==="
-Write-Host ("仓库根: " + $repoRoot)
+Write-Host ("仓库根: " + $RepoRoot)
 Write-Host ''
 
-# 排除构建产物与工作树, 避免把 target 里的拷贝也扫进来
-$excludePattern = '\\(\.git|target|node_modules|\.worktrees)\\'
-
-$files = Get-ChildItem -Path $repoRoot -Recurse -Filter '*.ps1' -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -notmatch $excludePattern }
-
-if (-not $files) {
-    Write-Host '[OK] 未发现 .ps1 文件, 无需检查' -ForegroundColor Green
-    exit 0
+# 排除构建产物与工作树, 避免把 target 里的拷贝也扫进来。
+#
+# ## 关键: 必须按**相对路径**排除, 不能拿绝对路径去 match
+#
+# 在 worktree 里 `$repoRoot` 本身就是 `D:\IM1.0\.worktrees\laneA` ——
+# 它**含有** `\.worktrees\`。于是每个文件的 FullName 都命中下面的模式,
+# 结果是扫到 **0 个文件**并报 `[OK] 未发现 .ps1 文件`。
+#
+# 也就是说: **这个门禁在任何 worktree 内恒绿**, 扫不扫都一样绿。
+# 「写了守卫但它永远不跑」比没有守卫更坏 —— 后者让人知道缺什么。
+# (子代理 lane/crossplat-pkg 报了这个, 当时手工验过两个 .ps1 都带 BOM。)
+#
+# `dist` 是 build-package.ps1 的产物目录(.gitignore:69), 里面的 .ps1 是
+# packaging/template/scripts/ 的**拷贝**。扫它等于把构建产物当被测对象: 源
+# 已经单独扫过, 产物只是重复计数。真正要守的是模板, 不是它的复印件。
+if (-not $ExcludeSegments -or $ExcludeSegments.Count -eq 0) {
+    $ExcludeSegments = @('.git', 'target', 'node_modules', '.worktrees', 'dist')
 }
+
+function Test-Excluded {
+    param([string] $AbsolutePath)
+    $rel = [System.IO.Path]::GetRelativePath($RepoRoot, $AbsolutePath)
+    $parts = $rel -split '[\\/]'
+    # 末段是文件名, 不是目录, 故只看父目录段
+    foreach ($p in $parts[0..([Math]::Max(0, $parts.Count - 2))]) {
+        if ($ExcludeSegments -contains $p) { return $true }
+    }
+    return $false
+}
+
+$allPs1 = @(Get-ChildItem -Path $RepoRoot -Recurse -Filter '*.ps1' -File -ErrorAction SilentlyContinue)
+$files = @($allPs1 | Where-Object { -not (Test-Excluded $_.FullName) })
+
+if ($files.Count -eq 0) {
+    # 0 命中**不自动等于**「无需检查」—— 那正是排除模式吃掉整个仓库时的表现。
+    # 判别: 不带排除再数一遍。真的 0 个 -> 确实没有; 有却被排除光 -> 门禁坏了。
+    if ($allPs1.Count -eq 0) {
+        Write-Host '[OK] 仓库里确实没有 .ps1 文件, 无需检查' -ForegroundColor Green
+        exit 0
+    }
+    Write-Host "[FAIL] 排除模式吃掉了全部 $($allPs1.Count) 个 .ps1 文件。" -ForegroundColor Red
+    Write-Host "       在 worktree 内会发生这个: \$repoRoot 自身含 \.worktrees\, 使每个文件的绝对路径都命中排除条件。" -ForegroundColor Red
+    Write-Host '       结果是一个在任何 worktree 里都恒绿的门禁。已按相对路径排除, 请复核本脚本。' -ForegroundColor Red
+    exit 2
+}
+
+# 被排除掉的数量必须**打出来**。上面的 exit 2 只拦得住「全被吞掉」;
+# 「只吞掉一部分」照样扫得到文件、照样报 OK, 在 CI 日志里跟正常通过长得
+# 一模一样。数字摆在日志里, 部分吞并才看得见。
+$excludedCount = $allPs1.Count - $files.Count
+if ($excludedCount -gt 0) {
+    Write-Host ("排除 " + $excludedCount + " 个构建产物/工作树中的 .ps1 (非仓库内容, 不在检查范围内)") -ForegroundColor DarkGray
+}
+Write-Host ''
 
 $violations = New-Object System.Collections.Generic.List[string]
 $checked = 0
@@ -70,7 +123,7 @@ foreach ($f in $files) {
         }
     }
 
-    $rel = $f.FullName.Substring($repoRoot.Length + 1)
+    $rel = $f.FullName.Substring($RepoRoot.Length + 1)
     $flag = if ($hasBom) { 'BOM   ' } else { 'NO-BOM' }
     $enc = if ($hasNonAscii) { 'non-ascii' } else { 'ascii-only' }
 
