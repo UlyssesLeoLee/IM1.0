@@ -406,7 +406,15 @@ async fn conversation_create_and_find_dm() {
         .expect("create failed");
     assert_eq!(conv.kind, ConversationKind::Dm);
 
-    // 模拟 ConversationService::create_dm:add member + 建 dm_pairs
+    // 直接铺 dm_pairs 行, 而**不**走 `ConversationService::create_dm`:
+    // 本用例要测的是 `find_dm` 本身(仓储层), 走 service 编排会把两个关注点
+    // 混在一起。
+    //
+    // 2026-10-07 补注: 此前这里写的是「模拟 `create_dm`:建 dm_pairs」——
+    // 那句话其实**掩盖了一个真 bug**: 生产代码当时**从不**插 dm_pairs, 只有
+    // 测试插, 于是 `create_dm` 的幂等短路永远命中不了。「模拟」二字把
+    // 「生产该做而没做」写成了「测试在造 fixture」。
+    // 修复见 `ConversationRepository::link_dm_pair` 与 gap-ledger §1.41。
     let (a, b) = if alice.0 < bob.0 {
         (alice, bob)
     } else {

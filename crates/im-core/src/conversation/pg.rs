@@ -91,6 +91,44 @@ impl ConversationRepository for PgConversationRepository {
         Ok(row.into_conversation())
     }
 
+    async fn link_dm_pair(
+        &self,
+        env: EnvironmentId,
+        conversation_id: ConversationId,
+        user_a: UserId,
+        user_b: UserId,
+    ) -> Result<bool, AppError> {
+        // 规范化 user_a < user_b —— dm_pairs 的 CHECK (user_a < user_b) 强制它。
+        // 规范化放在**这一层**而不是只靠调用方, 是为了让「谁能写 dm_pairs」
+        // 只有这一个入口; 上层再normalize 一次就可能出现两套顺序。
+        let (a, b) = if user_a.0 < user_b.0 {
+            (user_a.0, user_b.0)
+        } else {
+            (user_b.0, user_a.0)
+        };
+
+        // ON CONFLICT DO NOTHING 而不是 DO UPDATE: dm_pairs 是**身份表**,
+        // 不是可更新状态。已存在就说明别人已经登记过, 覆盖它会把另一个会话
+        // 从这个 (env, a, b) 上摘掉, 造成更难查的错。
+        let n = sqlx::query(
+            r#"
+            INSERT INTO dm_pairs (environment_id, user_a, user_b, conversation_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (environment_id, user_a, user_b) DO NOTHING
+            "#,
+        )
+        .bind(env.0)
+        .bind(a)
+        .bind(b)
+        .bind(conversation_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx link_dm_pair: {}", e)))?
+        .rows_affected();
+
+        Ok(n > 0)
+    }
+
     async fn find_dm(
         &self,
         env: EnvironmentId,

@@ -55,6 +55,30 @@ pub trait ConversationRepository: Send + Sync {
         metadata: Value,
     ) -> Result<Conversation, AppError>;
 
+    /// 把 DM 会话登记进 `dm_pairs`(per aux-02 §F.10)。
+    ///
+    /// 返回 `true` = 本次登记了新行; `false` = 该 `(env, user_a, user_b)`
+    /// 已经有行了(并发下别人先到)。
+    ///
+    /// ## 为什么必须单列一个方法, 不能塞进 `create` 或 `add_member`
+    ///
+    /// `find_dm` 的幂等短路是 `INNER JOIN dm_pairs` —— **而 `dm_pairs` 在
+    /// 2026-10-07 之前从不被任何生产代码写入**(全仓仅有的两处 INSERT 都在
+    /// 测试里, 其中一处还写着「模拟 `create_dm`:插 dm_pairs 行」)。结果:
+    /// 短路永远命中不了, **每次 `create_dm` 都新建一个会话 + 两个成员**。
+    ///
+    /// 这不是理论问题: `POST /v1/conversations/dm` 直接调它, 客户端任何一次
+    /// 重试(超时 / 双击)都会多出一个重复 DM。
+    ///
+    /// 由 aux-06 §D.2 的 A-005 基准当场抓到(见 `docs/gap-ledger.md` §1.41)。
+    async fn link_dm_pair(
+        &self,
+        env: EnvironmentId,
+        conversation_id: ConversationId,
+        user_a: UserId,
+        user_b: UserId,
+    ) -> Result<bool, AppError>;
+
     async fn find_dm(
         &self,
         env: EnvironmentId,

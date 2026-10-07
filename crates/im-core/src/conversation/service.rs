@@ -70,6 +70,29 @@ impl ConversationService {
 
         self.repo.add_member(conv.id, a, MemberRole::Member).await?;
         self.repo.add_member(conv.id, b, MemberRole::Member).await?;
+
+        // 登记 `dm_pairs` —— **这一步此前从来没有做过**, 于是上面的 `find_dm`
+        // 幂等短路永远命中不了, 每次调用都新建一个会话 + 两个成员。
+        // 任何一次客户端重试(超时 / 双击)都会多出一个重复 DM。
+        // 详见 `repository.rs::link_dm_pair` 的注释与 gap-ledger §1.41。
+        //
+        // 并发下 `link_dm_pair` 可能返回 false(别人先登记了同一对用户): 此时
+        // 刚建的 `conv` 是**孤儿**(没被登记进 dm_pairs), 必须把对方那次登记
+        // 指向的会话返回给调用方, 否则调用方会拿到一个别人不在里面的会话。
+        if !self.repo.link_dm_pair(env, conv.id, a, b).await? {
+            if let Some(existing) = self.repo.find_dm(env, user_a, user_b).await? {
+                return Ok(existing);
+            }
+            // 登记说「已有」而 find_dm 却查不到 —— 状态自相矛盾。这里必须响,
+            // 悄悄把那个孤儿会话交出去, 就是在制造一条只有用户才发现得了的
+            // 坏数据(重复会话 + 两个成员)。
+            return Err(AppError::Internal(anyhow::anyhow!(
+                "dm_pairs 声称 ({}, {}, {}) 已登记, 但 find_dm 查不到对应会话",
+                env.0,
+                a.0,
+                b.0
+            )));
+        }
         Ok(conv)
     }
 

@@ -3861,3 +3861,72 @@ PowerShell 读: [84292]=0xEF  [84293]=0xBF  [84294]=0xBD
 
 > 判据: 一次变异测试通过, 前提是**注入物本身正确**。注入物错了, 门禁会
 > 正确地报告「没有问题」, 于是你得到一个假绿。
+
+
+## 1.41 `create_dm` 从不写 `dm_pairs` —— 幂等短路是死代码, 客户端每次重试都多一个重复会话 (2026-10-07)
+
+#### 怎么被发现的
+
+aux-06 §D.2 的 A-005 基准(**「DM 重复创建幂等」**, 目标 < 20ms)在 CI 里第一次
+跑就红:
+
+```
+assertion `left == right` failed: 重复创建必须返回同一个会话
+```
+
+不是性能问题, 是**行为不对**: 同一对用户调两次 `create_dm`, 拿到两个不同的
+会话 id。
+
+#### 根因
+
+`ConversationService::create_dm` 的幂等短路是:
+
+```rust
+if let Some(existing) = self.repo.find_dm(env, user_a, user_b).await? {
+    return Ok(existing);
+}
+```
+
+而 `find_dm` 是 `INNER JOIN dm_pairs`。**`dm_pairs` 这张表从不被任何生产代码
+写入** —— 全仓仅有的两处 `INSERT INTO dm_pairs` 都在测试文件里
+(`message_service_test.rs` / `pg_repos_integration.rs`), 其中后者的注释原文是
+「**模拟** `ConversationService::create_dm`:建 dm_pairs」。
+
+于是: 短路永远查不到东西 → 每次调用都走 `create` + 两次 `add_member` → 每
+次重试都多出一个重复 DM 会话。
+
+**注释里的「模拟」二字把「生产该做而没做」写成了「测试在造 fixture」。** 这
+正是它能潜伏的原因: 测试把缺口填平了, 于是没有任何一条路径会失败。
+
+#### 影响面
+
+`POST /v1/conversations/dm` 直接调它(`im-gateway/src/http/conversations.rs:158`)。
+客户端任何一次超时重试、双击, 都会让用户多出一个只属于两个人的重复会话 ——
+而这个重复会话后续还能发消息、收消息, 不会自愈。
+
+这与「别人接进来顺不顺手」直接相关: 接入方按正常做法做重试, 就踩中。
+
+#### 修法
+
+新增 `ConversationRepository::link_dm_pair(env, conv, a, b) -> Result<bool, _>`:
+
+- 规范化 `a < b` 放在**仓储层**而不是只靠调用方 —— 让「谁能写 dm_pairs」
+  只有这一个入口(上层再 normalize 一次就可能出现两套顺序)
+- `ON CONFLICT DO NOTHING` 而**不是** `DO UPDATE`: dm_pairs 是**身份表**,
+  已存在就说明别人登记过; 覆盖它会把另一个会话从这对用户上摘掉, 制造更难查
+  的错
+- `create_dm` 里: 登记返回 `false`(并发下别人先到)时, 重新 `find_dm` 并把
+  **对方那次登记指向的会话**返回给调用方 —— 刚建的这个已经成了孤儿, 交给
+  调用方就是「一个别人不在里面的会话」
+- 登记说「已有」而 `find_dm` 查不到 → **返 `Internal` 错**, 不把孤儿交出去
+
+`ConversationRepository` 全仓只有 `PgConversationRepository` 一个实现者, 所以
+加必选方法不会波及任何替身(那些单测用的是自由函数, 不实现该 trait)。
+
+#### 断言为什么值钱
+
+A-005 那条断言就是 `create_dm` 的**幂等契约**。fixture 修好后它才第一次真正
+被执行到 —— 之前它只是「一行看起来在检查东西的代码」。
+
+> 判据: 当一条测试需要**手工造出生产代码本该造出的状态**时, 先问一句「生产
+> 代码真的会造出这个状态吗」。答不上来, 那就不是 fixture, 那是缺口。
