@@ -345,7 +345,22 @@ pub struct DlqRecord {
     /// 原事件载荷
     ///
     /// 规范样例是对象。但载荷是**任意字节**, 不保证是合法 JSON —— 解析失败时
-    /// 退化为一个 JSON **字符串**, 原始字节不丢。宁可形状不统一, 不可丢数据。
+    /// 退化为一个 JSON **字符串**。
+    ///
+    /// ## 这个退化是**有损**的, 不是无损回退
+    ///
+    /// 非 UTF-8 字节在这里就被 `String::from_utf8_lossy` 替换成 U+FFFD
+    /// (`EF BF BD`): `0xFF 0xFE` 落库时已经变成 `EF BF BD EF BF BD`, 信息在
+    /// **写**的这一步就没了 —— 下游再怎么写都还原不回来。
+    ///
+    /// 所以本字段对 **UTF-8 载荷无损**, 对**非 UTF-8 载荷不保证可还原**。
+    /// (早先此处写的是「原始字节不丢」, 那句话是错的: 没有任何地方保留原始字节。)
+    ///
+    /// 完整分析与真库实测见 `crates/jobctl/src/dlq.rs:135-149`
+    /// (`replay_of_a_non_utf8_payload_is_lossy_at_write_time`), 已记入
+    /// `docs/gap-ledger.md` §1.35。要真正无损得改存储形状
+    /// (如 `{"__b64__": "..."}`), 而 aux-08 §D.2 冻结了该形状 ——
+    /// 那是规范所有者的裁决, 不是这里能顺手改的。
     pub original_payload: serde_json::Value,
     pub error: DlqError,
     pub context: DlqContext,
