@@ -3753,3 +3753,111 @@ G-1 / V1 (多租户隔离)
 **维护**: 本表为快照, 记录于 dev @ `a0e72f9` + 本次未提交改动 (2026-10-03)。
 缺口被接线后请同步勾除本文档与代码注释两侧, 避免再次出现
 「代码引用台账但台账不存在」或「台账有项但代码已删」的双向漂移。
+
+
+## 1.39 全仓 3 个文件含 U+FFFD, 其中 2 个在**已交付的安装包**里 (2026-10-07)
+
+#### 怎么发现的
+
+修 `handler.rs` 注释时顺手扫全仓 `EF BF BD` 字节, 447 个跟踪文件里 3 个命中:
+
+| 文件 | 位置 | 是否进分发包 |
+|---|---|---|
+| `crates/im-gateway/src/ws/handler.rs` | 208 / 247 行注释 | 否 |
+| `packaging/template/env.example` | 31 行注释 | **是** |
+| `packaging/template/scripts/preflight.ps1` | 104 行注释 | **是** |
+
+后两个进 `packaging/`, 而 `build-package.ps1` 把 `packaging/template/` 整个打进
+zip。也就是说**已经交付出去的 Windows 包和 Linux 包里, 环境变量模板与
+preflight 脚本都带着乱码** —— 而这两个文件恰好是接入方第一眼要读的「怎么配」
+与「配没配对」。
+
+#### 为什么潜伏这么久
+
+**U+FFFD 本身是合法 UTF-8。** 「文件是不是合法 UTF-8」这类检查(ruff / 编译器 /
+`utf8.DecodeStrict`)全部放行。仓里现有的 `lint-ps1-encoding.ps1` 也抓不到 ——
+它管的是 BOM, 不是内容。也就是说这类损坏对**所有现有门禁都是隐形的**。
+
+#### 三个都是「出生即坏」, 不是后来改坏的
+
+`git cat-file` 逐版本比对(`fc3715d^` / `fc3715d` / `HEAD`):
+
+```
+fc3715d^  bytes=76711  U+FFFD=0     <- 父提交里既没有这两段注释, 也没有乱码
+fc3715d   bytes=78351  U+FFFD=5     <- 乱码与注释同一次提交诞生
+HEAD      bytes=84297  U+FFFD=5
+```
+
+即: 提交时编码被换过一次, 三字节汉字被打成 `EF BF BD`。**历史上从来没有过
+干净版本可恢复。** 所以处理方式不是「还原」, 而是**按上下文重写**并在台账留痕
+(这一节就是那份留痕)。
+
+判定过程: 上下文使原字**无歧义**, 但仍不该「顺手补一个看起来对的字」——
+`return 〔?〕`、`收时〔?〕attach` 各 1 个字, 猜错就是给后人一句假话。
+最终补的是: `各 return 点`(后文「每加一个退出分支就得记得补一次」印证),
+`首次要收时才 attach`, `也不会告诉你值哪里不对`, `它给出的却是`。四处均在
+句法与语义上唯一。
+
+#### 门禁: `scripts/check-no-replacement-char.ps1`
+
+- 扫**被 git 跟踪**的文件(不是目录树): 目录树会把 target/ dist/ 的构建产物
+  也扫进来, 既慢又让门禁结果随机器而变 —— 这正是 `lint-ps1-encoding` 踩过的坑
+- 非 UTF-8 文件跳过, 但**计数并打印**: 静默跳过会让「扫描范围悄悄变窄」与
+  「扫到了且没问题」长得一模一样
+- `git ls-files` 失败或返回 0 个文件 → **exit 2**(门禁失效 ≠ 通过)
+- 变异验证**两次, 两个不同文件**: 注入 `EF BB BD` → exit 1 且点名该文件;
+  还原 → exit 0
+
+> 判据: 一个从未被看见变红的门禁不是门禁。「它跑过了、它报 OK」与「它能报红」
+> 是两件独立的事, 后者必须**主动**证明 —— 这次就差点没证明: 第一版变异用
+> Python 注入, 而门禁始终报绿。
+
+## 1.40 aux-06 §D.2 的 7 项基准: 搬进 CI, 并被 CI 当场抓出 3 个 fixture 错误 (2026-10-07)
+
+#### 挡了半年的理由把两件事粘在了一起
+
+aux-06 §D.2 写「需要真 PG … CI 的 PG service container(**Docker 目前在本机**
+不可用)」。但 CI 的 `test-integration` job **一直**带着 `postgres:18.6`, 而这
+7 项的宿主代码(仓储 / service)早就在同一个 job 的 22 个真 PG 集成测试里跑过。
+缺的不是 PG, 也不是 harness 能力, 只是「把基准搬进 CI」这一步。
+
+#### CI 第一次跑就红了, 而且红的全是 fixture
+
+7 个用例 0.41 秒全灭 —— 那不是性能问题, 是**跑不起来**。逐条(本机无 PG,
+只能读代码 + 读 CI 日志定位):
+
+1. **`environments.name` 有 CHECK 约束**: `name IN ('production','staging','test')`,
+   我在 fixture 里写了 `'perf'`。既有测试用的是 `'test'` —— 照抄即可。
+2. **`list_friends` 读的是 `friendships` 表, 不是 `friend_requests`**。我原本
+   `UPDATE friend_requests SET state='accepted'` 就算完事, 那样 `friendships`
+   是空的, 测到的是**空查询**的延迟 —— 一个漂亮的小数字, 而且毫无意义。
+   正确做法是走 `create_request` → `respond_request(id, true)`, 只有它会插
+   那两行双向 friendships。
+3. **`block` 与 `is_blocked` 的参数语义相反**。`block(user, target)` 写
+   `friendships(user→target)`; 而 `is_blocked(user, target)` 查的是
+   `friendships(target→user)` —— 它回答「**我**有没有**被**拉黑」。想让
+   `is_blocked(alice, bob)` 为 true 必须先 `block(bob, alice)`。
+
+> 判据: 性能测试里「对照组非空」不是锦上添花, 是**正确性前提**。空数据集的
+> 延迟永远好看, 而它对应的根本不是你声称在测的东西。
+
+#### 一个环境层的怪事: 两个工具读同一文件, 读出不同字节
+
+用 Python 注入 `EF BB BD` 时, 门禁始终报绿。逐字节比对发现:
+
+```
+python 尾部:  0A 7D 0A 0A 2F 2F 20 EF BB BD 20 69 6E ...
+PowerShell 读: [84292]=0xEF  [84293]=0xBF  [84294]=0xBD
+                                 ^^ 0xBB 被翻成 0xBF
+```
+
+同一路径、同一长度, Python 读出 `BB`, PowerShell 读出 `BF` —— 差一个比特。
+所以那次变异**从一开始就没注入真正的 U+FFFD**, 门禁报绿是对的。
+
+**结论不是「门禁坏了」**: 改用 PowerShell 注入(已验证字节正确)后, 门禁在
+两个不同文件上都正确报红。教训是: 变异测试里**注入手段本身要被验证** ——
+「我改了文件」不等于「文件被改成了我以为的样子」。本机 E: 卷已有
+「拒绝访问 (os error 5)」的前科, 这类底层异常在本环境并非孤例。
+
+> 判据: 一次变异测试通过, 前提是**注入物本身正确**。注入物错了, 门禁会
+> 正确地报告「没有问题」, 于是你得到一个假绿。

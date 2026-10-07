@@ -156,7 +156,7 @@ async fn make_env() -> (EnvironmentId, UserId, UserId) {
             RETURNING id
         )
         INSERT INTO environments (id, game_id, name)
-        SELECT gen_random_uuid(), g.id, 'perf' FROM g
+        SELECT gen_random_uuid(), g.id, 'test' FROM g
         RETURNING id
         "#,
     )
@@ -508,6 +508,16 @@ async fn perf_a007_list_friends() {
     let repo = PgFriendshipRepository::new(pool().await);
 
     // 铺 40 个已接受好友: 让分页真的在做活, 而不是「空表 + LIMIT 50」。
+    //
+    // ## 必须走 `respond_request(true)`, 不能只改 friend_requests.state
+    //
+    // `list_friends` 读的是 **`friendships` 表**(`state='accepted'`), 不是
+    // `friend_requests`。只有 `respond_request(id, true)` 才会插那两行双向
+    // friendships(`relationship/pg.rs` 第 3 步)。
+    //
+    // 直接 `UPDATE friend_requests SET state='accepted'` 会让 friendships 空着,
+    // 于是测到的是**空查询**的延迟 —— 一个漂亮的小数字, 而且毫无意义。
+    // 这正是本文件每个用例都断言「对照组非空」要挡的那类假绿。
     let p = pool().await;
     for i in 0..40 {
         let friend: Uuid = sqlx::query_scalar(
@@ -520,22 +530,14 @@ async fn perf_a007_list_friends() {
         .await
         .expect("create friend failed");
 
-        repo.create_request(env, alice, UserId(friend))
+        let req = repo
+            .create_request(env, alice, UserId(friend))
             .await
             .expect("create_request failed");
+        repo.respond_request(req.id, true)
+            .await
+            .expect("respond_request(true) failed —— 否则 friendships 表是空的");
     }
-
-    // 把 alice 发出的申请全部置为 accepted —— `respond_request` 需要请求 id,
-    // 而这里要的是「40 个 accepted 好友」这个数据集, 不是要测申请流程。
-    sqlx::query(
-        "UPDATE friend_requests SET state = 'accepted' \
-         WHERE environment_id = $1 AND sender_id = $2",
-    )
-    .bind(env.0)
-    .bind(alice.0)
-    .execute(&p)
-    .await
-    .expect("mark accepted failed");
 
     let mut samples = Vec::with_capacity(A007_N);
     for _ in 0..A007_N {
@@ -578,8 +580,20 @@ async fn perf_a011_request_and_block_query() {
             .await
             .expect("create_request failed");
     }
-    // 预置一条拉黑, 让 is_blocked 走「命中」而不是恒为 false 的空结果集
-    repo.block(alice, bob).await.expect("block failed");
+    // ## 拉黑方向: `block` 与 `is_blocked` 的参数**不是同一个语义**
+    //
+    // `block(user, target)` 写的是 `friendships(user_id=user, friend_id=target)`,
+    // 即「user 拉黑了 target」。
+    //
+    // 而 `is_blocked(user, target)` 查的是
+    // `friendships(user_id=target, friend_id=user, state='blocked')`,
+    // 即「**target** 拉黑了 **user**」—— 它回答的是「**我**有没有**被**拉黑」,
+    // 不是「我拉黑了谁」。
+    //
+    // 所以想让 `is_blocked(alice, bob)` 为 true, 必须先 `block(bob, alice)`。
+    // 我第一版写成 `block(alice, bob)` 然后断言 `is_blocked(alice, bob)` 为 true,
+    // 方向反了 —— 本机无 PG 跑不出来, 是读 `relationship/pg.rs` 才发现的。
+    repo.block(bob, alice).await.expect("block 失败");
 
     let mut req_samples = Vec::with_capacity(A011_N);
     let mut blocked_hits = Vec::with_capacity(A011_N);

@@ -101,7 +101,7 @@ function Get-Prop {
 #
 # 而真正决定服务能不能起来的是 Rust 侧的 `serde_json` + figment(严格)。
 # 用一个**比被测对象更宽松**的解析器当门禁, 后果是 preflight 放行、服务拒绝 ——
-# 那比没有 preflight 更坏: 它给出的���是「已验证」的假信号。
+# 那比没有 preflight 更坏: 它给出的却是「已验证」的假信号。
 #
 # 故语法校验一律走 System.Text.Json(与 serde_json 同为严格 RFC 8259)。
 # 校验通过后才用 ConvertFrom-Json 取值, 那一步只求方便, 不承担判定。

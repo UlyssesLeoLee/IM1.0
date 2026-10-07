@@ -481,6 +481,21 @@ jobs:
         # 门禁因此带了 -RepoRoot / -ExcludeSegments 两个仅供本测试使用的参数。
         shell: pwsh
         run: pwsh -NoProfile -File ./scripts/test-lint-ps1-encoding.ps1
+      - name: U+FFFD 替换字符检查
+        # 2026-10-07 新增。实测全仓有 3 个文件含 U+FFFD, 且经 `git cat-file`
+        # 逐版本比对确认**都是出生即坏**(引入它们的那个提交里就是乱码, 历史上
+        # 从来没有过干净版本) —— 编码换过一次, 汉字被打成 EF BF BD。
+        #
+        # 为什么它能潜伏这么久: U+FFFD 本身是**合法 UTF-8**, 所以任何
+        # 「文件是不是合法 UTF-8」的检查都抓不到它; 而那 3 个里有 2 个
+        # (env.example / preflight.ps1) **直接进分发包** —— 已交付给接入方的
+        # 安装包里, 环境变量模板与 preflight 脚本都带着乱码, 而这两个恰好是
+        # 接入方第一眼要读的「怎么配」与「配对没」。
+        #
+        # 变异验证(两次, 不同文件): 注入 EF BF BD -> exit 1 且点名该文件;
+        # 还原 -> exit 0。纯字节扫描, Windows / Linux 行为一致。
+        shell: pwsh
+        run: pwsh -NoProfile -File ./scripts/check-no-replacement-char.ps1
       - name: package platform mapping regression (build-package 纯函数)
         # 2026-10-06 新增。`scripts/build-package.ps1` 里「平台 → 包名后缀/二进制
         # 扩展名」此前写死 win-x64 + .exe, 而 CI runner 是 Linux —— 即「CI 全绿
