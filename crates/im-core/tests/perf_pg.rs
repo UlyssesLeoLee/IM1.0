@@ -304,6 +304,57 @@ async fn perf_a002_refresh_token_rotate() {
 
     let p50 = report("A-002", "refresh_token 校验+旋转(含 argon2id)", samples);
     assert_p50_ceiling("A-002", "refresh", p50, 50.0, 3.0);
+
+    // -----------------------------------------------------------------
+    // 反向证明: 篡改 refresh token 的 raw 段必须被拒, **且不得**撤销 session
+    //
+    // 2026-10-07 实测这里曾是 **P0**: `IdentityService::refresh` 算出 hash 后
+    // 直接丢弃(`let _ = expected_hash;`), 于是**什么都没校验** —— session id
+    // 成了唯一凭据, 而它明文躺在 access token 的 `dsid` claim 里。
+    // 完整攻击链见 gap-ledger §1.42。
+    //
+    // ## 为什么必须用一个**未被撤销**的真实 session
+    //
+    // 若随手拿一个已经 rotate 掉的 token 去试, 它当然会被拒 —— 但那可能是因为
+    // 「session 已撤销」, **与 hash 校验无关**。这种用例会因错误的原因而绿。
+    // 所以这里专门再 `authenticate` 一次拿一个全新的、确定未被撤销的 token,
+    // 只改 raw 段。
+    let live = svc
+        .authenticate(env, &username, "perf-password-123")
+        .await
+        .expect("authenticate failed");
+    let (sid, raw) = live
+        .refresh_token
+        .0
+        .split_once('.')
+        .expect("refresh token 应为 <session_id>.<raw>");
+    // 只改 raw 的**最后一个字符**, 做成「近似值」。这比塞一个完全不同的串更
+    // 严格: 后者可能因长度/格式不同被挡在别处, 而前者只有**逐字节比对**才会被拒。
+    let tampered = format!("{sid}.{}x", &raw[..raw.len() - 1]);
+
+    let rejected = svc.refresh(&tampered).await;
+    assert!(
+        rejected.is_err(),
+        "篡改 raw 段的 refresh token 被**接受**了 —— 说明校验没有真正执行"
+    );
+    assert!(
+        matches!(rejected, Err(im_common::AppError::Unauthorized(_))),
+        "拒绝原因应是 Unauthorized, 实际: {rejected:?}"
+    );
+
+    // **关键**: 拒绝之后, 那个 session 必须还能用。
+    //
+    // 若实现里把「撤销」放在「校验」之前(旧代码的顺序就是先 revoke), 一次
+    // 伪造尝试会把受害者的合法 session 直接注销 —— 攻击者不花任何代价就能让
+    // 对方强制下线, 而受害者只会看到「莫名其妙被登出了」。
+    let still_works = svc
+        .refresh(&live.refresh_token.0)
+        .await
+        .expect("篡改尝试之后, 原本合法的 refresh token 必须仍然可用");
+    assert_ne!(
+        still_works.refresh_token.0, live.refresh_token.0,
+        "仍然应该正常旋转"
+    );
 }
 
 // ============================================================================

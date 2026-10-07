@@ -357,7 +357,8 @@ impl DeviceSessionRepository for PgDeviceSessionRepository {
             r#"
             INSERT INTO device_sessions (user_id, device_fingerprint, refresh_token_hash)
             VALUES ($1, $2, $3)
-            RETURNING id, user_id, device_fingerprint, created_at, revoked_at
+            RETURNING id, user_id, device_fingerprint, created_at, revoked_at,
+                   refresh_token_hash
             "#,
         )
         .bind(user_id.0)
@@ -378,7 +379,8 @@ impl DeviceSessionRepository for PgDeviceSessionRepository {
         // caller 必须传 user_id(从 JWT claims 拿),避免横向越权
         let row: Option<DeviceSessionRow> = sqlx::query_as(
             r#"
-            SELECT id, user_id, device_fingerprint, created_at, revoked_at
+            SELECT id, user_id, device_fingerprint, created_at, revoked_at,
+                   refresh_token_hash
             FROM device_sessions
             WHERE user_id = $1
               AND refresh_token_hash = $2
@@ -402,7 +404,8 @@ impl DeviceSessionRepository for PgDeviceSessionRepository {
         // 避免之前 placeholder bug (传 UserId::nil + 空 hash 永远返回 None)
         let row: Option<DeviceSessionRow> = sqlx::query_as(
             r#"
-            SELECT id, user_id, device_fingerprint, created_at, revoked_at
+            SELECT id, user_id, device_fingerprint, created_at, revoked_at,
+                   refresh_token_hash
             FROM device_sessions
             WHERE id = $1
             "#,
@@ -439,6 +442,7 @@ struct DeviceSessionRow {
     device_fingerprint: Option<String>,
     created_at: DateTime<Utc>,
     revoked_at: Option<DateTime<Utc>>,
+    refresh_token_hash: String,
 }
 
 impl DeviceSessionRow {
@@ -449,6 +453,7 @@ impl DeviceSessionRow {
             device_fingerprint: self.device_fingerprint,
             created_at: self.created_at,
             revoked_at: self.revoked_at,
+            refresh_token_hash: self.refresh_token_hash,
         }
     }
 }

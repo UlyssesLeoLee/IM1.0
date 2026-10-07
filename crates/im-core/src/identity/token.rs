@@ -105,6 +105,17 @@ pub struct DeviceSession {
     pub device_fingerprint: Option<String>,
     pub created_at: DateTime<Utc>,
     pub revoked_at: Option<DateTime<Utc>>,
+    /// 该 session 的 refresh_token 哈希(per `DeviceSessionRepository::create`)
+    ///
+    /// ## 2026-10-07 新增: 这个字段**曾经不存在**, 而它是必须的
+    ///
+    /// `IdentityService::refresh` 过去算出 `sha256_hex(raw)` 之后直接
+    /// `let _ = expected_hash;` 丢掉了 —— 因为结构体里根本没有 hash 可比,
+    /// 拿不到就没法验。结果是 **session id 成了唯一的凭据**, 而 session id
+    /// 又明文躺在 access token 的 `dsid` claim 里。
+    ///
+    /// 完整攻击链与实测见 `docs/gap-ledger.md` §1.42。
+    pub refresh_token_hash: String,
 }
 
 pub struct TokenService {

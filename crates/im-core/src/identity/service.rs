@@ -339,12 +339,25 @@ where
         }
 
         // 验证 refresh_token_hash 匹配 raw (防伪造 refresh token)
+        //
+        // ## 2026-10-07: 这里曾是一行 `let _ = expected_hash;`(占位)
+        //
+        // 旧代码算完 hash 就丢掉, 理由写的是「`DeviceSession` 结构体没暴露该
+        // 字段」—— 于是**没有任何东西被校验**。后果不是「校验弱」而是
+        // **完全没有凭据**: session id 成了唯一的秘密, 而 session id 明文躺在
+        // access token 的 `dsid` claim 里。完整攻击链见 gap-ledger §1.42。
+        //
+        // 现在 `DeviceSession` 带上了 `refresh_token_hash`(见 token.rs 的说明),
+        // 校验得以真正执行。**顺序很重要**: 先验 hash 再撤销 session ——
+        // 反过来的话, 一次伪造尝试会把受害者的合法 session 直接注销掉,
+        // 攻击者不花代价就能让对方强制下线。
         let expected_hash = crate::common::crypto::sha256_hex(raw);
-        // session.refresh_token_hash 字段 (per DeviceSession struct) 需要 access;
-        // 因 PgDeviceSessionRepository::find_by_refresh_token_hash 接口已含 user_id guard,
-        // 这里简化为: 直接 issue new token pair + revoke old session
-        // (后续 V1 可加 refresh_token_hash 校验, 需先在 DeviceSession struct 暴露字段)
-        let _ = expected_hash; // 占位, V1 校验
+        if !crate::common::crypto::constant_time_eq(
+            expected_hash.as_bytes(),
+            session.refresh_token_hash.as_bytes(),
+        ) {
+            return Err(AppError::Unauthorized("invalid refresh token".into()));
+        }
 
         // 撤销旧 session
         self.device_repo.revoke(session_id).await?;

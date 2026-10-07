@@ -168,6 +168,13 @@ impl DeviceSessionRepository for InMemoryDeviceRepo {
             device_fingerprint: _device_fingerprint.map(String::from),
             created_at: Utc::now(),
             revoked_at: None,
+            // 2026-10-07: 此前这个参数被写成 `_refresh_token_hash` 直接丢掉,
+            // 于是本 fake **无法**表达「hash 不匹配」这个状态 —— 也就是说,
+            // 任何拿它测 refresh 校验的用例, 都测不到校验本身。
+            // `find_by_id` / `find_by_refresh_token_hash` 在本 fake 里恒返 None,
+            // 所以 refresh 的校验路径**根本走不到**; 真实验证靠
+            // `crates/im-core/tests/perf_pg.rs`(真 PG), 不靠这里。
+            refresh_token_hash: _refresh_token_hash.to_string(),
         })
     }
 

@@ -3930,3 +3930,167 @@ A-005 那条断言就是 `create_dm` 的**幂等契约**。fixture 修好后它�
 
 > 判据: 当一条测试需要**手工造出生产代码本该造出的状态**时, 先问一句「生产
 > 代码真的会造出这个状态吗」。答不上来, 那就不是 fixture, 那是缺口。
+
+
+## 1.42 【P0】`refresh` 从不校验 refresh token —— 一个 access token 泄漏即可永久接管账号 (2026-10-07)
+
+#### 怎么被发现的
+
+aux-06 §D.2 的 A-002 基准实测 **P50 = 2.6 ms**, 而该表 §B A-002 的性能模型写的是
+「argon2 ~30ms + DB ~8ms + JWT ~2ms ≈ 40ms」。**差 15 倍。**
+
+15 倍的差距不是「机器快一点」能解释的。顺着查下去, 发现了比性能问题严重得多
+的东西。
+
+#### 根因
+
+`IdentityService::refresh`(`crates/im-core/src/identity/service.rs`)原本是:
+
+```rust
+// 验证 refresh_token_hash 匹配 raw (防伪造 refresh token)
+let expected_hash = crate::common::crypto::sha256_hex(raw);
+// session.refresh_token_hash 字段 (per DeviceSession struct) 需要 access;
+// 因 PgDeviceSessionRepository::find_by_refresh_token_hash 接口已含 user_id guard,
+// 这里简化为: 直接 issue new token pair + revoke old session
+// (后续 V1 可加 refresh_token_hash 校验, 需先在 DeviceSession struct 暴露字段)
+let _ = expected_hash; // 占位, V1 校验
+```
+
+**算完就丢。** 理由写得很清楚: `DeviceSession` 结构体里**根本没有**
+`refresh_token_hash` 字段, 拿不到就没法比。核实无误 —— 该结构体当时只有
+`id / user_id / device_fingerprint / created_at / revoked_at`, 而
+`PgDeviceSessionRepository::find_by_id` 的 SELECT 也不取那一列。
+
+所以 refresh 路径上**没有任何东西被校验**。既没有 argon2, 也没有 sha256 比对,
+也没有 pepper(见下)。
+
+#### 完整攻击链(全部经代码核实, 非推断)
+
+1. `dsid` claim 里放着 `DeviceSessionId` —— `TokenService::issue_access_token_for_session`
+   明确写入 `dsid: device_session_id.map(|id| id.to_string())`
+2. JWT payload 是 base64, **不是加密的** —— 任何拿到 access token 的人
+   (日志、前端 localStorage、APM 抓包、浏览器历史、反代访问日志)都能读出 `dsid`
+3. refresh 接口收 `"{session_id}.{raw}"`, 用 `split_once('.')` 拆开,
+   **只用前半段查库**, 后半段算完 hash 就丢
+4. 拿到新的 access + refresh token 对
+
+即: **只要曾经泄漏过一个 access token, 就能换出永久有效的凭证。** refresh token
+轮换 —— 这正是「access token 泄漏后唯一的缓解手段」—— 在这里提供**零**保护。
+
+#### 顺带发现: `IM_REFRESH_PEPPER` 是必填配置, 但从未被使用
+
+`TokenService` 的字段名是 `_refresh_pepper`(前导下划线 = 刻意不用), 而
+`AppConfig::refresh_pepper` 却是四个**必填**配置之一, preflight 会因它缺失而
+拒绝启动。也就是说: 运维被要求配一个密钥, 配错了也不会有任何后果 —— 因为它
+根本不在任何计算路径上。**一个必填却不生效的配置项, 比没有这一项更糟**: 它让人
+以为哈希被加过 pepper。
+
+#### 修法(2026-10-07)
+
+1. `DeviceSession` 增加 `refresh_token_hash: String`, `DeviceSessionRow` 与
+   三处 SQL(`INSERT ... RETURNING` + 两处 `SELECT`)同步补列
+2. `refresh` 真正比对, 用仓里**已有**的 `common::crypto::constant_time_eq`
+   (不要另写一个; `crypto.rs` 里那个的文档已经写明它就是给签名比对用的)
+3. **顺序: 先验 hash, 再 revoke session。** 反过来的话, 一次伪造尝试会把受害者
+   的合法 session 直接注销 —— 攻击者零成本让对方强制下线, 而受害者只会看到
+   「莫名其妙被登出」
+
+反向测试加在 `perf_pg.rs` 的 A-002(真 PG), 两点都不可省:
+
+- 用一个**未被撤销**的真实 session 做篡改。拿一个已经 rotate 掉的 token 去试,
+  它当然会被拒 —— 但那可能是因为「session 已撤销」, **与 hash 校验无关**,
+  用例会因错误的原因而绿。
+- 只改 raw 的**最后一个字符**做成近似值。塞一个完全不同的串可能被长度/格式
+  挡在别处, 只有「逐字节比对」才会拒绝它。
+- 拒绝之后**那个 session 必须仍然可用** —— 这一条直接盯住上面的「顺序」。
+
+#### 仍未决: pepper 要不要真的用上
+
+本次**只关掉「完全不校验」这个洞**, 没有改哈希方案(仍是 `sha256_hex(raw)`,
+未加 pepper)。理由: 改哈希会让**所有已签发的 refresh token 立即失效**, 这是
+一次有用户影响的变更, 属产品决策而非 bug 修复, 应单独拍板。
+aux-06 §B A-002 声称的是 argon2id(慢, 反暴力破解), 与当前实现的 sha256 也
+不一致 —— 两者都需要规范所有者裁决。已登记为本节的后续项。
+
+> 判据: 「性能数字与文档差 15 倍」不是一个可以记进「文档待更新」的观察 ——
+> 它是「文档描述的那件事根本没发生」的信号。**实测值比模型低一个数量级时,
+> 先怀疑模型描述的东西不存在。**
+
+#### 为什么内存测试抓不到
+
+`im-core/src/identity/tests.rs` 的 `InMemoryDeviceRepo` 是个**从不存任何东西**
+的桩: `find_by_id` 与 `find_by_refresh_token_hash` 恒返 `None`, `revoke` 是空
+实现。它的 `create` 还把 `refresh_token_hash` 参数写成 `_refresh_token_hash`
+直接丢弃 —— 与生产代码同一种病。
+
+结果: **任何拿这个 fake 测 refresh 的用例都走不到校验那一步**(在
+`find_by_id` 就返回 None 了)。本次已把 `create` 改成真的记录 hash, 并在注释里
+写明本 fake **无法**表达「hash 不匹配」, 真实验证靠 `perf_pg.rs`。
+
+> 判据: 当替身(fake / mock)的接口**无法表达**被测函数的失败态时, 用它写的测试
+> 测的不是那个函数。接口缺一个字段不是细节, 它决定了这个替身能不能用。
+## 1.43 aux-06 §D.2 实测回填: 7 项真 PG 基准跑通, 同时证伪了 A-002 的性能模型 (2026-10-07)
+
+#### 实测值(2026-10-07, CI run 37555872686, PG 18.6 / ubuntu-latest)
+
+来源 `crates/im-core/tests/perf_pg.rs` 的 `PERF|` 行(7 个用例, 8.44s 全过)。
+
+| 项 | 场景 | min | **P50** | P99 | aux-06 §A 目标 | 判定 |
+|---|---|---|---|---|---|---|
+| A-002 | refresh 校验+旋转 | 2.458 | **2.629** | 3.930 | < 50 | ✅ 但见下 |
+| A-003 | sequence 分配(无竞争) | 0.888 | **0.971** | 55.331 | < 10 | ✅ |
+| A-003 | 同上(100 并发同会话) | 6.354 | **97.079** | 352.430 | P99 < 50 | ⚠️ 见下 |
+| A-004 | idempotency key 查重(命中) | 0.436 | **0.477** | 0.959 | < 5 | ✅ |
+| A-005 | DM 重复创建(幂等命中) | 0.389 | **0.546** | 53.164 | < 20 | ✅ |
+| A-006 | 增量拉取(50 条/页) | 1.125 | **1.410** | 55.749 | < 50 | ✅ |
+| A-007 | 好友列表(分页 50, 40 好友) | 0.565 | **0.652** | 1.601 | < 50 | ✅ |
+| A-011 | 拉黑查询(命中) | 0.399 | **0.433** | 1.097 | < 20 | ✅ |
+| A-011 | 拉黑查询(未命中) | 0.391 | **0.435** | 0.874 | < 20 | ✅ |
+| A-011 | 申请按主键点查 | 0.399 | **0.435** | 1.055 | < 20 | ✅ |
+
+100 并发的总墙钟 **354 ms**。
+
+#### 三条与文档不符的地方, 按严重度排
+
+**1. A-002 慢了 15 倍 —— 而「快」是因为它什么都没做。**
+实测 P50 = 2.6 ms, §B A-002 的模型是 ≈ 40 ms(其中 argon2 ~30 ms)。差的不是
+机器性能, 是 **argon2 根本没跑**: `refresh` 算完 `sha256_hex(raw)` 就
+`let _ = expected_hash;` 丢掉了。顺着查出 §1.42 那个 P0。
+**文档描述的那件事从来没发生过。**
+
+**2. A-003 的 100 并发 P99 是 352 ms, 是文档目标(50 ms)的 7 倍。**
+`GAP-5` 早就记着「A-003 单会话 1000+ 并发 P99 500ms 是已知瓶颈」, 现在 100
+并发就已经 352 ms —— 瓶颈比记录的更早出现。串行档 0.97 ms 远低于 10 ms 目标,
+说明**成本全在锁等待**, 不在查询本身。`MVP 不优化` 这个决定本身仍成立, 但
+「100 并发 P99 50ms」这个数字应当按实测修正。
+
+**3. A-003 / A-005 / A-006 的 P99 都落在 53~56 ms 这个窄带里。**
+三个**互不相关**的查询同时在 ~55 ms 出现同一个离群值, 更像是周期性事件
+(checkpoint / WAL flush / autovacuum), 而不是各自的查询代价。P99 因此不宜
+当作这三项的「查询延迟」来解读 —— 门禁也因此只对 P50 断言。
+
+#### 仍然空白的项(与 §D.2 原分类一致)
+
+| 类别 | 涉及 | 缺什么 |
+|---|---|---|
+| 需要 Valkey(限流未实装) | A-009 | 用户 2026-10-06 已拍板限流维持现状, 无实现可测 |
+| 需要对象存储 | A-012 | 无 MinIO/S3(§B A-012 自身写明 V1+ 才实装) |
+| 需要 WS 连接 | A-013 | 与 A-008 同因, `im-gateway` 是 bin-only crate |
+
+即: §D.2 原先「需要真 PG」的 7 项**已全部实测**。
+
+#### 基准本身的门禁设计(供后续沿用)
+
+- 默认 `#[ignore]`, 由 CI 的 `test-integration` job 显式 `--ignored --nocapture
+  --test-threads=1` 跑。A-002 每次都跑 argon2, 且每个样本都要先 `authenticate`
+  拿一个**未被用过**的 refresh token(旋转会撤销旧的), 塞进本地全量测试太重。
+- `--test-threads=1` 是必须的: A-003 测的就是**行锁竞争**, 并行会互相制造
+  它本不该有的竞争。
+- 对 **P50** 断言、对 P99 只打印。几十个样本的 P99 ≈ 最大值 + 噪声, 拿它做门禁
+  是在跟共享 runner 的抖动对赌; 而本次第 3 条正好说明那个离群值是系统性的。
+- ceiling = aux-06 目标 × 3(A-003 并发档 × 10, 因为 100 个事务本来就在行锁
+  后排队)。要抓的是索引丢失 / N+1 / 全表扫描那类 10×~100× 的回退。
+
+> 判据: 「实测比模型快一个数量级」和「实测比模型慢一个数量级」是两类信号, 都
+> 不是「更新文档」级别的观察。前者意味着**模型描述的东西不存在**, 后者意味着
+> **实现的瓶颈被低估**。两者都要先查实现, 再动文档。
