@@ -4429,3 +4429,66 @@ max 顶上去, 而不是把断言改成 1。走的是真实 `send_message` 路�
 - `mark_read_rejects_negative_sequence_in_the_service` —— 负值成
   `Validation`, **且读指针没被动过**(拒绝必须无副作用)。
 - `mark_read_by_non_member_is_forbidden_and_never_touches_the_pointer`。
+
+## 1.51 未实装: `openapi_contract` 的反向检查(代码 → 规范)零覆盖 (2026-10-08)
+
+`openapi_contract.rs` 现有三条: ① 规范里每条 operation 都必须在 actix 路由表里
+(spec → routes); ② 对照组探针; ③ `route_table_baseline` 把 spec 与**手工核对值**
+(21 paths / 24 operations)比对 —— **它完全不碰代码**。
+
+于是「在 `http/mod.rs` 加一条路由却忘了写进 spec」会得到全绿 CI, 而接入方按文档
+生成的 SDK 缺这个接口。
+
+**2026-10-08 实测: 当前两个方向都没有漂移**(mod.rs 的 20 条 /v1 路由与 spec
+24 个 operation 逐条 method+path 对齐)。所以缺的是**防将来**的守卫, 不是修现在。
+
+#### 为什么没有直接建起来: 试过, 两次都撞在语义上
+
+试了一版源码级刮取(actix-web 4 **不提供路由枚举 API** —— `AppService` 上没有
+可遍历的路由表, 也没有官方 introspection 入口, 所以只能刮源码)。用 Python
+复刻同一套算法实测, 两处都错:
+
+1. **`http/mod.rs` 刮出 0 条。** 本仓路由大量写成多行
+   ```rust
+   .route(
+       "/token/exchange",
+       actix_web::web::post().to(...),
+   )
+   ```
+   按「`.route(` 后面紧跟引号」匹配会漏掉绝大部分。
+
+2. **`main.rs` 的根级路由被算成 `/v1/healthz`。** 这是**语义错**而不是匹配错:
+   actix 里 `App::new().service(web::scope("/v1").configure(..)).route("/healthz", ..)`
+   中, 后面的 `.route()` 挂在 **App** 上而**不在** scope 内 —— scope 是嵌套的、
+   前缀逐层相加, 但**源码的线性顺序不等于嵌套结构**。「当前 scope」这个变量在
+   线性文本里根本无法还原。
+
+第 2 条意味着这条路要正确就必须写真正的 Rust 解析器(或用 syn), 不是调参能修的。
+**已撤回, 没有把一个已知是坏的解析器当门禁交出去** —— 误报的门禁比没有门禁更糟,
+因为下一个人只会给它加白名单。
+
+同一晚的 `production_code_never_formats_an_error_into_the_wire` 门禁也打磨了三轮
+才敢用(误报 2 次、漏报 1 次, 见 §1.49)。判据一致: 门禁第一次误报时, 修的是门禁
+不是白名单; 修不好就不交。
+
+#### 建议的正解(需要一次真实的重构, 不是加一个测试)
+
+把路由表变成**显式共享常量**, 由它同时驱动 actix 注册与契约测试:
+
+```rust
+// http/routes.rs
+pub const ROUTES: &[(&str, &str, RouteKind)] = &[
+    ("/v1/auth/guest", "post", RouteKind::NoContent),
+    ("/v1/conversations/{id}/read", "post", RouteKind::Json),
+    // ...
+];
+```
+
+`configure()` 遍历它注册, 契约测试遍历它比对 spec。**单一事实源, 无需解析源码。**
+代价: `http/mod.rs` 的注册从「链式 builder」改成「数据驱动」, 涉及 20 条路由的
+重写与回归 —— 必须单独一轮做, 且要有 mutation 证明(随便删一条 spec operation
+必须让门禁变红)。
+
+在那个重构落地之前, 反向漂移靠**评审时对照**兜, 已知豁免只有一条
+(`ws/router.rs:14` 给 `/v1/ws` 同时注册 `""` 与 `"/"`, actix 把尾斜杠当独立路径,
+故多出 `/v1/ws/`; 尾斜杠算不算同一个端点属规范所有者裁决)。
