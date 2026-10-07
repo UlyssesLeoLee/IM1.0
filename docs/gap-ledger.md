@@ -4314,3 +4314,62 @@ combine_dlq_results(nats_res, pg_res)
 > 判据: 修「判定里少了一个分支」这类缺陷时, 优先问「能不能让退化状态在类型上
 > 不可表达」, 而不是补一个测试。测试只能钉住你写下来的那个形状, 钉不住
 > 「接线有没有把值送对」—— 那是另一个层次的问题。
+
+## 1.49 【P1】WS 有 5 处把内部错误 format 进 wire, 其中一条「看起来很规范」 (2026-10-08)
+
+`AppError::ServiceUnavailable(String)` 的 Display 是 `service unavailable: {0}`。
+仓储层把连接串/超时细节装进去时, **DSN 会原样到达客户端**。
+
+`map_service_error` 明确规定 `InternalError` / `ServiceUnavailable` 只回通用
+文案、细节写服务端日志, 且它**早已有两条用例**。但有 5 处没走它:
+
+| 位置 | 原写法 | 风险 |
+|---|---|---|
+| `handle_auth` 失败 | `let code = e.code(); let msg = format!("auth failed: {e}"); send_error(.., &msg, ..)` | **最高** —— 还配了 `e.code()`, 读起来完全规范 |
+| membership 加载失败 | `format!("membership load failed: {e}")` | 中 |
+| 幂等键预查失败 | `format!("idempotency lookup failed: {e}")` | 中 |
+| auth_ok 序列化失败 | `format!("auth_ok serialize failed: {e}")` | 低(serde Display) |
+| edit content 序列化失败 | `format!("content serialize failed: {e}")` | 低(serde Display) |
+
+前 3 处改走 `map_service_error`; 后 2 处改为「固定文案 + 服务端日志」,
+**错误码一律不动** —— 改错误码是协议变更, 而 `ImplementationSpec` 处于
+`[PROTOCOL-FROZEN]`。
+
+顺带更正 `map_service_error` 的日志文案: 它被 send_message / edit / recall /
+mark_read / react 多条路径共用, 却写死「send_message internal failure」,
+会把排查引向错误的路径。
+
+#### 门禁: 盯 `format!` 本身, 不是盯 `map_service_error`
+
+**这个缺陷的关键是「有没有人绕过那个已被测住的函数」**。再加纯函数用例是自欺 ——
+`map_service_error` 修复前后都是绿的。新增源码级用例
+`production_code_never_formats_an_error_into_the_wire`: 取 `#[cfg(test)]`
+之前的生产段, 逐行剥离 `//` 注释, 按括号配对扫每个 `format!`, 模板出现
+`{e}` / `{err}` / `{error}` 即失败。
+
+#### 门禁本身被打磨了三轮 —— 每轮都是它先误报或漏报
+
+1. **盯 `send_error(` 实参 + 固定 400 字符窗口** → 跨调用点串味, 把安全的
+   `&format!("...: {detail}")`(detail 来自 map_service_error)也判违规。
+   **门禁一旦误报, 下一个人只会给它加白名单 —— 那比没有门禁更糟。**
+2. **改按括号配对取整个 send_error 表达式** → 精确了, 但**漏掉**
+   `let msg = format!("auth failed: {e}"); send_error(.., &msg, ..)` 这种
+   先赋值再传的形状 —— 而那恰好是风险最高的一处。改成盯 `format!` 本身。
+3. **仍会扫到自己的测试源码**(`const OPEN: &str = "send_error(";` 这个字面量
+   就在文件里)导致括号失配 → 用 `#[cfg(test)]` 标记限定扫描范围。
+4. 期间另踩两次: `start + 400` 落在多字节字符中间导致切片 panic
+   (本文件全是中文注释); 自失效阈值下界我按感觉写了 20, 实际只有 6 个
+   `format!` —— 阈值报红后按实测值改成 3。
+
+**变异证明**: 注入 `let msg = format!("membership load failed: {e}"); send_error(.., &msg, ..)`
+→ 报红并点名 `handler.rs:367` 与该 `format!` 原文; 还原 → 142 passed。
+
+#### 还原步骤本身也踩了一次坑
+
+`Copy-Item` **保留原文件 mtime**, 于是 cargo 判定「没变」直接跑了陈旧二进制,
+门禁仍报刚才那条违规 —— 看起来像还原失败。`「我改了文件」≠「构建用的是改后
+的文件」`: 变异测试的还原必须验证还原**生效**, 而不只是执行了还原命令。
+
+> 判据: 门禁的质量不体现在它绿不绿, 而体现在**它第一次误报时你是修了门禁还是
+> 加了白名单**。这一条的门禁在落地过程中误报了 2 次、漏报了 1 次, 三次都是往
+> 「更严格且更精确」的方向修的 —— 这才是正确反应。

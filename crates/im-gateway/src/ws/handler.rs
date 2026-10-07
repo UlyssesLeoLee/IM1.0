@@ -354,8 +354,16 @@ async fn run_ws_loop(
                                     {
                                         Ok(ids) => ids,
                                         Err(e) => {
-                                            let code = e.code();
-                                            let msg = format!("membership load failed: {e}");
+                                            // 2026-10-08: 此前是
+                                            // `let msg = format!("membership load failed: {e}")`
+                                            // 直接把 `{e}` 拼进 wire, **绕过 map_service_error**。
+                                            // `AppError::ServiceUnavailable(String)` 的 Display
+                                            // 是 `service unavailable: {0}` —— 若仓储层把连接串
+                                            // 或超时细节装进去, 就等于把 DSN 交给前端用户。
+                                            // map_service_error 对 Internal / ServiceUnavailable
+                                            // 只回通用文案并写服务端日志。
+                                            tracing::error!(error = %e, "membership load failed");
+                                            let (code, msg) = map_service_error(&e);
                                             send_error(ws_session, code, &msg, req_id).await;
                                             return Err(e);
                                         }
@@ -403,10 +411,18 @@ async fn run_ws_loop(
                                             }
                                         }
                                         Err(e) => {
+                                            // 2026-10-08: 消息文本原先是
+                                            // `format!("auth_ok serialize failed: {e}")`。
+                                            // serde 的错误 Display 未必带敏感信息, 但同一
+                                            // 形状一旦换成别的错误类型就会带 —— 统一
+                                            // 走「固定文案 + 服务端日志」, 不在 wire
+                                            // 上回显任何内部错误。真正的 `AppError`
+                                            // 仍在下面的 return 里原样带回服务端。
+                                            tracing::error!(error = %e, "auth_ok serialize failed");
                                             send_error(
                                                 ws_session,
                                                 im_common::ErrorCode::InternalError,
-                                                &format!("auth_ok serialize failed: {e}"),
+                                                "internal error",
                                                 req_id,
                                             )
                                             .await;
@@ -417,8 +433,14 @@ async fn run_ws_loop(
                                     }
                                 }
                                 Err(e) => {
-                                    let code = e.code();
-                                    let msg = format!("auth failed: {e}");
+                                    // 2026-10-08: 原先 `let msg = format!("auth failed: {e}")`
+                                    // 配 `e.code()` 直接进 wire。`e` 是 `AppError` ——
+                                    // `ServiceUnavailable(String)` 的 Display 会带出
+                                    // 连接串。这条是本轮实测到的**最直接**的泄漏形状
+                                    // (另外两处是「先 format 进变量再传」, 只盯
+                                    // send_error 的实参会漏掉, 所以门禁改成盯
+                                    // `format!` 本身)。
+                                    let (code, msg) = map_service_error(&e);
                                     send_error(ws_session, code, &msg, req_id).await;
                                     // 鉴权失败 → close
                                     return Err(e);
@@ -743,13 +765,11 @@ async fn handle_send_message(
         }
         Ok(None) => {}
         Err(e) => {
-            send_error(
-                ws_session,
-                im_common::ErrorCode::InternalError,
-                &format!("idempotency lookup failed: {e}"),
-                Some(req_id),
-            )
-            .await;
+            // 2026-10-08: 同上, 此前是
+            // `&format!("idempotency lookup failed: {e}")` 绕过 map_service_error。
+            tracing::error!(error = %e, "idempotency lookup failed");
+            let (code, msg) = map_service_error(&e);
+            send_error(ws_session, code, &msg, Some(req_id)).await;
             return;
         }
     }
@@ -836,10 +856,14 @@ async fn handle_edit_message(
     let new_content = match serde_json::to_value(&content) {
         Ok(v) => v,
         Err(e) => {
+            // 2026-10-08: 同上, 消息文本原先回显 serde 的 `{e}`。
+            // 错误码保持 `ValidationError` 不变 —— 改错误码是协议变更, 而
+            // `ImplementationSpec` 处于 `[PROTOCOL-FROZEN]`。这里只去掉回显。
+            tracing::error!(error = %e, "edit content serialize failed");
             send_error(
                 ws_session,
                 im_common::ErrorCode::ValidationError,
-                &format!("content serialize failed: {e}"),
+                "content serialize failed",
                 Some(req_id),
             )
             .await;
@@ -1312,7 +1336,11 @@ fn map_service_error(e: &AppError) -> (im_common::ErrorCode, String) {
     let code = e.code();
     match code {
         EC::InternalError | EC::ServiceUnavailable => {
-            tracing::error!(error = %e, "send_message internal failure");
+            // 日志文案**不带具体上下文**是有意的: 这个函数被 send_message /
+            // edit_message / recall / mark_read / react 等多条路径共用, 写死一句
+            // 「send_message internal failure」会把排查引向错误的路径
+            // (2026-10-08 实测就有一处). 需要上下文的调用点自己再打一行。
+            tracing::error!(error = %e, "ws service error mapped to internal text");
             (code, "internal error".into())
         }
         _ => (code, e.to_string()),
@@ -1343,6 +1371,141 @@ mod tests {
     // C-12 心跳骨架帧仅测试路径引用 (per ping_frame_pong_roundtrip_via_c12_skeleton);
     // 真实收发循环接线前 driver 走 ClientFrame::Ping (per 本文件模块 doc 已知缺口 #2)。
     use crate::ws::heartbeat::{PingFrame, PingPongType, PongFrame};
+
+    // ========================================================================
+    // 错误帧脱敏 —— 盯「谁把内部错误 format 进 wire」, 不是盯 map_service_error
+    //
+    // 2026-10-08 实测到 3 处:
+    //   - `format!("membership load failed: {e}")`   (membership 加载失败)
+    //   - `format!("idempotency lookup failed: {e}")` (幂等键预查失败)
+    //   - `format!("auth failed: {e}")` 配 `e.code()`  (鉴权失败)
+    // 外加 2 处回显 serde 错误(`{e}`)的。`AppError::ServiceUnavailable(String)`
+    // 的 Display 是 `service unavailable: {0}` —— 仓储层把连接串/超时细节装
+    // 进去时, DSN 会原样到达客户端。
+    //
+    // map_service_error 本身**早就有**两条用例
+    // (`map_service_error_does_not_leak_internal_details` /
+    //  `..._passes_through_business_errors`)。再加几条纯函数用例是自欺:
+    // 那个函数修复前后都是绿的, 缺的从来不是它的覆盖。
+    // ========================================================================
+
+    /// 生产代码里不得有把错误变量插值进 `format!` 的写法
+    ///
+    /// ## 判别式
+    ///
+    /// 取 `#[cfg(test)] mod tests` **之前**的代码, 逐行去掉 `//` 行注释,
+    /// 然后找任何形如 `format!( … {e} … )` / `{err}` / `{error}` 的调用。
+    ///
+    /// ## 为什么盯 `format!` 而不是盯 `send_error(` 的实参
+    ///
+    /// 第一版盯 send_error 的实参, 结果漏掉了 `let msg = format!("auth failed:
+    /// {e}"); send_error(…, &msg, …)` 这种**先赋值再传**的形状 —— 而那恰好是
+    /// 三处里泄漏风险最高的一处(它还配了 `e.code()`, 看起来很规范)。
+    /// 盯 `format!` 本身覆盖两种形状。
+    ///
+    /// 去掉行注释是必须的: 修这几处时留了「原代码长什么样」的引用注释, 里面
+    /// 天然含 `{e}`。行注释之外本文件无块注释, 故逐行剥离是安全的。
+    ///
+    /// ## 为什么是源码级
+    ///
+    /// 这些点都在 `async` 闭包深处, 触发需要一个真实 `actix_ws::Session`
+    /// **加上**一个恰好失败的可注入依赖; e2e 无法经济地构造「仓储层返回带
+    /// DSN 的错误」这一状态。源码级断言是唯一能同时覆盖全部调用点、且不随
+    /// 重构失效的做法。
+    #[test]
+    fn production_code_never_formats_an_error_into_the_wire() {
+        const SELF: &str = include_str!("handler.rs");
+        const TEST_MOD_MARKER: &str = "#[cfg(test)]\nmod tests {";
+
+        // 自失效阈值: 找不到测试模块标记说明本文件结构变了, 扫描范围会变成
+        // 「整个文件含测试模块」, 于是本测试会拿自己的源码去判自己。
+        let (prod, _) = SELF
+            .split_once(TEST_MOD_MARKER)
+            .expect("找不到 `#[cfg(test)] mod tests` 标记 —— 扫描范围会失真, 先改本测试");
+
+        // 逐行剥离行注释
+        let stripped: String = prod
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) if !l[..i].contains('"') => &l[..i],
+                _ => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut violations: Vec<String> = Vec::new();
+        let bytes = stripped.as_bytes();
+        let mut i = 0usize;
+        while let Some(rel) = stripped[i..].find("format!(") {
+            let start = i + rel;
+            // 取这对括号之间的内容(实参里没有裸括号, 只有字符串与表达式)
+            let mut depth = 0i32;
+            let mut in_str = false;
+            let mut escaped = false;
+            let mut j = start + "format!".len() - 1;
+            while j < bytes.len() {
+                let c = bytes[j];
+                if in_str {
+                    if escaped {
+                        escaped = false;
+                    } else if c == b'\\' {
+                        escaped = true;
+                    } else if c == b'"' {
+                        in_str = false;
+                    }
+                } else {
+                    match c {
+                        b'"' => in_str = true,
+                        b'(' => depth += 1,
+                        b')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                j += 1;
+            }
+            assert!(depth == 0, "format!( 括号不配对 —— 扫描器失效");
+            let mut end = j + 1;
+            while !stripped.is_char_boundary(end) {
+                end += 1;
+            }
+            let args = &stripped[start..end];
+            for var in ["{e}", "{err}", "{error}"] {
+                if args.contains(var) {
+                    let line_no = stripped[..start].matches('\n').count() + 1;
+                    violations.push(format!(
+                        "handler.rs:{line_no}: format! 插值了 `{var}` -> {}",
+                        args.replace('\n', " ")
+                    ));
+                    break;
+                }
+            }
+            i = end;
+        }
+
+        // 自失效阈值: 扫到 0 个 format! 时几乎一定是扫描路径写坏了
+        // (文件被拆走 / 标记位置变了 / 注释剥离逻辑吃掉了代码)。
+        //
+        // 下界 3 是量出来的不是猜的: 本文件生产段现有 6 个 `format!`。留出余量
+        // 免得正常的增删触发误报, 但不能低到「扫到 1 个也算数」—— 那时规则
+        // 实际上只覆盖了 1/6 的调用点却显示为绿。
+        let found = stripped.matches("format!(").count();
+        assert!(
+            (3..=200).contains(&found),
+            "在生产段只扫到 {found} 个 `format!`(期望 3~200)—— 扫描器多半失效了, \
+             先怀疑本测试, 再下结论"
+        );
+        assert!(
+            violations.is_empty(),
+            "{} 处把错误变量 format 进了可能进 wire 的文本:\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
 
     #[test]
     fn auth_frame_deserialize_full() {
