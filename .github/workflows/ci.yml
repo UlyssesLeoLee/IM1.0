@@ -247,6 +247,26 @@ jobs:
         # 命令保持 cargo test --workspace:它会连 lib tests 一起跑(与 test-unit 重叠),
         # 这是既有行为,不在本次修正范围内。
         run: cargo test --workspace --no-fail-fast
+      - name: aux-06 真 PG 性能基准 (A-002/003/004/005/006/007/011)
+        # 2026-10-07 新增。aux-06 §D.2 把这 7 项列为「尚未实测」, 理由写的
+        # 是「Docker 在**本机**不可用」—— 但挡住它们的从来不是「没有 PG」,
+        # 而是「**本机**没有 PG」。本 job 的 postgres service container 一直都
+        # 在, 且这 7 项的宿主代码(仓储 / service)早就在上面那 22 个真 PG
+        # 集成测试里跑过。缺的是把基准搬进 CI 的这一步, 不是能力。
+        #
+        # 放**这个** job 而不是新 job: 复用同一个已迁移好的库, 不必再起一次
+        # PG、再跑一次迁移。基准要的就是「与集成测试同一台机器」的对照。
+        #
+        # `--ignored`: 这些用例默认被忽略(理由见 perf_pg.rs: A-002 每次都跑
+        # argon2id ~30ms, 塞进每个开发者的本地全量测试里太重, 且本地大多
+        # 没 PG, 本来也跑不了)。
+        # `--nocapture`: **必须**。结果以 `PERF|` 单行打到 stdout, 不加这个
+        # flag 一行都看不到 —— 而这些数字的用途正是写进 aux-06 §D.2。
+        # `--test-threads=1`: **必须**。A-003 测的就是**行锁竞争**; 用例并行
+        # 会互相制造它本不该有的竞争, 测出来的数没有意义。
+        run: >-
+          cargo test -p im-core --test perf_pg
+          -- --ignored --nocapture --test-threads=1
 
   sast:
     name: Static Analysis
