@@ -164,6 +164,22 @@ pub trait ConversationRepository: Send + Sync {
         sequence: i64,
     ) -> Result<bool, AppError>;
 
+    /// 该会话当前**已分配**的最大 message sequence(即 `next_sequence - 1`)
+    ///
+    /// 从未分配过 sequence 的会话返回 `0`。
+    ///
+    /// ## 存在的理由: `mark_read` 的上界夹紧
+    ///
+    /// `advance_last_read_sequence` 是 `SET last_read_sequence = $1`, 客户端
+    /// 传什么就写什么。传 `i64::MAX`(「全部标记已读」的一种自然写法)会把读
+    /// 指针永久顶到极大值 —— 此后该会话任何 `sequence` 都不再推进, 未读数永久
+    /// 失真, 且**没有任何报错**。这个值是**服务端的事实**, 客户端无从得知,
+    /// 所以必须由服务端提供。
+    ///
+    /// 存在 `conversation_sequences` 里(与 `SequenceAllocator::next` 同一张表),
+    /// 故这是一次极轻的单行查询。
+    async fn max_allocated_sequence(&self, conv: ConversationId) -> Result<i64, AppError>;
+
     async fn list_members(&self, conv: ConversationId)
         -> Result<Vec<ConversationMember>, AppError>;
 }

@@ -12,9 +12,10 @@
 use serde_json::json;
 use sqlx::PgPool;
 use std::env;
+use std::sync::Arc;
 use uuid::Uuid;
 
-use im_common::ids::{EnvironmentId, MessageId, UserId};
+use im_common::ids::{ConversationId, EnvironmentId, MessageId, UserId};
 use im_core::conversation::pg::PgConversationRepository;
 use im_core::conversation::repository::{ConversationKind, ConversationRepository, MemberRole};
 use im_core::identity::pg::{PgDeviceSessionRepository, PgUserRepository};
@@ -1047,7 +1048,6 @@ async fn reaction_add_remove_idempotent() {
 use chrono::Duration as ChronoDuration;
 use secrecy::SecretString;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 // SigningKey helper (与 token.rs tests 用同 key, 保持 HS256 兼容)
 mod link_test_token_key {
@@ -1500,5 +1500,173 @@ async fn list_for_user_invalid_cursor_is_rejected_not_ignored() {
         matches!(r, Err(im_common::AppError::Validation(_))),
         "非法游标必须报 Validation(400), 实际: {:?}",
         r
+    );
+}
+
+// ============================================================================
+// mark_read 的上界夹紧(2026-10-08)
+//
+// `advance_last_read_sequence` 是 `SET last_read_sequence = $1` —— 客户端传
+// 什么就写什么。传 `i64::MAX`(「全部标记已读」的一种自然写法)会把读指针
+// 永久顶到极大值: 此后该会话任何 sequence 都不再推进, 未读数永久失真,
+// 且**没有任何报错**。
+//
+// 另有一条相邻缺陷: 负值只有 HTTP handler 拒, WS 路径没拒, 而表上有
+// `CHECK (last_read_sequence >= 0)` —— WS 传 -1 会撞 DB 约束变成 500。
+// 两条都改在 `ConversationService::mark_read` 一次覆盖。
+// ============================================================================
+
+/// 造一个会话, 并把它的 sequence 游标直接推到 `next_sequence = n + 1`
+/// (等价于已经分配出 1..=n 这 n 条消息)
+async fn seed_conversation_with_sequence(
+    p: &PgPool,
+    env_id: EnvironmentId,
+    owner: UserId,
+    next_sequence: i64,
+) -> ConversationId {
+    let repo = PgConversationRepository::new(p.clone());
+    let conv = repo
+        .create(env_id, ConversationKind::Group, json!({}))
+        .await
+        .expect("create conversation");
+    repo.add_member(conv.id, owner, MemberRole::Member)
+        .await
+        .expect("add member");
+    sqlx::query(
+        r#"UPDATE conversation_sequences SET next_sequence = $1 WHERE conversation_id = $2"#,
+    )
+    .bind(next_sequence)
+    .bind(conv.id.0)
+    .execute(p)
+    .await
+    .expect("seed sequence cursor");
+    conv.id
+}
+
+#[tokio::test]
+async fn mark_read_clamps_absurd_sequence_to_the_real_max() {
+    let p = pool().await;
+    let (env_id, alice, _bob) = make_env().await;
+    // 已分配出 1..=3
+    let conv = seed_conversation_with_sequence(&p, env_id, alice, 4).await;
+    let svc = im_core::conversation::service::ConversationService::new(Arc::new(
+        PgConversationRepository::new(p.clone()),
+    ));
+
+    // 客户端表达「全部标记已读」
+    let advanced = svc
+        .mark_read(conv, alice, i64::MAX)
+        .await
+        .expect("mark_read i64::MAX");
+    assert!(advanced, "首次上报应当推进");
+
+    let stored: (i64,) = sqlx::query_as(
+        r#"SELECT last_read_sequence FROM conversation_members
+           WHERE conversation_id = $1 AND user_id = $2"#,
+    )
+    .bind(conv.0)
+    .bind(alice.0)
+    .fetch_one(&p)
+    .await
+    .expect("read pointer");
+    assert_eq!(
+        stored.0, 3,
+        "i64::MAX 必须被夹到已分配的最大 sequence(3), 而不是原样落库"
+    );
+
+    // 关键: 夹紧之后读指针仍然可用。
+    //
+    // 若真的写进了 i64::MAX, 下面这两行都会返回 false —— 读指针被永久顶死,
+    // 未读数从此失真且**无任何报错**。只断言「stored == 3」不够: 一个把它
+    // 夹到 0 的实现也能让上面那条断言失败, 但读指针会退到 0, 同样是坏的。
+    assert!(
+        svc.mark_read(conv, alice, 2).await.expect("mark_read 2") == false,
+        "夹紧后读指针在 3, 上报更小的 2 不应推进"
+    );
+    assert!(
+        svc.mark_read(conv, alice, 3).await.expect("mark_read 3") == false,
+        "上报当前值 3 是幂等重放, 不应推进"
+    );
+}
+
+#[tokio::test]
+async fn mark_read_at_or_below_max_still_works_unchanged() {
+    // 对照组: 上界夹紧**不能**影响正常范围内的上报。
+    let p = pool().await;
+    let (env_id, alice, _bob) = make_env().await;
+    let conv = seed_conversation_with_sequence(&p, env_id, alice, 11).await; // max = 10
+    let svc = im_core::conversation::service::ConversationService::new(Arc::new(
+        PgConversationRepository::new(p.clone()),
+    ));
+
+    assert!(svc.mark_read(conv, alice, 7).await.expect("mark_read 7"));
+    let stored: (i64,) = sqlx::query_as(
+        r#"SELECT last_read_sequence FROM conversation_members
+           WHERE conversation_id = $1 AND user_id = $2"#,
+    )
+    .bind(conv.0)
+    .bind(alice.0)
+    .fetch_one(&p)
+    .await
+    .expect("read pointer");
+    assert_eq!(stored.0, 7, "范围内的上报必须原样落库");
+}
+
+#[tokio::test]
+async fn mark_read_rejects_negative_sequence_in_the_service() {
+    // WS 路径此前**没有**这道校验, 负值会撞 DB 的
+    // `CHECK (last_read_sequence >= 0)` 变成 500 级错误。
+    let p = pool().await;
+    let (env_id, alice, _bob) = make_env().await;
+    let conv = seed_conversation_with_sequence(&p, env_id, alice, 5).await;
+    let svc = im_core::conversation::service::ConversationService::new(Arc::new(
+        PgConversationRepository::new(p.clone()),
+    ));
+
+    let r = svc.mark_read(conv, alice, -1).await;
+    assert!(
+        matches!(r, Err(im_common::AppError::Validation(_))),
+        "负值必须在 service 层被拒成 Validation, 实际: {:?}",
+        r.map(|_| ())
+    );
+
+    // 拒绝之后读指针必须没被动过
+    let stored: (i64,) = sqlx::query_as(
+        r#"SELECT last_read_sequence FROM conversation_members
+           WHERE conversation_id = $1 AND user_id = $2"#,
+    )
+    .bind(conv.0)
+    .bind(alice.0)
+    .fetch_one(&p)
+    .await
+    .expect("read pointer");
+    assert_eq!(stored.0, 0, "被拒的请求不得改动读指针");
+}
+
+#[tokio::test]
+async fn mark_read_by_non_member_is_forbidden_and_never_touches_the_pointer() {
+    // 夹紧查询 `max_allocated_sequence` 排在成员校验**之后**是有意的:
+    // 非成员不该从这条路径上探到会话的 sequence 上界。
+    let p = pool().await;
+    let (env_id, alice, _bob) = make_env().await;
+    let conv = seed_conversation_with_sequence(&p, env_id, alice, 5).await;
+    let svc = im_core::conversation::service::ConversationService::new(Arc::new(
+        PgConversationRepository::new(p.clone()),
+    ));
+
+    let stranger: UserId = sqlx::query_scalar(
+        r#"INSERT INTO users (id, environment_id, kind) VALUES (gen_random_uuid(), $1, 'guest') RETURNING id"#,
+    )
+    .bind(env_id.0)
+    .fetch_one(&p)
+    .await
+    .map(UserId)
+    .expect("create stranger");
+
+    let r = svc.mark_read(conv, stranger, i64::MAX).await;
+    assert!(
+        matches!(r, Err(im_common::AppError::Forbidden(_))),
+        "非成员必须 Forbidden, 实际: {:?}",
+        r.map(|_| ())
     );
 }

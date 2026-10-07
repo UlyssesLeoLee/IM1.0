@@ -4373,3 +4373,59 @@ mark_read / react 多条路径共用, 却写死「send_message internal failure�
 > 判据: 门禁的质量不体现在它绿不绿, 而体现在**它第一次误报时你是修了门禁还是
 > 加了白名单**。这一条的门禁在落地过程中误报了 2 次、漏报了 1 次, 三次都是往
 > 「更严格且更精确」的方向修的 —— 这才是正确反应。
+
+## 1.50 【P1】`mark_read` 无上界: 传 i64::MAX 会把读指针永久顶死 (2026-10-08)
+
+`advance_last_read_sequence` 的 SQL 是 `SET last_read_sequence = $1` ——
+客户端传什么就写什么。传 `i64::MAX`（「全部标记已读」的一种自然写法,
+`im-testkit` 的 mock 就用 `sequence: 42` 这类魔法数）会把读指针顶到极大值:
+
+- 此后该会话任何 `sequence` 都不再推进(`WHERE last_read_sequence < $1` 永不成立);
+- 未读数**永久失真**;
+- **没有任何报错**, 响应是 200。
+
+那个值是服务端的事实(`conversation_sequences.next_sequence - 1`), 客户端
+无从得知, 所以只能由服务端夹紧。
+
+#### 相邻缺陷: 负值只有 HTTP 拒, WS 没拒
+
+表上有 `CHECK (last_read_sequence >= 0)`。`POST .../read` 的 handler 提前返 400,
+但 **WS 路径没有这道校验** —— 于是 WS 传 `sequence: -1` 会撞 DB 约束变成
+**500 级错误**。同一条业务规则, 两条入口行为不同。
+
+#### 修法: 两条一起收进 service
+
+```rust
+if sequence < 0 { return Err(Validation("sequence must be >= 0")) }   // 覆盖 WS
+if !is_member { return Err(Forbidden) }                               // 顺序不能反
+let max = self.repo.max_allocated_sequence(conv).await?;
+self.repo.advance_last_read_sequence(conv, user, sequence.min(max)).await
+```
+
+- **夹紧而不是拒绝**: 「标记全部已读」是合法意图, 拒绝它等于逼客户端先自己
+  查一遍最大 sequence —— 而那个值本来就只有服务端知道。HTTP 响应的
+  `last_read_sequence` **本来就已经回报服务端实际值**, 所以夹紧对客户端是可
+  观测的, 不会让客户端误以为自己读到了 MAX。
+- **成员校验排在 `max_allocated_sequence` 之前**: 非成员不该从这条路径上探到
+  会话的 sequence 上界。
+- 新增 `ConversationRepository::max_allocated_sequence`(读
+  `conversation_sequences`, 极轻的单行查询; 从未分配过则 0)。
+
+#### 一处真实的行为变更(不是测试放宽)
+
+既有 HTTP 用例 `mark_read_advances_and_reports_server_value` 断言
+「上报 5 → 指针 5」, 而它的夹具只种了 1 条消息(max=1), 夹紧后会变成 1 ——
+**那会让该用例测不到它本来要测的东西**。修法是先往夹具里补 5 条消息把
+max 顶上去, 而不是把断言改成 1。走的是真实 `send_message` 路径, 不是直接改
+`conversation_sequences`: 夹紧的基准是分配器的事实, 绕过它造出来的数字没有意义。
+
+#### 用例(4 条, 真 PG)
+
+- `mark_read_clamps_absurd_sequence_to_the_real_max` —— 断言存的是 3, **且**
+  随后上报 2 与 3 都不推进。只断言「stored == 3」不够: 一个把它夹到 0 的
+  实现也能让那条断言失败, 而读指针退到 0 同样是坏的。
+- `mark_read_at_or_below_max_still_works_unchanged` —— 对照组, 范围内上报
+  原样落库。
+- `mark_read_rejects_negative_sequence_in_the_service` —— 负值成
+  `Validation`, **且读指针没被动过**(拒绝必须无副作用)。
+- `mark_read_by_non_member_is_forbidden_and_never_touches_the_pointer`。

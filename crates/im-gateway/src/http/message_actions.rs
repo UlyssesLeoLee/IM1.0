@@ -701,6 +701,29 @@ mod tests {
         .await;
         let uri = format!("/v1/conversations/{}/read", f.conv.0);
 
+        // 2026-10-08: `ConversationService::mark_read` 现在把 sequence 夹紧到
+        // 该会话**已分配的最大 sequence**(修 `i64::MAX` 把读指针永久顶死的洞)。
+        // 夹具只种了 1 条消息(max=1), 所以先补到 max >= 5, 否则下面的
+        // 「上报 5 → 指针 5」会被夹成 1 而让本用例测不到它本来要测的东西。
+        //
+        // 走真实 `send_message` 路径(而不是直接改 conversation_sequences):
+        // 夹紧的基准是服务端分配器的事实, 绕过它造出来的数字没有意义。
+        for i in 0..5 {
+            f.state
+                .message_service
+                .send_message(im_core::message::service::SendMessageCommand {
+                    conversation_id: f.conv,
+                    sender_id: f.alice,
+                    idempotency_key: format!("mark_read_fill_{i}"),
+                    kind: "text".to_string(),
+                    content: serde_json::json!({"kind": "text", "text": "fill"}),
+                    reply_to: None,
+                    max_size_bytes: 65_536,
+                })
+                .await
+                .expect("补齐消息以越过上界夹紧");
+        }
+
         // (a) 首次上报 5 → 推进
         let req = actix_web::test::TestRequest::post()
             .uri(&uri)

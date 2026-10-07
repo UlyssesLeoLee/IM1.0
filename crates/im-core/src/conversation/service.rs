@@ -180,17 +180,43 @@ impl ConversationService {
     /// 上捎带都是擅自发明 wire 形状, 与 §1.6 的 `UNSUPPORTED_OPERATION`、
     /// §1.8.2 的 `auth_ok` 同一类错误。故此处只做可确证的 UPDATE 部分,
     /// fanout 缺口记在 `docs/gap-ledger.md` §1.12。
+    /// 上报已读, 返回**是否真的推进了**。`sequence` 会被夹紧到该会话已分配的
+    /// 最大值。
+    ///
+    /// ## 上界夹紧(2026-10-08)
+    ///
+    /// 客户端可以提交任意 `i64`。`advance_last_read_sequence` 是
+    /// `SET last_read_sequence = $1`, 传 `i64::MAX`(「全部标记已读」的一种
+    /// 自然写法)会把读指针永久顶到极大值 —— 此后该会话任何 `sequence` 都不再
+    /// 推进, 未读数**永久失真**且无任何报错。
+    ///
+    /// 夹紧而不是拒绝, 因为「标记全部已读」是合法意图: 拒绝它等于逼客户端
+    /// 先自己查一遍最大 sequence, 而那个值本来就只有服务端知道。
+    /// HTTP 路径的响应**已经**回报服务端实际值(见 `mark_read` handler), 所以
+    /// 夹紧对客户端是可观测的、不会造成「以为自己读到了 MAX」。
+    ///
+    /// ## 负值校验也放在这里
+    ///
+    /// 此前只有 HTTP handler 拒负值, **WS 路径没有** —— 而表上有
+    /// `CHECK (last_read_sequence >= 0)`, 于是 WS 传 `-1` 会撞 DB 约束变成
+    /// 500 级错误。放在 service 层一次覆盖两条路径。
     pub async fn mark_read(
         &self,
         conv: ConversationId,
         user: UserId,
         sequence: i64,
     ) -> Result<bool, AppError> {
+        if sequence < 0 {
+            return Err(AppError::Validation("sequence must be >= 0".into()));
+        }
         if !self.repo.is_member(conv, user).await? {
             return Err(AppError::Forbidden("not a conversation member".into()));
         }
+        // 夹紧到已分配的最大 sequence。见上文。
+        let max = self.repo.max_allocated_sequence(conv).await?;
+        let effective = sequence.min(max);
         self.repo
-            .advance_last_read_sequence(conv, user, sequence)
+            .advance_last_read_sequence(conv, user, effective)
             .await
     }
 

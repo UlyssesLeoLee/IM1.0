@@ -325,6 +325,22 @@ impl ConversationRepository for PgConversationRepository {
         Ok(n > 0)
     }
 
+    async fn max_allocated_sequence(&self, conv: ConversationId) -> Result<i64, AppError> {
+        // 没有 sequence 行 = 从未分配过 = 0。COALESCE 而不是 unwrap_or,
+        // 让「没分配过」与「分配到第 0 条」在读指针语义上等价(都是「没有可读
+        // 到的消息」)。
+        let next: Option<(i64,)> = sqlx::query_as(
+            r#"
+            SELECT next_sequence FROM conversation_sequences WHERE conversation_id = $1
+            "#,
+        )
+        .bind(conv.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx: {}", e)))?;
+        Ok(next.map(|(n,)| n - 1).unwrap_or(0))
+    }
+
     async fn list_members(
         &self,
         conv: ConversationId,
