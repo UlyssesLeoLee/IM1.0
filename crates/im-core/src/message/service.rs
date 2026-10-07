@@ -11,14 +11,21 @@
 //! 5. 返回 Message
 //!
 //! ## Friend 关系校验(per 132-wbs §5.3.1 C-2 验收)
-//! DM 会话中,sender 必须与对方处于 `accepted` 友谊关系,或对方已加入会话且对 sender 开放
-//! (实现简化:仅要求 sender 是会话成员;friend 关系检查通过 service 调用方在 C-9 接入)
+//! DM 会话中,sender 不得是已被对端拉黑的人(2026-10-08 实装, 见 `check_block`)。
+//! 「必须是 accepted 好友」这条更强的约束仍未实装 —— 现状只要求 sender 是会话
+//! 成员且未被拉黑, 见 `docs/gap-ledger.md` §1.44。
 //!
 //! ## 2026-09-01 C-2 实装要点
 //! - 移除 `if let Ok(content) = ...` 静默失败路径,改为 `MessageContent` 严格反序列化
 //! - 校验放在事务前(避免无效 insert 浪费 sequence)
 //! - friend 关系校验通过 `ConversationRepository::is_member` 做兜底(简单版,完整 friend
 //!   关系校验在 im-gateway 层 + 后续 C-7 link_account 阶段补充)
+//!
+//! ## 2026-10-08 实装要点
+//! - 步骤 2e 的拉黑校验由恒 `Ok(false)` 的空壳改为真查 `friendships`。
+//!   在此之前 `POST /v1/friends/{id}/block` 写库成功但对消息完全不生效。
+//! - `if let Ok(true) = ..` 这个 fail-open 形状一并消除: 拉黑状态查不出来时
+//!   上抛错误, 不放行。
 
 use std::sync::Arc;
 
@@ -34,6 +41,16 @@ use super::sequence::SequenceAllocator;
 use crate::conversation::repository::ConversationRepository;
 use crate::event::events::{MessageCreatedEvent, MessageRecalledEvent};
 use crate::event::publisher::EventPublisher;
+use crate::relationship::repository::BlockChecker;
+
+/// `GET /v1/conversations/{id}/messages` 单页上限
+///
+/// 显式常量: handler 算 `has_more` 时必须用**同一个**上限。
+/// 2026-10-08 之前 handler 拿客户端原始 `limit` 去比返回条数, 而 service 把
+/// limit 静默截到 200 —— 客户端传 `limit=1000` 时服务端返 200 条,
+/// `200 == 1000` 为假 → `has_more=false`, 客户端**静默停止翻页**, 第 201 条
+/// 之后的消息永久丢失, 响应里没有任何线索表明数据被截断。
+pub const MAX_PAGE: i32 = 200;
 
 #[derive(Debug, Clone)]
 pub struct SendMessageCommand {
@@ -82,6 +99,22 @@ pub struct MessageService {
     events: Arc<dyn EventPublisher>,
     /// C-2 新增:用于 sender 是 conversation member 的快速校验
     conversation_repo: Arc<dyn ConversationRepository>,
+    /// 2026-10-08 新增:DM 发送前的拉黑校验。
+    ///
+    /// ## 为什么以前不需要它
+    ///
+    /// `check_block` 曾经是个恒返 `Ok(false)` 的空壳, 理由写的是「避免注入
+    /// RelationshipService 引起循环依赖, 完整实装在 C-9 + im-gateway 边界」。
+    /// 于是从 2026-08 到 2026-10-07, `POST /v1/friends/{id}/block` 能成功写入
+    /// `friendships(state='blocked')`, 但**没有任何发送路径会读它** —— 拉黑
+    /// 对消息完全不生效。C-9 早已完成, 这个推迟项没人回来做。
+    ///
+    /// ## 为什么注入窄接口而不是 RelationshipService
+    ///
+    /// 依赖 `BlockChecker`(1 个方法)而不是整个好友仓储(6 个方法), 发消息这条
+    /// 主路径不必为一次布尔查询背上整个好友域的接口面。注入 trait 而非具体
+    /// 类型, 也让测试能直接构造「恒不拉黑 / 恒拉黑」的替身。
+    block_checker: Arc<dyn BlockChecker>,
 }
 
 impl MessageService {
@@ -90,12 +123,14 @@ impl MessageService {
         sequencer: Arc<dyn SequenceAllocator>,
         events: Arc<dyn EventPublisher>,
         conversation_repo: Arc<dyn ConversationRepository>,
+        block_checker: Arc<dyn BlockChecker>,
     ) -> Self {
         Self {
             repo,
             sequencer,
             events,
             conversation_repo,
+            block_checker,
         }
     }
 
@@ -150,12 +185,14 @@ impl MessageService {
             )));
         }
 
-        // 2e. DM friend 关系校验(C-2 验收点)
-        // 仅在 conversations.kind='dm' 时生效;group/channel/broadcast 跳过
-        // 简化:检查 conversation 的 kind,如果是 dm,要求 sender 与对端有 accepted 关系
-        // 这里通过 conversation_repo.find_by_id 拿 kind;
-        // 完整 friend 关系遍历在 im-gateway / im-core 后续阶段补
-        // MVP 行为:kind=dm 但无 friend 关系 → UserBlocked
+        // 2e. DM 拉黑校验(C-2 验收点)
+        //
+        // 仅在 conversations.kind='dm' 时生效;group/channel/broadcast 跳过。
+        //
+        // 2026-10-08:此前这一段的调用是 `if let Ok(true) = self.check_block(..)`,
+        // 而 `check_block` 恒返 `Ok(false)` —— 两重失效叠在一起: 恒 false 的
+        // 空壳, 加上 `if let Ok(..)` 把查询失败当成「没被拉黑」而放行(fail-open)。
+        // 现在改成错误上抛: 数据库查不了拉黑状态时宁可发不出去, 也不放行。
         if let Some(conv) = self
             .conversation_repo
             .find_by_id(cmd.conversation_id)
@@ -174,16 +211,20 @@ impl MessageService {
                     .iter()
                     .find(|m| m.user_id != cmd.sender_id)
                     .map(|m| m.user_id);
-                // DM 必有 2 个成员,找不到说明数据异常
-                if let Some(other_id) = other {
-                    // friend 关系校验 — DM 必须 accepted
-                    // 这里我们用 RelationshipService 注入更优雅,但为避免循环依赖,
-                    // 直接查 friendships 表。简化:此处只检查 sender 是不是被 other block
-                    // (block 反向 = is_blocked 检查)
-                    // 完整 friend 互查留给 im-gateway 层(per SRS GAME-ID-005)
-                    if let Ok(true) = self.check_block(other_id, cmd.sender_id).await {
-                        return Err(AppError::UserBlocked);
-                    }
+                // DM 必有 2 个成员,找不到说明数据异常。
+                //
+                // 这里**不能**静默跳过: 数据异常意味着这条消息根本无从判断
+                // 是否该被拉黑拦下。与其放行(默认允许), 不如报出来让运维
+                // 看见 —— 否则「拉黑失效」会再次变成一条查不到根因的静默行为。
+                let Some(other_id) = other else {
+                    return Err(AppError::Internal(anyhow::anyhow!(
+                        "dm conversation {} has no member other than sender {}",
+                        cmd.conversation_id.0,
+                        cmd.sender_id.0
+                    )));
+                };
+                if self.check_block(other_id, cmd.sender_id).await? {
+                    return Err(AppError::UserBlocked);
                 }
             }
         }
@@ -246,15 +287,24 @@ impl MessageService {
         Ok(msg)
     }
 
-    /// 简化版 block 检查:查 friendships 表 "other block 了 sender"
-    /// 这里走直 SQL,避免注入 RelationshipService 引起循环依赖
-    /// 完整 friend 关系校验在 im-gateway 边界做(per ImplementationSpec §7.4.4)
+    /// DM 拉黑校验:`sender` 是否已被 `other` 拉黑。
+    ///
+    /// ## 实装(2026-10-08)
+    ///
+    /// 此前这里是 `let _ = (other, sender); Ok(false)` —— 签名在, 注释在,
+    /// 错误码 `AppError::UserBlocked` 也在, 唯独判断这件事没做, 所以
+    /// 「拉黑后不能发消息」这条产品语义从未生效。本函数此前 2 个月的行为
+    /// 与「任何人都没被拉黑」完全无法区分。
+    ///
+    /// ## 参数方向
+    ///
+    /// `is_blocked(user, target)` 的语义是「user 被 target 拉黑」(查
+    /// `friendships` 的 `target → user` 方向)。所以问「sender 被 other 拉黑吗」
+    /// 要传 `(sender, other)`, 与本函数入参顺序 `(other, sender)` **相反**。
+    /// 2026-10-03 已在 `RelationshipService::send_request` 上把方向写反过一次,
+    /// 这里显式写明以免第三次。
     async fn check_block(&self, other: UserId, sender: UserId) -> Result<bool, AppError> {
-        // 通过 conversation_repo 暴露 friendships 不优雅;此处复用 PgPool
-        // (注:MessageService 本身没有 PgPool 字段,留 extension point 给 C-9 接入)
-        // MVP:返回 false(=不阻止),完整实装在 C-9 + im-gateway 边界
-        let _ = (other, sender);
-        Ok(false)
+        self.block_checker.is_blocked(sender, other).await
     }
 
     pub async fn edit_message(
@@ -475,7 +525,7 @@ impl MessageService {
         after_sequence: i64,
         limit: i32,
     ) -> Result<Vec<Message>, AppError> {
-        let limit = limit.clamp(1, 200);
+        let limit = limit.clamp(1, MAX_PAGE);
         self.repo
             .list_after_sequence(conversation_id, after_sequence, limit)
             .await

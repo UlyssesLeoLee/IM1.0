@@ -81,9 +81,12 @@ mod placeholder;
 mod ws;
 
 /// 默认 access token TTL (秒) — 15 分钟
-// 守门 #1 缺口台账: 缺口 #A — http/auth_handlers.rs 响应 `expires_in` 当前写死 900,
-// 待 V1 抽 `TokenService::access_ttl_seconds()` 后改为读本常量 (per auth_handlers.rs 模块 doc)。
-// 保留常量而非删除,per docs/Project-Status.md §1.1.1 占位符保留约定。
+// 守门 #1 缺口台账: 缺口 #A **已结清 2026-10-08** ——
+// `http/auth_handlers.rs` 响应的 `expires_in` 原先写死 900, 而 JWT 的 `exp`
+// 取自 `cfg.access_token_ttl_seconds`, 两者可以不一致且无任何报错; 客户端按
+// `expires_in` 排刷新定时器, TTL 调小后会在 token 已过期后仍不发刷新。
+// 现已改为 `TokenService::access_ttl_seconds()`, 与签发用的是同一个值。
+// 本常量仅保留作占位(per docs/Project-Status.md §1.1.1), 无调用点。
 #[allow(dead_code)]
 const DEFAULT_ACCESS_TOKEN_TTL_SECONDS: i64 = 900;
 
@@ -198,18 +201,45 @@ async fn main() -> std::io::Result<()> {
     };
 
     // 6. TokenService (SigningKeyConfig → SigningKey 转换)
-    let signing_keys: Vec<SigningKey> = cfg
-        .jwt_signing_keys
+    //
+    // 2026-10-08: 此前这里是 `cfg.jwt_signing_keys.iter()`, **不看 `active`**。
+    // 后果不是「少一个功能」, 而是 `SigningKeyConfig.active` 成了假开关:
+    // 运维按 config 注释(「切完 v2 后 v1 active=false」)把一把**已泄漏**的
+    // v1 标成 inactive, 期望它不再被接受, 实际 v1 签的 token 照常验签通过。
+    // 而这是配置里唯一的密钥吊销手段。
+    //
+    // 现在按 `active` 过滤: inactive 的密钥既不用于签发, 也不用于验签。
+    // `active` 缺省为 true, 所以不写这个字段的既有配置行为不变。
+    let active_keys = cfg.active_signing_keys();
+    assert!(
+        !active_keys.is_empty(),
+        "at least one ACTIVE signing key required (set IM__JWT__SIGNING__KEYS, \
+         or set active=true on at least one key) — \
+         {} key(s) configured, all inactive",
+        cfg.jwt_signing_keys.len()
+    );
+    if active_keys.len() < cfg.jwt_signing_keys.len() {
+        let retired: Vec<&str> = cfg
+            .jwt_signing_keys
+            .iter()
+            .filter(|k| !k.active)
+            .map(|k| k.kid.as_str())
+            .collect();
+        // 用 warn 而不是 debug: 这是运维**主动**做的操作, 启动日志里必须看得见,
+        // 否则「v1 已下线」这件事只存在于配置文件里。
+        tracing::warn!(
+            retired_kids = ?retired,
+            "signing keys with active=false are neither used to sign nor to verify; \
+             tokens signed with them are now rejected"
+        );
+    }
+    let signing_keys: Vec<SigningKey> = active_keys
         .iter()
         .map(|k| SigningKey {
             kid: k.kid.clone(),
             key: Secret::new(k.key.clone()),
         })
         .collect();
-    assert!(
-        !signing_keys.is_empty(),
-        "at least one signing key required (set IM__JWT__SIGNING__KEYS)"
-    );
 
     let access_ttl = chrono::Duration::seconds(cfg.access_token_ttl_seconds);
     let refresh_pepper: Secret<String> = Secret::new(cfg.refresh_pepper.expose_secret().clone());
@@ -224,11 +254,18 @@ async fn main() -> std::io::Result<()> {
 
     // 8. ConversationService + MessageService + IdentityService
     let conversation_service = Arc::new(ConversationService::new(conversation_repo.clone()));
+    // 拉黑校验: 与 message_repo_for_reaction 同样的做法 —— 一份新的 Arc 指向
+    // 同一个 pool, 而不是把已有的 Arc 做 trait upcast。代价可忽略, 换来的是
+    // `MessageService` 只依赖窄接口 `BlockChecker`(1 个方法)。
+    let block_checker: Arc<dyn im_core::relationship::repository::BlockChecker> = Arc::new(
+        im_core::relationship::pg::PgFriendshipRepository::new(pg_pool.clone()),
+    );
     let message_service = Arc::new(MessageService::new(
         message_repo,
         sequence_allocator,
         event_publisher.clone(),
         conversation_repo,
+        block_checker,
     ));
     let identity_service = Arc::new(IdentityService::new(
         user_repo,

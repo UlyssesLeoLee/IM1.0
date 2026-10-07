@@ -13,7 +13,7 @@ use uuid::Uuid;
 use im_common::ids::{EnvironmentId, UserId};
 use im_common::AppError;
 
-use super::repository::{FriendRequest, FriendRequestState, FriendshipRepository};
+use super::repository::{BlockChecker, FriendRequest, FriendRequestState, FriendshipRepository};
 
 #[derive(Clone)]
 pub struct PgFriendshipRepository {
@@ -27,6 +27,25 @@ impl PgFriendshipRepository {
 
     pub fn from_pool(pool: &PgPool) -> Self {
         Self { pool: pool.clone() }
+    }
+}
+
+#[async_trait]
+impl BlockChecker for PgFriendshipRepository {
+    async fn is_blocked(&self, user: UserId, target: UserId) -> Result<bool, AppError> {
+        // "user 被 target 屏蔽" = friendships(target, user, 'blocked') 存在
+        let n: (i64,) = sqlx::query_as(
+            r#"
+            SELECT count(*)::bigint FROM friendships
+            WHERE user_id = $1 AND friend_id = $2 AND state = 'blocked'
+            "#,
+        )
+        .bind(target.0)
+        .bind(user.0)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx: {}", e)))?;
+        Ok(n.0 > 0)
     }
 }
 
@@ -252,22 +271,6 @@ impl FriendshipRepository for PgFriendshipRepository {
         .await
         .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx: {}", e)))?;
         Ok(rows.into_iter().map(|(u,)| UserId(u)).collect())
-    }
-
-    async fn is_blocked(&self, user: UserId, target: UserId) -> Result<bool, AppError> {
-        // "user 被 target 屏蔽" = friendships(target, user, 'blocked') 存在
-        let n: (i64,) = sqlx::query_as(
-            r#"
-            SELECT count(*)::bigint FROM friendships
-            WHERE user_id = $1 AND friend_id = $2 AND state = 'blocked'
-            "#,
-        )
-        .bind(target.0)
-        .bind(user.0)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| AppError::Internal(anyhow::anyhow!("sqlx: {}", e)))?;
-        Ok(n.0 > 0)
     }
 }
 

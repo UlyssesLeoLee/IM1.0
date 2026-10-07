@@ -2,6 +2,7 @@
 //!
 //! 依据: ImplementationSpec §7.4.2
 
+pub mod cursor;
 pub mod pg;
 pub mod repository;
 pub mod service;

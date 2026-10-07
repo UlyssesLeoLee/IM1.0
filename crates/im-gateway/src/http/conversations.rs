@@ -271,20 +271,29 @@ pub async fn list(
     query: web::Query<ListQuery>,
 ) -> Result<HttpResponse, actix_web::Error> {
     let svc: &ConversationService = &app.conversation_service;
-    let limit = query.limit.unwrap_or(50);
+    let limit = query
+        .limit
+        .unwrap_or(im_core::conversation::service::MAX_PAGE);
 
     let convs = svc
         .list_user_conversations(auth.user_id, query.cursor.as_deref(), limit)
         .await
         .map_err(http_err)?;
 
-    // has_more 推断:limit 返回 N 条 + cursor 仍能下推 → 客户端用 next_cursor
-    let has_more = convs.len() as i32 >= limit.clamp(1, 50);
+    // has_more 推断:本页取满上限 → 说明后面还有。
+    //
+    // 上限取自 service 的常量而不是在这里重写一遍 —— 过去这里是
+    // `limit.clamp(1, 50)` 的第三份字面量。
+    let effective_limit = limit.clamp(1, im_core::conversation::service::MAX_PAGE);
+    let has_more = convs.len() as i32 >= effective_limit;
     let next_cursor = if has_more {
-        // cursor = "created_at:last.id"(简化,client 透传即可)
+        // 游标由 conversation::cursor 统一编解码。2026-10-08 之前这里手写
+        // `format!("{}:{}", c.created_at.timestamp_millis(), c.id.0)`,
+        // 而仓储层把形参命名成 `_cursor` 直接丢弃 —— 格式知识只存在于
+        // handler 一侧, 于是这个端点从上线起就没真正翻过页。
         convs
             .last()
-            .map(|c| format!("{}:{}", c.created_at.timestamp_millis(), c.id.0))
+            .map(|c| im_core::conversation::cursor::encode(c.created_at, c.id.0))
     } else {
         None
     };

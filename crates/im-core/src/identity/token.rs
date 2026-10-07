@@ -141,6 +141,21 @@ impl TokenService {
         }
     }
 
+    /// Access Token 的实际有效期(秒)—— 与 `issue_access_token_for_session`
+    /// 写进 `exp` claim 的是**同一个** `access_ttl`
+    ///
+    /// 存在的理由: `IdentityService` 要在 `TokenPair.expires_in` 里告诉客户端
+    /// 「这个 access token 还能用多久」。此前该字段写死 900, 而 JWT 的 `exp`
+    /// 取自 `cfg.access_token_ttl_seconds` —— 两个值可以不一致, 且**没有任何
+    /// 报错**。运维把 TTL 调小(如 300)后, 客户端仍按 900 安排刷新, 在
+    /// 300~900s 之间会撞 401 却没有触发刷新。
+    ///
+    /// 接入方正是靠这个字段排刷新定时器, 所以它必须来自签发用的那一个值,
+    /// 而不是任何常量。
+    pub fn access_ttl_seconds(&self) -> i64 {
+        self.access_ttl.num_seconds()
+    }
+
     /// 签发 Access Token(不带 device session —— claims 里无 `dsid`)
     ///
     /// 保留本入口是为了不改动既有调用点/测试; **签发登录/注册类 token 时应改用
@@ -159,7 +174,17 @@ impl TokenService {
         user: &User,
         device_session_id: Option<DeviceSessionId>,
     ) -> Result<AccessToken, TokenError> {
-        // 用第 1 个 key 签发(轮换时仍可用 v1 签发,v2 用于校验新发的 v2 token)
+        // 用第 1 个 key 签发。
+        //
+        // 2026-10-08 更正: 原注释写的是「用第 1 个 key 签发(轮换时仍可用 v1
+        // 签发,v2 用于校验新发的 v2 token)」—— 这句话自相矛盾(v1 签发怎么
+        // 会产出 v2 token), 且「仍可用 v1 签发」与 config 里
+        // 「切完 v2 后 v1 active=false」的轮换设计相反。
+        //
+        // 实际语义现在是: **进入本构造函数的 key 全部是 active 的**
+        // (im-gateway/main.rs 按 `SigningKeyConfig.active` 过滤后才传入),
+        // 所以取第 1 个就是「当前主密钥」。inactive 的密钥既不会被用来签发,
+        // 也不会被用来验签 —— 它是配置里唯一的密钥吊销手段。
         let key = &self.signing_keys[0];
         let now = Utc::now();
         let claims = TokenClaims {

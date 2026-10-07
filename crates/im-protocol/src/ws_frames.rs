@@ -74,6 +74,15 @@ pub enum ClientFrame {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerFrame {
     /// WS 握手成功
+    ///
+    /// ## ⚠ 生产侧**从不发送**本帧(2026-10-08 核实)
+    ///
+    /// 鉴权成功后 gateway 实际发的是 [`ServerFrame::AuthOk`], 不是本变体。
+    /// `aux-13` §1.2.1 写的是 `connected`, 代码发 `auth_ok`, 哪个才是原意
+    /// **尚未裁决**(见 `docs/gap-ledger.md` §2), 故本变体保留不动。
+    ///
+    /// 本变体在全仓的构造点只有 `im-testkit` 样例帧与契约测试。
+    /// 接入方**不要**写「等 connected」的接收分支 —— 见 §1.45。
     Connected { session_id: Uuid },
     /// 鉴权成功回执 (2026-10-07 新增, 用户拍板)
     ///
@@ -185,6 +194,15 @@ pub enum ServerFrame {
         emoji: String,
     },
     /// 在线状态变化
+    ///
+    /// ## ⚠ 生产侧**从不发送**本帧(2026-10-08 核实)
+    ///
+    /// 全仓构造点只有 `im-testkit` 的样例帧构造函数与本 crate 的契约测试;
+    /// `im-gateway` 零发送点。根因是 `im-presence` 整个 crate 仍是 5 行的
+    /// 占位(`pub fn placeholder() {}`), 没有事件源可发。
+    ///
+    /// 接入方**不要**为它写接收分支并等它到来: 那样的集成测试对着
+    /// `im-testkit` 会全绿, 上生产却永远收不到。见 `docs/gap-ledger.md` §1.45。
     PresenceUpdate {
         user_id: Uuid,
         status: String, // online | offline | away | busy | invisible
@@ -197,6 +215,17 @@ pub enum ServerFrame {
     /// 心跳响应
     Pong { ts: i64 },
     /// 强制下线
+    ///
+    /// ## ⚠ 生产侧**从不发送**本帧(2026-10-08 核实)
+    ///
+    /// `im-gateway` 侧只存在 `SessionState::force_close()` 这个**本地**状态
+    /// 置位(handler.rs 在心跳超时/本地 close 时调), 它**不发任何帧**;
+    /// logout / 封号 / admin kick 三个触发源都还没有钩子接到 hub 上。
+    ///
+    /// 后果不只是「收不到帧」: 用户 logout 或被封号后, **既有 WS 连接会继续
+    /// 收发消息**, 因为鉴权只在建连第一帧做过一次(见 gap-ledger §1.46)。
+    ///
+    /// 接入方不能依赖本帧来感知被踢。见 `docs/gap-ledger.md` §1.45。
     ForceDisconnect {
         reason: String, // token_revoked | account_banned | account_deleted | admin_kick
     },

@@ -29,6 +29,13 @@ pub struct ConversationService {
     repo: Arc<dyn ConversationRepository>,
 }
 
+/// `GET /v1/conversations` 单页上限(UI 会话列表)
+///
+/// 显式常量而不是散落各处的字面量: handler 算 `has_more` 时需要**同一个**
+/// 上限, 过去两边各写一个 `50`。数字一旦不同步, `has_more` 就会拿一个服务端
+/// 没采纳的 limit 去比, 客户端据此静默停止翻页。
+pub const MAX_PAGE: i32 = 50;
+
 impl ConversationService {
     pub fn new(repo: Arc<dyn ConversationRepository>) -> Self {
         Self { repo }
@@ -134,10 +141,12 @@ impl ConversationService {
         cursor: Option<&str>,
         limit: i32,
     ) -> Result<Vec<Conversation>, AppError> {
-        let limit = limit.clamp(1, 200);
-        self.repo
-            .list_for_user(user, cursor, limit.clamp(1, 50))
-            .await
+        // clamp 只在这里做一次。之前是 `limit.clamp(1,200)` 之后又
+        // `limit.clamp(1,50)`, 而 handler 那边为了算 `has_more` **又自己
+        // clamp 了一遍** —— 三处各写一个字面量, 谁改一处另外两处不会跟着动。
+        // 现在 handler 直接读 `MAX_PAGE`, 不再重复这个数字。
+        let limit = limit.clamp(1, MAX_PAGE);
+        self.repo.list_for_user(user, cursor, limit).await
     }
 
     /// 用户所属的**全部**会话 id(无上限)—— WS 广播成员过滤用

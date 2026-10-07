@@ -165,6 +165,14 @@ pub fn ping_json() -> Value {
 // =============================================================================
 
 /// §1.2.1 `connected` —— 强类型版
+///
+/// ## ⚠ 生产服务**不会发这一帧**
+///
+/// gateway 鉴权成功后实际发的是 `auth_ok`(见 `ServerFrame::AuthOk`)。
+/// 本函数给的是 `aux-13` §1.2.1 的**规范样例**, 不是线上会到来的帧。
+///
+/// 拿它写断言的集成测试必然全绿, 接生产却收不到 —— 这正是
+/// `docs/gap-ledger.md` §1.45 记的那类陷阱。握手成功请断 `auth_ok`。
 pub fn connected_frame() -> ServerFrame {
     ServerFrame::Connected {
         session_id: Uuid::parse_str(SESSION_ID_CONNECTED).expect("valid uuid"),
@@ -375,6 +383,11 @@ pub fn reaction_added_frame() -> ServerFrame {
 }
 
 /// §1.2.9 `presence_update` —— 强类型版
+///
+/// ## ⚠ 生产服务**不会发这一帧**
+///
+/// `im-presence` 整个 crate 仍是占位(无事件源), gateway 零发送点。
+/// 本函数只提供规范样例, 用于协议形状测试。详见 `docs/gap-ledger.md` §1.45。
 pub fn presence_update_frame() -> ServerFrame {
     ServerFrame::PresenceUpdate {
         user_id: Uuid::parse_str(USER_ID_PEER).expect("valid uuid"),
@@ -404,6 +417,17 @@ pub fn pong_json() -> Value {
 }
 
 /// §1.2.12 `force_disconnect` —— 强类型版
+///
+/// ## ⚠ 生产服务**不会发这一帧**
+///
+/// gateway 只有 `SessionState::force_close()` 这个本地状态置位(心跳超时 /
+/// 本地 close 时调), **不发任何帧**; logout / 封号 / admin kick 都还没有
+/// 钩子接到 hub 上。所以这里的 `reason: "token_revoked"` 是一个**生产上
+/// 不存在的场景**。
+///
+/// 接入方不能靠本帧感知「被踢」; 用户 logout 或被封号后, 既有 WS 连接会
+/// **继续收发消息**(鉴权只在建连第一帧做过一次)。见
+/// `docs/gap-ledger.md` §1.45 / §1.46。
 pub fn force_disconnect_frame() -> ServerFrame {
     ServerFrame::ForceDisconnect {
         reason: "token_revoked".into(),

@@ -258,6 +258,9 @@ fn app_parts() -> (AppState, sqlx::PgPool, crate::ws::hub::WsHub) {
             sequencer,
             events,
             conversation_repo.clone(),
+            Arc::new(im_core::relationship::pg::PgFriendshipRepository::new(
+                pool.clone(),
+            )),
         )),
         token_service.clone(),
         Arc::new(im_core::identity::service::IdentityService::new(

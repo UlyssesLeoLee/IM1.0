@@ -19,6 +19,8 @@ use im_core::message::pg::{PgMessageRepository, PgSequenceAllocator};
 use im_core::message::repository::MessageRepository;
 use im_core::message::sequence::SequenceAllocator;
 use im_core::message::service::{MessageService, SendMessageCommand};
+use im_core::relationship::pg::PgFriendshipRepository;
+use im_core::relationship::repository::FriendshipRepository;
 
 fn database_url() -> String {
     env::var("DATABASE_URL")
@@ -170,11 +172,15 @@ async fn make_service_async() -> (MessageService, Arc<MockEventPublisher>, PgPoo
     let conv_repo: Arc<dyn ConversationRepository> =
         Arc::new(PgConversationRepository::new(p.clone()));
     let events = Arc::new(MockEventPublisher::default());
+    let block_checker: Arc<dyn im_core::relationship::repository::BlockChecker> = Arc::new(
+        im_core::relationship::pg::PgFriendshipRepository::new(p.clone()),
+    );
     let svc = MessageService::new(
         msg_repo,
         seq,
         events.clone() as Arc<dyn EventPublisher>,
         conv_repo,
+        block_checker,
     );
     (svc, events, p)
 }
@@ -278,6 +284,145 @@ async fn c2_step2_non_member_cannot_send() {
         matches!(r, Err(AppError::Forbidden(_))),
         "expected Forbidden, got {:?}",
         r
+    );
+}
+
+// ============================================================================
+// 步骤 2e — DM 拉黑校验
+//
+// 2026-10-08 新增。这一步在 2026-08 ~ 2026-10 之间**从未被测过**, 原因就是
+// `check_block` 恒返 `Ok(false)` —— 没有可观测的行为, 也就没有可写的断言。
+// 所以这里不只是「补一个用例」, 而是把「拉黑真的拦得住消息」钉成可判定事实。
+//
+// 三个用例构成一组, 缺一不可:
+//   1. 被拉黑者发消息 → UserBlocked      (正向: 拦截生效)
+//   2. 拉黑者自己发消息 → 成功            (反向守卫: 没有把所有人一起拦掉)
+//   3. 拉黑发生在**之前**的历史消息方向不变 (防「谁先说话谁就不能说」这类
+//      错误实现)
+// ============================================================================
+
+#[tokio::test]
+async fn c2_step2e_blocked_sender_cannot_send_in_dm() {
+    let (_env, alice, bob, conv) = make_env_with_dm().await;
+    let (svc, _events, p) = make_service_async().await;
+
+    // bob 拉黑 alice → alice 不应再能发消息
+    PgFriendshipRepository::new(p.clone())
+        .block(bob, alice)
+        .await
+        .expect("bob blocks alice");
+
+    let cmd = SendMessageCommand {
+        conversation_id: conv,
+        sender_id: alice,
+        idempotency_key: "blocked-1".into(),
+        kind: "text".into(),
+        content: json!({"kind": "text", "text": "let me in"}),
+        reply_to: None,
+        max_size_bytes: 65536,
+    };
+    let r = svc.send_message(cmd).await;
+    assert!(
+        matches!(r, Err(AppError::UserBlocked)),
+        "被拉黑者发消息必须被拒, got {:?}",
+        r
+    );
+}
+
+#[tokio::test]
+async fn c2_step2e_blocker_can_still_send_in_dm() {
+    let (_env, alice, bob, conv) = make_env_with_dm().await;
+    let (svc, _events, p) = make_service_async().await;
+
+    PgFriendshipRepository::new(p.clone())
+        .block(bob, alice)
+        .await
+        .expect("bob blocks alice");
+
+    // 拉黑是单向的: bob 拉黑 alice 不妨碍 bob 自己说话。
+    //
+    // 这条与上一条成对存在。`is_blocked(user, target)` 问的是「user 被 target
+    // 拉黑」, 参数写反时**两条会同时通过或同时失败** —— 单测一条看不出方向,
+    // 两条一起断言才能锁住「谁被拦」而不是「有没有人拦」。
+    let cmd = SendMessageCommand {
+        conversation_id: conv,
+        sender_id: bob,
+        idempotency_key: "blocker-1".into(),
+        kind: "text".into(),
+        content: json!({"kind": "text", "text": "bye"}),
+        reply_to: None,
+        max_size_bytes: 65536,
+    };
+    let r = svc.send_message(cmd).await;
+    assert!(r.is_ok(), "拉黑者本人发消息必须放行, got {:?}", r.err());
+}
+
+#[tokio::test]
+async fn c2_step2e_unblocked_dm_still_works() {
+    // 对照组: 同一个 DM, 没有任何拉黑 → 必须放行。
+    //
+    // 没有这条, 「所有 DM 消息都被拒」这种最粗暴的实现也能让上面两条变绿。
+    let (_env, alice, _bob, conv) = make_env_with_dm().await;
+    let (svc, _events, _p) = make_service_async().await;
+
+    let cmd = SendMessageCommand {
+        conversation_id: conv,
+        sender_id: alice,
+        idempotency_key: "unblocked-1".into(),
+        kind: "text".into(),
+        content: json!({"kind": "text", "text": "hi"}),
+        reply_to: None,
+        max_size_bytes: 65536,
+    };
+    assert!(svc.send_message(cmd).await.is_ok());
+}
+
+#[tokio::test]
+async fn c2_step2e_blocked_sender_cannot_send_in_group() {
+    // 群聊**不**做拉黑校验 —— 这是当前已知的范围限制, 不是已实现的语义。
+    // 本用例的作用是把这个边界显式钉住: 将来若决定扩到群聊, 这条会红,
+    // 从而强制一次有意识的决定, 而不是悄悄改变行为。
+    //
+    // 详见 docs/gap-ledger.md §1.44。
+    let (env, alice, _bob, _dm) = make_env_with_dm().await;
+    let (svc, _events, p) = make_service_async().await;
+
+    let conv_repo = PgConversationRepository::new(p.clone());
+    let carol: Uuid = sqlx::query_scalar(
+        r#"INSERT INTO users (id, environment_id, kind) VALUES (gen_random_uuid(), $1, 'guest') RETURNING id"#,
+    )
+    .bind(env.0)
+    .fetch_one(&p)
+    .await
+    .expect("create carol");
+
+    let group = conv_repo
+        .create(env, ConversationKind::Group, json!({}))
+        .await
+        .expect("create group");
+    for u in [alice, UserId(carol)] {
+        conv_repo
+            .add_member(group.id, u, MemberRole::Member)
+            .await
+            .unwrap();
+    }
+    PgFriendshipRepository::new(p.clone())
+        .block(UserId(carol), alice)
+        .await
+        .expect("carol blocks alice");
+
+    let cmd = SendMessageCommand {
+        conversation_id: group.id,
+        sender_id: alice,
+        idempotency_key: "group-blocked-1".into(),
+        kind: "text".into(),
+        content: json!({"kind": "text", "text": "still here"}),
+        reply_to: None,
+        max_size_bytes: 65536,
+    };
+    assert!(
+        svc.send_message(cmd).await.is_ok(),
+        "当前实现只在 DM 上校验拉黑, 群聊应放行(已知限制, 见 gap-ledger §1.44)"
     );
 }
 

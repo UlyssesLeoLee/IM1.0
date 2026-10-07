@@ -175,21 +175,50 @@ impl ConversationRepository for PgConversationRepository {
     async fn list_for_user(
         &self,
         user: UserId,
-        _cursor: Option<&str>,
+        cursor: Option<&str>,
         limit: i32,
     ) -> Result<Vec<Conversation>, AppError> {
         let limit = limit.clamp(1, 200) as i64;
+
+        // 游标**必须真的下推到 SQL**。
+        //
+        // 2026-10-08 之前这个形参叫 `_cursor`, SQL 里没有任何游标谓词 ——
+        // 每带一次 cursor 都拿回一模一样的头 N 条。handler 却一直在生成并
+        // 下发 cursor(spec 也承诺 client 可原样回传), 于是接入方按规范写的
+        // 翻页循环会无限重复第 1 页。详见 `conversation::cursor` 模块文档。
+        //
+        // 解析失败在这里就报 Validation(400), **不**降级成「从头开始」:
+        // 静默降级产生的现象与「游标根本没生效」完全一样, 排查时会把人引向
+        // 错误的方向。
+        let cursor = cursor.map(super::cursor::decode).transpose()?;
+
+        // `$2 IS NULL` 时整个谓词为 TRUE, 等价于「无游标, 取第一页」。
+        //
+        //   ('epoch'::timestamptz + $2::bigint * interval '1 microsecond')
+        //
+        // 用整数微秒而非 epoch 毫秒: timestamptz 精度就是微秒, 毫秒会把
+        // 同一毫秒内的多条会话折叠成同一个键。(bigint → double 的隐式转换
+        // 在 ±2^53 微秒内精确, 即约公元 ±285 年, 远大于本系统可用范围。)
         let rows: Vec<ConvRow> = sqlx::query_as(
             r#"
             SELECT c.id, c.environment_id, c.kind, c.metadata, c.created_at
             FROM conversations c
             INNER JOIN conversation_members m ON m.conversation_id = c.id
             WHERE m.user_id = $1
-            ORDER BY c.created_at DESC
-            LIMIT $2
+              AND (
+                    $2::bigint IS NULL
+                    OR (c.created_at, c.id) < (
+                            'epoch'::timestamptz + $2::bigint * interval '1 microsecond',
+                            $3::uuid
+                       )
+                  )
+            ORDER BY c.created_at DESC, c.id DESC
+            LIMIT $4
             "#,
         )
         .bind(user.0)
+        .bind(cursor.map(|(ts, _)| ts.timestamp_micros()))
+        .bind(cursor.map(|(_, id)| id))
         .bind(limit)
         .fetch_all(&self.pool)
         .await

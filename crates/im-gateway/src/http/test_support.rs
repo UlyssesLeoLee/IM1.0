@@ -259,11 +259,17 @@ pub async fn rest_fixture(p: &sqlx::PgPool) -> RestFixture {
         Arc::new(PgConversationRepository::new(p.clone()));
 
     // 种子消息走真实路径(见上方长注释): 分配器 / 幂等 / schema 校验全都不绕。
+    // 拉黑校验同样给真实仓储 —— 替身只能表达 true/false, 表达不了「SQL 查失败」,
+    // 而 DM 的成员查不到对端时正要走那条错误路径。
+    let block_checker: Arc<dyn im_core::relationship::repository::BlockChecker> = Arc::new(
+        im_core::relationship::pg::PgFriendshipRepository::new(p.clone()),
+    );
     let message_service = im_core::message::service::MessageService::new(
         message_repo,
         sequencer,
         events,
         conversation_repo.clone(),
+        block_checker,
     );
     let seed = message_service
         .send_message(im_core::message::service::SendMessageCommand {

@@ -310,7 +310,7 @@ where
                 device_session.id, refresh_raw
             )),
             user_id: user.id,
-            expires_in: 900, // TODO: 读 self.token_service 的 access_ttl
+            expires_in: self.token_service.access_ttl_seconds(),
         })
     }
 

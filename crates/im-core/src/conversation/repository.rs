@@ -88,6 +88,11 @@ pub trait ConversationRepository: Send + Sync {
 
     async fn find_by_id(&self, id: ConversationId) -> Result<Option<Conversation>, AppError>;
 
+    /// 用户参与的会话列表, **按 `(created_at DESC, id DESC)` 排序的 keyset 分页**
+    ///
+    /// `cursor` 由 `crate::conversation::cursor::encode` 生成, 解析失败返
+    /// `Validation`(400)。**实现方必须真的把它下推到 SQL** —— 忽略游标
+    /// 会让接入方拿到无限重复的第 1 页, 而这正是 2026-10-08 修掉的 bug。
     async fn list_for_user(
         &self,
         user: UserId,
@@ -103,16 +108,18 @@ pub trait ConversationRepository: Send + Sync {
     /// - `list_for_user` 服务于 UI 列表: 要完整 `Conversation` 行、要排序、要分页。
     /// - 本方法服务于 **WS 广播成员过滤**: 只需要一个 id 集合, 且**一个都不能少**。
     ///
-    /// `PgConversationRepository::list_for_user` 目前的实现有两个对该用途致命的特点:
-    /// 1. `cursor` 参数**被完全忽略**(形参名 `_cursor`, SQL 里没有 OFFSET) ——
-    ///    所以「翻页取完」这条路根本不存在;
-    /// 2. `ConversationService::list_user_conversations` 把 limit clamp 到
-    ///    1..=50, 而 SQL 又 `LIMIT $2`。
+    /// `PgConversationRepository::list_for_user` 对该用途仍有两个致命特点:
+    /// 1. 有 `limit` 上限(1..=50) —— 超出部分静默丢失;
+    /// 2. 游标一旦出错会整页失败。
     ///
     /// 于是复用它的后果是: **用户加入超过 50 个会话时, 超出部分静默丢失**。
     /// 对 UI 列表, 丢掉的只是「更早的会话还能再翻」; 对广播过滤, 丢掉的
     /// 是「这些会话的实时消息一条都收不到」—— 用户不会看到任何报错, 只会
     /// 以为对方没发言。故单列一个方法。
+    ///
+    /// 2026-10-08 更新: 原文把第 1 条写成「`cursor` 被完全忽略(形参名
+    /// `_cursor`, SQL 里没有 OFFSET), 所以翻页取完这条路根本不存在」。
+    /// 游标已实装, 但「有上限」这一条依然成立, 且它本身就是该方法存在的理由。
     async fn list_all_memberships_for_user(
         &self,
         user: UserId,

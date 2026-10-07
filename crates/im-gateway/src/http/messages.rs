@@ -258,7 +258,13 @@ pub async fn list_messages(
         .map_err(http_err)?;
 
     // 3. 构造响应
-    let has_more = (messages.len() as i32) == q.limit;
+    //
+    // has_more 必须拿**服务端实际采用的**上限去比, 不能用客户端的原始 limit:
+    // service 会把 limit 静默 clamp 到 MAX_PAGE, 传 limit=1000 时只返 200 条,
+    // 于是 `200 == 1000` 为假 → has_more=false → 客户端以为没有更多而停止
+    // 翻页, 第 201 条之后的消息**静默丢失**。
+    let effective_limit = q.limit.clamp(1, im_core::message::service::MAX_PAGE);
+    let has_more = (messages.len() as i32) == effective_limit;
     let next_after_sequence = messages
         .last()
         .map(|m| m.sequence)

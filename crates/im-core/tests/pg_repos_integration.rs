@@ -28,7 +28,7 @@ use im_core::message::sequence::SequenceAllocator;
 use im_core::reaction::pg::PgReactionRepository;
 use im_core::reaction::repository::ReactionRepository;
 use im_core::relationship::pg::PgFriendshipRepository;
-use im_core::relationship::repository::{FriendRequestState, FriendshipRepository};
+use im_core::relationship::repository::{BlockChecker, FriendRequestState, FriendshipRepository};
 
 // ============================================================================
 // 共享测试 Fixtures
@@ -1352,6 +1352,153 @@ async fn link_account_invalid_token_returns_unauthorized() {
     assert!(
         matches!(r, Err(im_common::AppError::Unauthorized(_))),
         "expected Unauthorized, got: {:?}",
+        r
+    );
+}
+
+// ============================================================================
+// GET /v1/conversations —— keyset 分页(2026-10-08 新增)
+//
+// 这个端点从上线起就没真正翻过页: handler 一直在生成并下发 cursor, spec 也
+// 承诺 client 可原样回传, 而 `PgConversationRepository::list_for_user` 把形参
+// 命名成 `_cursor` 直接丢弃 —— 每带一次 cursor 都拿回一模一样的头 N 条。
+// 接入方按规范写的翻页循环会**无限重复第 1 页**。
+//
+// 下面的用例刻意造出 `created_at` **完全相同**的会话: 只按时间比较的 keyset
+// 分页会在这种数据上静默漏行, 必须靠 `(created_at, id)` 复合键才不漏。
+// ============================================================================
+
+/// 造 N 个 conversation 并把 alice 加为成员, 返回 id 列表
+///
+/// `ties` 指定「有多少个会话共享同一个 created_at」——用来逼出缺 tiebreaker 的
+/// 实现。返回的 created_at 基准固定, 保证排序可预测。
+async fn seed_conversations_for_pagination(
+    p: &PgPool,
+    env_id: EnvironmentId,
+    alice: UserId,
+    label: &str,
+) -> Vec<Uuid> {
+    // 基准时间取过去 1 小时, 避免与其他用例的 now() 交错导致顺序不可预测
+    let base: chrono::DateTime<chrono::Utc> = chrono::Utc::now() - chrono::Duration::hours(1);
+    let mut ids = Vec::new();
+    for i in 0..5i32 {
+        // i<3 → 全部落在 base(制造 3 个同刻);i>=3 → base+1s
+        let ts = if i < 3 {
+            base
+        } else {
+            base + chrono::Duration::seconds(1)
+        };
+        let id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO conversations (environment_id, kind, metadata, created_at)
+            VALUES ($1, 'group', '{}'::jsonb, $2)
+            RETURNING id
+            "#,
+        )
+        .bind(env_id.0)
+        .bind(ts)
+        .fetch_one(p)
+        .await
+        .expect("insert conversation");
+        sqlx::query(
+            r#"
+            INSERT INTO conversation_members (conversation_id, user_id, role)
+            VALUES ($1, $2, 'member')
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(id)
+        .bind(alice.0)
+        .execute(p)
+        .await
+        .expect("insert member");
+        ids.push(id);
+    }
+    let _ = label;
+    ids
+}
+
+#[tokio::test]
+async fn list_for_user_cursor_actually_paginates() {
+    let p = pool().await;
+    let (env_id, alice, _bob) = make_env().await;
+    let seeded = seed_conversations_for_pagination(&p, env_id, alice, "cursor").await;
+    let repo = PgConversationRepository::new(p);
+
+    // 按 limit=2 翻到底, 记录每一页拿到的 id
+    let mut seen: Vec<Uuid> = Vec::new();
+    let mut pages: Vec<Vec<Uuid>> = Vec::new();
+    let mut cursor: Option<String> = None;
+
+    for _ in 0..10 {
+        let page = repo
+            .list_for_user(alice, cursor.as_deref(), 2)
+            .await
+            .expect("list_for_user");
+        if page.is_empty() {
+            break;
+        }
+        pages.push(page.iter().map(|c| c.id.0).collect());
+        seen.extend(page.iter().map(|c| c.id.0));
+        let last = page.last().expect("non-empty page");
+        cursor = Some(im_core::conversation::cursor::encode(
+            last.created_at,
+            last.id.0,
+        ));
+    }
+
+    // 1. 必须恰好拿到全部 5 个
+    assert_eq!(
+        seen.len(),
+        5,
+        "翻页必须拿全 5 个会话, 实际拿到 {} 个 (pages={:?})",
+        seen.len(),
+        pages
+    );
+
+    // 2. 一个都不能重复 —— 重复意味着第 1 页末尾和第 2 页开头重叠,
+    //    即 tiebreaker 没生效。
+    let mut uniq = seen.clone();
+    uniq.sort_unstable();
+    uniq.dedup();
+    assert_eq!(
+        uniq.len(),
+        5,
+        "分页结果出现重复会话: {seen:?} —— (created_at, id) 复合键没生效"
+    );
+
+    // 3. 集合必须与 seed 完全一致(既不漏也不多)
+    let mut expected = seeded.clone();
+    expected.sort_unstable();
+    assert_eq!(uniq, expected, "分页结果集合与实际种下的会话不一致");
+
+    // 4. 关键反例: 第 2 页必须与第 1 页**不同**。
+    //    游标被忽略时, 两页内容完全一致, 而上面 1/2/3 条会因为
+    //    seen.len() 恒为 2 而先失败 —— 这条把「重复直到耗尽」这个具体形状
+    //    也单独钉住, 使失败信息直接指向游标而不是「数量不对」。
+    assert!(
+        pages.len() >= 3,
+        "limit=2 / 5 个会话应至少翻 3 页, 实际 {} 页",
+        pages.len()
+    );
+    assert_ne!(
+        pages[0], pages[1],
+        "第 2 页与第 1 页完全相同 —— 游标没有下推到 SQL"
+    );
+}
+
+#[tokio::test]
+async fn list_for_user_invalid_cursor_is_rejected_not_ignored() {
+    let (env_id, alice, _bob) = make_env().await;
+    let _ = env_id;
+    let repo = PgConversationRepository::new(pool().await);
+
+    // 静默降级成「从头开始」是这个 bug 当初的症状本身:
+    // 拿回第 1 页, 客户端以为翻页成功, 于是既不报错也永远拿不到后续页。
+    let r = repo.list_for_user(alice, Some("not-a-cursor"), 2).await;
+    assert!(
+        matches!(r, Err(im_common::AppError::Validation(_))),
+        "非法游标必须报 Validation(400), 实际: {:?}",
         r
     );
 }

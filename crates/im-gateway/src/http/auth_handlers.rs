@@ -31,8 +31,10 @@
 //! - Server exchange 用户 `kind=user` (同上)
 //! - refresh_token 格式 `<session_id>.<raw_uuid>` (per IdentityService::issue_token_pair)
 //! - device_session_id 从 refresh_token 第一段截取 (公开字段,不是 secret)
-//! - 响应字段 `expires_in` 当前写死 900 (15min) per IdentityService::issue_token_pair TODO 备注
-//!   待 V1 抽 `TokenService::access_ttl_seconds()` 后改
+//! - 响应字段 `expires_in` 取自 `TokenService::access_ttl_seconds()`(2026-10-08
+//!   起)。此前写死 900 而 JWT `exp` 取自 `cfg.access_token_ttl_seconds`, 两者
+//!   可以不一致: TTL 调小后客户端会按 900 排刷新, 在 token 已过期后撞 401
+//!   却不触发刷新。接入方正是靠这个字段排定时器, 故必须与签发同源。
 //! - AppState 需含 `identity_service: Arc<IdentityService<...>>` + UserRepository + DeviceSessionRepository
 //!   (state.rs 扩展,main.rs wire-up 留给 D-1 PR)
 //!
@@ -730,6 +732,9 @@ mod tests {
             Arc::new(PgSequenceAllocator::new(p.clone())),
             Arc::new(StubEventPublisher::new()),
             conv_repo,
+            Arc::new(im_core::relationship::pg::PgFriendshipRepository::new(
+                p.clone(),
+            )),
         ));
         let token_service = Arc::new(TokenService::new(
             vec![SigningKey {

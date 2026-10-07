@@ -64,7 +64,7 @@ use im_core::message::pg::{PgMessageRepository, PgSequenceAllocator};
 use im_core::message::repository::{MessageRepository, MessageState, NewMessage};
 use im_core::message::sequence::SequenceAllocator;
 use im_core::relationship::pg::PgFriendshipRepository;
-use im_core::relationship::repository::FriendshipRepository;
+use im_core::relationship::repository::{BlockChecker, FriendshipRepository};
 
 // ============================================================================
 // 计时 / 报告 / 断言

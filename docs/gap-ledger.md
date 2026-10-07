@@ -4094,3 +4094,160 @@ aux-06 §B A-002 声称的是 argon2id(慢, 反暴力破解), 与当前实现的
 > 判据: 「实测比模型快一个数量级」和「实测比模型慢一个数量级」是两类信号, 都
 > 不是「更新文档」级别的观察。前者意味着**模型描述的东西不存在**, 后者意味着
 > **实现的瓶颈被低估**。两者都要先查实现, 再动文档。
+
+## 1.44 【P0】拉黑对消息完全无效 —— 校验函数在, 判断没做 (2026-10-08)
+
+**发现路径**: 机械扫 `let _ =` 时命中 `message/service.rs:256` 的
+`let _ = (other, sender);` —— 与 §1.41(`dm_pairs` 从不被写)、§1.42
+(refresh 哈希被丢弃) **完全同形**: 函数签名、注释、错误码一应俱全, 唯独
+判断这件事没做。
+
+#### 声称 vs 实际
+
+```rust
+// 声称: 「简化版 block 检查: 查 friendships 表 other block 了 sender」
+//       错误码 AppError::UserBlocked 存在, §2e 步骤号 C-2 验收点标注齐全
+async fn check_block(&self, other: UserId, sender: UserId) -> Result<bool, AppError> {
+    // MVP: 返回 false(=不阻止), 完整实装在 C-9 + im-gateway 边界
+    let _ = (other, sender);
+    Ok(false)          // ← 恒 false
+}
+```
+
+调用点还叠了第二重失效:
+
+```rust
+if let Ok(true) = self.check_block(other_id, cmd.sender_id).await { return Err(UserBlocked) }
+```
+
+`if let Ok(..)` 把 `Err` 当成「没被拦下」→ **fail-open**。即使日后 `check_block`
+改成真查询, 数据库抖动也会被当成「没拉黑」而放行。
+
+#### 影响
+
+`POST /v1/friends/{id}/block` 能成功写入 `friendships(state='blocked')`,
+但**没有任何发送路径会读它** —— 已核实 `im-gateway` 侧不存在任何补偿检查
+(HTTP `messages.rs` 与 WS `handler.rs:773` 共用同一个
+`MessageService::send_message`, 全部经由这个空壳)。拉黑后被拉黑者**照样**
+能向 DM 发消息, 客户端收不到任何拒绝。
+
+**为什么拖了两个月**: 文档把它记成「推迟到 C-9」的 P2 stub, 而 C-9(gateway
+全量接线) 早在 2026-10-03 就完成了 —— 推迟项的目标阶段已过, 没人回来做。
+`135-wbs-lane1-final-report.md` / `136-wbs-lane1-verifier-report.md` §8 #3
+都写着这条, 状态始终是 stub。
+
+#### 修法
+
+- 新增窄接口 `BlockChecker`(`is_blocked` 一个方法), 提为
+  `FriendshipRepository` 的**超 trait** —— 依赖面从 6 个方法降到 1 个, 且
+  「能建关系就一定能查拉黑」成为类型层面���约束。
+- `MessageService` 注入 `Arc<dyn BlockChecker>`(第 5 个构造参数, 6 个调用点同步)。
+- `if let Ok(true)` → `?` 上抛: 查不了拉黑状态时宁可发不出去, 不放行。
+- DM 查不到对端成员时返 `Internal` 而非静默跳过 —— 数据异常下「默认允许」
+  会让拉黑再次变成一条查不到根因的静默行为。
+
+#### 用例(4 条, 真 PG)
+
+`c2_step2e_blocked_sender_cannot_send` / `..._blocker_can_still_send` /
+`..._unblocked_dm_still_works` / `..._blocked_sender_cannot_send_in_group`。
+
+前两条成对存在: `is_blocked(user, target)` 问的是「user 被 target 拉黑」,
+参数写反时**两条会同时通过或同时失败**, 单测一条看不出方向; 第三条是对照组
+(没有它, 「所有 DM 消息都被拒」也能让前两条变绿)。第四条把**群聊不做拉黑
+校验**这一范围限制显式钉住, 将来若决定扩到群聊它会红, 从而强制一次有意识
+的决定而不是悄悄改行为。
+
+## 1.45 【P0】`GET /v1/conversations` 的游标分页是假的 (2026-10-08)
+
+#### 声称 vs 实际
+
+- spec: `next_cursor` 可由 client **原样回传**为下一次请求的 `cursor`;
+- `im-gateway/src/http/conversations.rs`: 老老实实生成游标并下发;
+- `PgConversationRepository::list_for_user`: 形参名 **`_cursor`**, SQL 里既没有
+  `OFFSET` 也没有游标谓词 —— **收到即丢弃**。
+
+#### 影响
+
+用户加入 >50 个会话时, 第 1 页返回 `has_more=true` + 一个 cursor; 客户端带
+cursor 请求第 2 页, 拿回**一模一样的 50 条**, `next_cursor` 也一模一样。
+按规范写的循环分页会**无限循环**, 第 51 个之后的会话永远拿不到。客户端会
+判成「服务端有 bug」, 实际是契约层承诺了未实现的能力。
+
+#### 成因: 格式知识只存在于 handler 一侧
+
+游标格式(`created_at_millis:id`)写死在 gateway, 仓储层根本不在乎拿到什么。
+两边各自「正常」, 而 `openapi_contract.rs` 只检查路由存在与否, 看不到这里。
+
+#### 修法
+
+- 抽出 `im_core::conversation::cursor` 作为游标编解码的**单一事实源**,
+  `encode` / `decode` 两侧共用 —— 要么都跟着它变, 要么编译不过。
+- 仓储层实装 keyset: `ORDER BY c.created_at DESC, c.id DESC` +
+  `(c.created_at, c.id) < (cursor_ts, cursor_id)`。
+- 游标精度用**微秒**而非毫秒: `timestamptz` 精度就是微秒, 用毫秒会把同一
+  毫秒内的多条会话折叠成同一个键, 往返有损 → 分页静默漏会话。
+- 游标解析失败返 `Validation`(400), **不**静默降级成「从头开始」—— 静默
+  降级产生的现象与「游标根本没生效」一模一样, 会把排查引向错误方向。
+- `MAX_PAGE` 提为共享常量(见 §1.46 的同类问题)。
+
+#### 用例
+
+- `cursor.rs` 内 5 条单测(PG-free): 微秒往返无损、同一微秒的两条会话游标
+  必须可区分、毫秒旧格式必须被拒、垃圾游标必须报错、越界微秒必须被拒。
+- `list_for_user_cursor_actually_paginates`(真 PG): 刻意造出 3 条
+  `created_at` **完全相同**的会话逼出 tiebreaker, 翻到底断言恰好 5 个、
+  无重复、集合一致, 且**第 2 页 ≠ 第 1 页**(这条把「重复直到耗尽」的具体
+  形状单独钉住, 使失败信息直接指向游标而不是「数量不对」)。
+- `list_for_user_invalid_cursor_is_rejected_not_ignored`(真 PG)。
+
+## 1.46 【P1】`has_more` / `expires_in` / `active`: 三个「算了但没用」 (2026-10-08)
+
+同一形状的三个实例 —— 值算出来了, 但用它的不是它。
+
+| # | 位置 | 声称 | 实际 | 后果 |
+|---|---|---|---|---|
+| a | `http/messages.rs:261` | `has_more` 反映「还有更多」 | 拿客户端**原始** `q.limit` 比, 而 service 静默 clamp 到 200 | 传 `limit=1000` → 返 200 条 → `200 == 1000` 为假 → 客户端**静默停止翻页**, 第 201 条后永久丢失, 响应里无线索 |
+| b | `IdentityService::issue_token_pair` | `expires_in` 告诉客户端还能用多久 | 写死 `900`, 而 JWT `exp` 取自 `cfg.access_token_ttl_seconds` | TTL 调小(如 300)后客户端仍按 900 排刷新, 在 token 已过期后撞 401 却不触发刷新 |
+| c | `main.rs` signing_keys | `SigningKeyConfig.active` 注释「切完 v2 后 v1 active=false」 | `cfg.jwt_signing_keys.iter()` **不看 `active`** | 运维把**已泄漏**的 v1 标 inactive, v1 签的 token 照常验签通过 —— 这是配置里**唯一的密钥吊销手段**, 而它是假的 |
+
+**修法**: a 改成读 `im_core::message::service::MAX_PAGE` 共享常量(会话列表同理);
+b 新增 `TokenService::access_ttl_seconds()`, 与写进 `exp` 的是同一个 `access_ttl`;
+c `main.rs` 改用 `cfg.active_signing_keys()`, inactive 的密钥**既不签发也不验签**,
+并对「有密钥被下线」打 `warn`(这是运维主动操作, 必须留在启动日志里)、
+对「全部 inactive」直接 assert 失败。`active` 缺省为 `true`, 不写该字段的既有
+配置行为不变。
+
+> 判据: 上限 / TTL / 开关这类数字**只能有一个定义处**。同一个值在三处各写一遍
+> 字面量时, 改一处不会让另外两处跟着动, 而它们之间的偏差**不会产生任何报错**
+> —— 三例都是全绿 CI 下长期存在的。
+
+## 1.47 【P1】三个已声明的 ServerFrame 生产从不发送, 接入方却能对着 mock 写断言 (2026-10-08)
+
+`Connected` / `PresenceUpdate` / `ForceDisconnect` 三个变体的全仓构造点:
+
+| 帧 | 生产发送点 | `im-testkit` 样例帧 | 契约测试 |
+|---|---|---|---|
+| `connected` | **无**(实际发 `auth_ok`) | `mock_ws_frames.rs:168/175` | `ws_frames_contract.rs:377` |
+| `presence_update` | **无**(`im-presence` 整个 crate 是 5 行占位, 无事件源) | `:378` | `:453` |
+| `force_disconnect` | **无**(只有本地 `SessionState::force_close()` 置位, 不发帧) | `:407/414` | `:476` |
+
+`hub.rs:368/369/381` 那三处是 `Audience::of` 的**路由规则** match 分支, 不是发送点;
+`hub.rs:592/612/809` 是 `#[cfg(test)]` 单测。
+
+`im-testkit` 侧**不是**自动发送的脚本服务器, 而是一组**样例帧构造函数** ——
+所以严格说不是「mock 制造假绿灯」, 但陷阱等价: 接入方拿
+`connected_frame()` 写接收断言必然全绿, 上生产收到的是 `auth_ok`。
+
+**修法**: 不替规范做裁决(`connected` vs `auth_ok` 哪个是原意仍挂在 §2),
+而把「生产不发」这一事实**标在定义处** —— `ServerFrame` 三个变体各自的 doc
++ `im-testkit` 三个 mock 函数各自的 doc。接入方读到 API 文档时就会知道
+握手成功要断 `auth_ok`、在线状态没有事件源、不能靠 `force_disconnect` 感知被踢。
+
+**未实装(需 owner 裁决, 本轮不动)**:
+
+- `force_disconnect` 缺失的根因是 WS 鉴权**只在建连第一帧做一次**
+  (`handler.rs:330` → `mark_authenticated` 后主循环零复查)。用户 logout /
+  被封号后既有连接**继续收发消息**, 60s 心跳只防死连接, 不防「token 已过期
+  但连接还活着」。修法是在心跳 tick 按 `exp` 定期复查 + 把 hub 连接表按
+  `device_session_id` 建索引供 kick hook 主动踢。
+- `presence_update` 缺失需要 `im-presence` 整个实装, 超出本轮范围。
