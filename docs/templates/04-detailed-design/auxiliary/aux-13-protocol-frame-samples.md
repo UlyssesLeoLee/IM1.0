@@ -285,14 +285,17 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 }
 ```
 
-> **`reactions` 当前恒为 `[]`** —— `hub.rs:423` 硬编码
+> **`reactions` 当前恒为 `[]`** —— `hub.rs:436` 硬编码
 > `reactions: Vec::new()`,reaction 数据**不会**随新消息下行。接入方不应依赖
 > 该字段携带内容,也不应因收到空数组而认为「该消息无人 react」。
-> reaction 的实时下行是另一条路(§1.2.8 `reaction_added`),而该帧生产代码
-> **从不发送**(见其小节说明)。
+> reaction 的实时下行是另一条路(§1.2.8 `reaction_added`),该帧自 2026-10-07
+> 起**生产代码已发送**。
 >
-> `WireMessage` 的 10 个字段在 wire 上**全部恒出现**(`ws_frames.rs:158-173`),
-> 其中 `sender_id` / `reply_to` / `edited_at` 可为 `null`。注意
+> `WireMessage` 的 **11** 个字段在 wire 上**全部恒出现**
+> (`ws_frames.rs:223-238`:`id` `conversation_id` `sequence` `sender_id` `kind`
+> `content` `reply_to` `state` `created_at` `edited_at` `reactions`),
+> 其中 `sender_id` / `reply_to` / `edited_at` 可为 `null`。字段数由契约测试钉住
+> (`ws_frames_contract.rs:690` 断言序列化结果恰好 11 个键)。注意
 > `sender_id` 与 `reply_to` 虽带 `#[serde(default)]`,但**不带**
 > `skip_serializing_if`,故 `default` 只放宽反序列化,**不影响**序列化 ——
 > 接入方不可按「键可能消失」实现。
@@ -306,20 +309,25 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 {
   "type": "message_edited",
   "message_id": "8a7e6679-7425-40de-944b-e07fc1f90ae7",
+  "conversation_id": "6b3e6679-7425-40de-944b-e07fc1f90ae7",
   "content": { "kind": "text", "text": "你好(已编辑)" },
   "edited_at": "2026-08-23T00:01:00Z"
 }
 ```
 
-> **生产代码从不发送本帧。** 形状只有 3 个字段,**没有 `conversation_id`**
-> (`ws_frames.rs:106-110` 即如此定义),广播中枢因此无从判断接收方是否该
-> 会话成员,`hub.rs:361-363` 把本帧归为 `Audience::Undeliverable` 并直接短路。
-> 后果: **编辑消息没有实时同步**,客户端只能靠
+> **生产代码已发送本帧(2026-10-07 起)。** 此前本帧只有 3 个字段、**没有
+> `conversation_id`**,广播中枢无从判断接收方是否该会话成员,`hub.rs` 只能把
+> 本帧归为 `Audience::Undeliverable` 并在 `publish` 里直接短路 —— 后果是
+> **编辑消息没有任何实时同步**,客户端只能靠
 > `GET /v1/conversations/{id}/messages`(§3.4)拉取。
 >
-> **补 `conversation_id` 属 wire 形状变更(协议变更),不由实现方拍板**,
-> 待规范所有者裁决。在此之前本节**如实保留当前形状**并标注「不发送」,
-> 不擅自加字段。接入方可照此形状实现解析分支,但不必等待该帧到来。
+> 现已补上**必填单态** `conversation_id`(`ws_frames.rs:170`,类型 `Uuid`,
+> **非** `Option`),它与 `message_new` 走同一条定向投递路径,**非本会话成员
+> 绝不收到**。选单态而非 `Option<Uuid>`: 仓里踩过一次二态的坑(`None` 退化成
+> 「发给所有人」= 跨会话泄漏),单态从**类型上**根除了那条分支。
+>
+> wire 兼容性: 本帧此前**从未被发送过**,平台尚未发布,故加字段不破坏任何
+> 已部署的接入方。
 
 #### 1.2.7 `message_recalled`
 
@@ -337,17 +345,22 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 {
   "type": "reaction_added",
   "message_id": "8a7e6679-7425-40de-944b-e07fc1f90ae7",
+  "conversation_id": "6b3e6679-7425-40de-944b-e07fc1f90ae7",
   "user_id": "2b3e6679-7425-40de-944b-e07fc1f90ae7",
   "emoji": "👍"
 }
 ```
 
-> **生产代码从不发送本帧**,原因同 §1.2.6:形状**没有 `conversation_id`**
-> (`ws_frames.rs:117-121`),`hub.rs:364-366` 归为 `Undeliverable`。发给别人
-> 即跨会话泄漏,故宁可不发。
+> **生产代码已发送本帧(2026-10-07 起)。** 此前形状**没有 `conversation_id`**,
+> `hub.rs` 归为 `Audience::Undeliverable`: 发给别人即跨会话泄漏,而且会顺带
+> 泄漏「谁对哪条消息点了什么表情」—— 那是会话内的用户行为信息,故当时宁可不发。
 >
-> 客户端 `react` 帧仍会**落库并回 `ack`**(§1.1.5),只是**没有**实时下行
-> 通知。是否补 `conversation_id` 属协议变更,待规范所有者裁决。
+> 现已补上**必填单态** `conversation_id`(`ws_frames.rs:184`),由
+> `ReactionService::add_reaction_with_context` 从它**本就已经加载**的 message
+> 带出,**不额外查库**。幂等重放(`inserted == false`,即同一用户重复点同一
+> 表情)**不广播** —— 否则所有在线端会看到同一个表情被重复动画一次。
+>
+> wire 兼容性: 本帧此前**从未被发送过**,故加字段不破坏任何已部署接入方。
 
 #### 1.2.9 `presence_update`
 
@@ -450,14 +463,19 @@ Tech Lead。任何协议变更必须同时更新本表与 `DetailedDesign.md` �
 `auth_ok.req_id` 为 `null`。鉴权后再发 `auth` 会被判为重复鉴权
 (`handler.rs:416`)。
 
-**3) `auth_ok` 不在 `ServerFrame` 枚举里,本文档不给它 schema。**
-鉴权成功后服务端回的是 `{"type":"auth_ok","req_id":...}`,由
-`crates/im-gateway/src/ws/handler.rs:381-384` 的裸 `serde_json::json!`
-构造并直发,**绕过整个 `im_protocol` 类型体系** —— 它不是 `ServerFrame`
-的任何变体,本文档 §1.2 也从未定义它(§1.2.1 定义的是 `connected`)。
-因此本表**没有**它的规范文本可供校验,本文档**不**为它编造 schema,接入方
-**自行构造**并按「`type` 恒为 `auth_ok` + 回显 `req_id`(可 null)」处理即可。
-它是否本应是 `connected`(或某个新帧类型)属规范级裁决,见 §11。
+**3) `auth_ok` 自 2026-10-07 起已在 `ServerFrame` 枚举里,但 §1.2 仍未定义它。**
+§1.2.1 定义的是 `connected`,而代码实际发的是 `auth_ok`,两边对不上,且**无任何
+文档说明哪个才是原意** —— 该归属仍待裁决,见 §11 #1。
+
+2026-10-07 之前,鉴权成功后服务端回的是 `{"type":"auth_ok","req_id":...}`,由
+`crates/im-gateway/src/ws/handler.rs` 的裸 `serde_json::json!` 构造并直发,
+**绕过整个 `im_protocol` 类型体系** —— 它不是 `ServerFrame` 的任何变体,于是
+不受任何门禁、契约测试或 `im-testkit` 覆盖,serde 定义若变它也不会跟着变。
+现已收进枚举(`ServerFrame::AuthOk { req_id }`),**wire 形状逐字节不变**。
+
+接入方按「`type` 恒为 `auth_ok` + 回显 `req_id`(**键恒存在**,可为 `null`)」
+处理即可:`req_id` 刻意**不加** `skip_serializing_if`,加了键就会消失,那就不
+是「wire 不变」而是改形状了。
 
 > 鉴权**失败**时服务端**不回** `auth_ok`,而是回一条 `ok=false` 的 `ack`
 > 帧(§1.2.4)并关闭连接。
@@ -1096,6 +1114,7 @@ grpcurl -plaintext -d '{"access_token":"eyJ..."}' \
 | 1.0.0 | YYYY-MM-DD | (模板初版) | 初版通用模板 |
 | 1.1.0 | 2026-08-23 | Mavis 辅助 | 填实 IM1.0:§1 WS 12 个帧(双向);§2 gRPC 4 个核心 RPC + proto 示例;§3 REST 7 个端点 + 错误通用格式;§4 JSON Schema 6 种 kind + Conversation metadata 命名空间;§5 调试命令 wscat/grpcurl/curl;§6 协议版本与冻结流程;全表命名从 `room_id`/`chat_rooms` 改为 `conversation_id`/`conversations` 对齐 aux-01 |
 | 1.1.1 | 2026-09-01 | 架构师 (Mavis 接手 agent per DEC-008) | **[PROTOCOL-FROZEN-PATCH]** B-4 补丁(aux-13 §7 流程豁免,理由:补缺失样例非新元素):新增 §2.5 gRPC `RespondFriendRequest` 样例 + proto 块(原错误映射表 §2.5 → §2.6);新增 §3.7 REST `POST /v1/friends/requests/{id}/respond` 接受/拒绝 curl + 204/404/403/409 错误样例(原通用错误格式 §3.7 → §3.8);修复 ImplementationSpec §16 P2-3 已知缺口;不新增协议元素,端点与 RPC 早在 2026-08-26 [PROTOCOL-FROZEN] (commit 12c7662) 冻结 |
+| 1.1.3 | 2026-10-07 | Mavis | **协议文档追平 2026-10-07 的代码事实**(owner 拍板 #1 #2 落地后同步; 不改任何 Rust 代码):①§1.2.6 `message_edited` 与 §1.2.8 `reaction_added` 的**样例 JSON 补 `conversation_id`** —— 原样例是 3/4 字段的旧形状, 接入方照抄会**解析不出真实下行的帧**; ②两处「生产代码从不发送」注解改写为已发送 + 定向投递语义; ③§1.2.5 更正 `WireMessage` 字段数 **10 → 11**(契约测试 `ws_frames_contract.rs:690` 钉住 11)与 `hub.rs` 行号; ④§1.4 第 3 条重写: `auth_ok` **已在** `ServerFrame` 枚举里(wire 逐字节不变), 不再「不在枚举里」; ⑤§11 #2 标注已实装并修一处 markdown 反引号错位。**逐条依据见各小节内联的 `文件:行号`** |
 | 1.1.2 | 2026-10-06 | Mavis (lane/proto-doc-align) | **样例与代码对齐**(不改任何 Rust 代码, 帧集合仍为 8 + 10):①全部 `content` 样例补内层 `"kind"`(`MessageContent` 是标记枚举, 缺则被 `from_value::<MessageContent>` 拒为 `VALIDATION_ERROR`);②WS 错误体补必填 `ts`, `trace_id` 更正为恒空串(非 `tr_01HXY...`);③`pong.ts` 更正为非严格回显(省略时回 `0`);④标注 `message_new.reactions` 恒为 `[]`;⑤标注外层 `kind` 与 `content.kind` 不互相校验(外层只能声明 `type: string`);⑥新增 §1.4 三条实现事实(未知字段静默忽略 / `auth` 首帧 `req_id` 可选 / `auth_ok` 不在枚举内);⑦新增 §11 待裁决开放项;⑧标注 `message_edited`/`reaction_added`/`connected` 生产代码不发送。逐条依据见各小节内联的 `文件:行号` |
 
 ## 11. 待规范所有者裁决的开放项
@@ -1106,7 +1125,7 @@ grpcurl -plaintext -d '{"access_token":"eyJ..."}' \
 | # | 开放项 | 状态 | 现状(代码事实) |
 |---|---|---|---|
 | 1 | `auth_ok` 是否应为 `connected`,或另立帧类型 | ✅ **已拍板 2026-10-07** | 采纳「另立帧类型」: 新增 `ServerFrame::AuthOk { req_id }`, **wire 逐字节不变**。`connected` 保留不动(`im-testkit` mock server 在用)。**`auth_ok` 是否本应是 `connected` 的别名仍未裁决** —— 收进枚举只让现状有类型/有测试/可被 AsyncAPI 建模, 不主张二者等同 |
-| 2 | `message_edited` / `reaction_added` 是否补 `conversation_id` | ✅ **已拍板 2026-10-07** | 采纳: 两帧补**必填单态** `conversation_id`, 并启用定向广播。**选单态而非 `Option`** —— 仓里踩过一次二态的坑(`None` 退化成「发给所有人」= 跨会话泄漏); 单态从类型上根除那条分支。wire 兼容性: 两帧此前**从未被发送过`, 加字段不破坏任何已部署接入方 |
+| 2 | `message_edited` / `reaction_added` 是否补 `conversation_id` | ✅ **已拍板并实装 2026-10-07** | 采纳: 两帧补**必填单态** `conversation_id`, 并启用定向广播(`handle_edit_message` / `handle_react` 均已接线)。**选单态而非 `Option`** —— 仓里踩过一次二态的坑(`None` 退化成「发给所有人」= 跨会话泄漏); 单态从类型上根除那条分支。wire 兼容性: 两帧此前**从未被发送过**, 加字段不破坏任何已部署接入方 |
 | 3 | 外层 `kind` 是否应校验与 `content.kind` 一致 | ⏳ 仍开放 | 外层是自由 `String`(`ws_frames.rs`), 不校验, 可不一致并原样下行 | 收紧会拒掉当前合法的既有客户端帧 |
 | 4 | WS 侧 `trace_id` 恒为空串 | ⏳ 仍开放 | `handler.rs:148` 写死 `""` | 补 trace 需引入链路追踪基建, 非本表范围 |
 
