@@ -531,6 +531,27 @@ async fn dm_with_members() -> (
         .await
         .unwrap();
     let svc = im_core::conversation::service::ConversationService::new(repo);
+
+    // 2026-10-08: 把 sequence 游标推到 101(即「已分配出 1..=100」)。
+    //
+    // 起因是 `ConversationService::mark_read` 开始把 sequence **夹紧**到该会话
+    // 已分配的最大 sequence(修「客户端传 i64::MAX 把读指针永久顶死」)。而本夹具
+    // 建的是**零消息**的新 DM, max = 0, 于是下面 6 个用例上报的 7 / 42 / 55 / 100
+    // 全被压成 0:
+    //   - 5 个直接断言失败;
+    //   - `repeated_mark_read_skips_the_write` **假绿** —— 两次调用都成了
+    //     no-op, 「不推进所以 xmin 不变」恒成立, 它要验的「值不变时仍跳写」
+    //     已经不存在了。假绿比红灯更危险, 所以一并在这里修。
+    //
+    // 断言一个字都没改: 这 6 个用例验的是读指针的**不变量**(单调 / 幂等 /
+    // 非成员无副作用 / 互不影响 / 值不变时跳写), 与夹紧无关, 只是原先的
+    // 夹具让那些 sequence 落不到真实存在的范围内。
+    sqlx::query("UPDATE conversation_sequences SET next_sequence = 101 WHERE conversation_id = $1")
+        .bind(conv.id.0)
+        .execute(&p)
+        .await
+        .expect("seed sequence cursor so mark_read clamps are no-ops for these tests");
+
     (svc, p, env, alice, bob, carol, conv.id)
 }
 

@@ -4430,6 +4430,31 @@ max 顶上去, 而不是把断言改成 1。走的是真实 `send_message` 路�
   `Validation`, **且读指针没被动过**(拒绝必须无副作用)。
 - `mark_read_by_non_member_is_forbidden_and_never_touches_the_pointer`。
 
+#### CI 抓到的一处「假绿」—— 比红灯更值得记
+
+`63880d3` 的 CI 红了: `pg_repos_integration.rs` 里 **6 个既有** mark_read 用例
+有 **5 个**失败(`mark_read_advances_the_pointer` / `..._never_moves_backwards` /
+`repeated_mark_read_is_idempotent` / `..._by_non_member_...` /
+`..._does_not_affect_other_members_pointers`)。
+
+根因: 这 6 个用例共用 `dm_with_members()` 夹具, 它建的是**零消息**的新 DM,
+`max_allocated_sequence = 0`, 于是它们上报的 7 / 42 / 55 / 100 全被夹成 0。
+
+**第 6 个 `repeated_mark_read_skips_the_write` 却「通过」了** —— 那才是关键。
+它验的是「值没变时 UPDATE 不产生新行版本(读 `xmin` 比对)」。夹紧之后两次
+`mark_read` **都成了 no-op**, 于是「不推进 → xmin 不变」恒成立, 它要验的
+「值不变时仍跳写」**已经不存在了**, 而它照样绿。
+
+> 判据: 一个新加的约束若把某条用例的**前提**清空, 那条用例会变成**假绿**而不是
+> 变红 —— 它还在断言, 只是断言的东西恒真。CI 只报 5 红不报这 1 个假绿, 靠的是我
+> 数了一下「6 个用共用夹具, 为什么只红 5 个」。**「失败的条数」与「受影响的
+> 条数」不等时, 多出来的那几条要先怀疑自己变假绿了**, 而不是庆幸它没红。
+
+修法: 在 `dm_with_members()` 里把 sequence 游标推到 101(等价「已分配出
+1..=100」), 覆盖全部用到的 sequence。**一个断言都没改** —— 这 6 个用例验的是
+读指针的不变量(单调 / 幂等 / 非成员无副作用 / 互不影响 / 值不变时跳写), 与
+夹紧无关, 只是原先的夹具让那些 sequence 落不到真实存在的范围内。
+
 ## 1.51 未实装: `openapi_contract` 的反向检查(代码 → 规范)零覆盖 (2026-10-08)
 
 `openapi_contract.rs` 现有三条: ① 规范里每条 operation 都必须在 actix 路由表里
