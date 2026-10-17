@@ -45,6 +45,23 @@ fn run_mock_switch_reader() -> serde_json::Value {
     serde_json::from_slice(&output.stdout).expect("output must be valid JSON")
 }
 
+/// 读取某个 plugin 真实声明的 module 名单 (来自 Python helper 读回的 .aci.json)。
+///
+/// **这条辅助函数是本文件所有「名单类断言」的基础** —— 断言必须比对
+/// helper 真正读到的名单, 而不是拿写死的列表和自己比 (那种写法恒绿)。
+fn module_names(state: &serde_json::Value, plugin: &str) -> Vec<String> {
+    state["plugins"][plugin]["modules"]
+        .as_array()
+        .unwrap_or_else(|| panic!("plugins.{plugin}.modules must be an array"))
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .unwrap_or_else(|| panic!("module entry must be a string"))
+                .to_string()
+        })
+        .collect()
+}
+
 #[test]
 fn module_switch_total_count_is_28() {
     let state = run_mock_switch_reader();
@@ -69,16 +86,24 @@ fn mock_grpc_has_4_modules() {
     let grpc = &state["plugins"]["mock_grpc"];
     assert_eq!(grpc["modules_total"].as_u64().unwrap(), 4);
     assert_eq!(grpc["modules_enabled"].as_u64().unwrap(), 4);
-    let expected = vec![
-        "send_message",
-        "list_messages",
-        "validate_access_token",
-        "mark_read",
+
+    // 比对 helper **真正读回的名单**, 不是拿 expected 和它自己的副本比。
+    // v0.1 的写法是 `let actual = expected.to_vec()` 再 contains ——
+    // 无论 helper 返回什么都会通过。
+    let expected: Vec<String> = vec![
+        "list_messages".to_string(),
+        "mark_read".to_string(),
+        "send_message".to_string(),
+        "validate_access_token".to_string(),
     ];
-    let actual: Vec<&str> = expected.to_vec();
-    for name in &expected {
-        assert!(actual.contains(name), "mock_grpc missing module {}", name);
-    }
+    let mut actual = module_names(&state, "mock_grpc");
+    actual.sort();
+    let mut expected_sorted = expected.clone();
+    expected_sorted.sort();
+    assert_eq!(
+        actual, expected_sorted,
+        "mock_grpc module names must match .aci.json exactly"
+    );
 }
 
 #[test]
@@ -87,6 +112,23 @@ fn mock_rest_has_7_modules() {
     let rest = &state["plugins"]["mock_rest"];
     assert_eq!(rest["modules_total"].as_u64().unwrap(), 7);
     assert_eq!(rest["modules_enabled"].as_u64().unwrap(), 7);
+
+    let mut expected: Vec<String> = vec![
+        "create_conversation".to_string(),
+        "error_responses".to_string(),
+        "guest_register".to_string(),
+        "list_messages_rest".to_string(),
+        "login".to_string(),
+        "presign_media".to_string(),
+        "send_message_rest".to_string(),
+    ];
+    let mut actual = module_names(&state, "mock_rest");
+    actual.sort();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "mock_rest module names must match .aci.json"
+    );
 }
 
 #[test]
@@ -95,6 +137,27 @@ fn mock_ws_frames_has_9_modules_including_server_frames_aggregation() {
     let ws = &state["plugins"]["mock_ws_frames"];
     assert_eq!(ws["modules_total"].as_u64().unwrap(), 9);
     assert_eq!(ws["modules_enabled"].as_u64().unwrap(), 9);
+
+    // server_frames 是聚合项; 其余 8 个与 §1.47 点名的「声明了但生产不发送」
+    // 帧相关 —— 名单必须显式列出, 否则增减一个都无人察觉
+    let mut expected: Vec<String> = vec![
+        "auth".to_string(),
+        "edit_message".to_string(),
+        "mark_read".to_string(),
+        "ping".to_string(),
+        "react".to_string(),
+        "recall_message".to_string(),
+        "send_message".to_string(),
+        "server_frames".to_string(),
+        "typing".to_string(),
+    ];
+    let mut actual = module_names(&state, "mock_ws_frames");
+    actual.sort();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "mock_ws_frames module names must match .aci.json"
+    );
 }
 
 #[test]
@@ -103,6 +166,19 @@ fn assertions_plugin_has_3_modules_unchanged_from_pr23() {
     let a = &state["plugins"]["assertions"];
     assert_eq!(a["modules_total"].as_u64().unwrap(), 3);
     assert_eq!(a["modules_enabled"].as_u64().unwrap(), 3);
+
+    let mut expected: Vec<String> = vec![
+        "assert_error_code".to_string(),
+        "assert_json_schema".to_string(),
+        "assert_ws_frame_shape".to_string(),
+    ];
+    let mut actual = module_names(&state, "assertions");
+    actual.sort();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "assertions module names must match .aci.json"
+    );
 }
 
 #[test]
@@ -111,6 +187,45 @@ fn fixtures_plugin_has_5_modules_unchanged_from_pr23() {
     let f = &state["plugins"]["fixtures"];
     assert_eq!(f["modules_total"].as_u64().unwrap(), 5);
     assert_eq!(f["modules_enabled"].as_u64().unwrap(), 5);
+
+    let mut expected: Vec<String> = vec![
+        "device".to_string(),
+        "message".to_string(),
+        "session".to_string(),
+        "tenant".to_string(),
+        "user".to_string(),
+    ];
+    let mut actual = module_names(&state, "fixtures");
+    actual.sort();
+    expected.sort();
+    assert_eq!(
+        actual, expected,
+        "fixtures module names must match .aci.json"
+    );
+}
+
+/// 汇总约束: 5 个 plugin 的名单长度之和 == summary.modules_total == 28。
+///
+/// 这是防止「某 plugin 悄悄少一个 module 而总数不变」的那道交叉校验 ——
+/// 只断言总数, 不交叉核对名单, 仍然可能漏。
+#[test]
+fn per_plugin_module_name_counts_sum_to_total() {
+    let state = run_mock_switch_reader();
+    let plugins = state["plugins"]
+        .as_object()
+        .expect("plugins must be object");
+    let mut sum: u64 = 0;
+    for (pid, _pl) in plugins.iter() {
+        let n = module_names(&state, pid).len() as u64;
+        assert!(n > 0, "plugin {pid} declares zero modules");
+        sum += n;
+    }
+    assert_eq!(
+        sum,
+        state["summary"]["modules_total"].as_u64().unwrap(),
+        "sum of per-plugin module name counts must equal summary.modules_total"
+    );
+    assert_eq!(sum, 28);
 }
 
 #[test]
