@@ -180,6 +180,11 @@ pub fn connected_frame() -> ServerFrame {
 }
 
 /// §1.2.1 `connected` —— JSON Value 版
+///
+/// ## ⚠ 与 [`connected_frame`] 同: 生产从不发送本帧 (per §1.47)
+///
+/// 握手成功请断 `auth_ok` (`ServerFrame::AuthOk`), 不是 `connected`。拿本函数
+/// 写的断言必然全绿, 接生产却收不到 —— `docs/gap-ledger.md` §1.45 记的那类陷阱。
 pub fn connected_json() -> Value {
     json!({
         "type": "connected",

@@ -66,9 +66,17 @@ class MockSwitchReader:
 
             p_modules_total = 0
             p_modules_enabled = 0
+            # 真实 module 名单 (排序) + 逐个 enabled 状态。
+            #
+            # v0.1 只输出 modules_total / modules_enabled 两个**计数**, 于是
+            # 下游测试无法核对「到底是哪几个 module」—— 名单对不上也发现不了
+            # (im_testkit_module_switch.rs 那条恒绿的 `expected.to_vec()` 就是
+            # 这么活下来的)。计数能对上而名单实际错了, 是恒绿结构。
+            p_module_names: list[str] = []
             for module_id, module in plugin.get("modules", {}).items():
                 modules_total += 1
                 p_modules_total += 1
+                p_module_names.append(module_id)
                 if bool(module.get("enabled", False)):
                     modules_enabled += 1
                     p_modules_enabled += 1
@@ -79,6 +87,7 @@ class MockSwitchReader:
                 "default_mode": plugin.get("default_mode", "offline"),
                 "modules_total": p_modules_total,
                 "modules_enabled": p_modules_enabled,
+                "modules": sorted(p_module_names),
             }
 
         return {

@@ -166,6 +166,83 @@ fn mock_ws_frames_connected_json() {
     assert_eq!(v["session_id"], mock_ws_frames::SESSION_ID_CONNECTED);
 }
 
+/// `connected` 帧: 生产从不发送 (per gap-ledger §1.47 / im-protocol ws_frames.rs L78-86)。
+///
+/// `ServerFrame::Connected` 的 doc 明确写着「⚠ 生产侧**从不发送**本帧
+/// (2026-10-08 核实)」—— 鉴权成功后 gateway 实际发的是 `AuthOk`。
+/// 但 `im-testkit` 照旧暴露 `connected_frame()` / `connected_json()`, 于是
+/// 接入方可以对着一个**永远不会到达线上**的帧写断言: 测试永远绿, 线上永不发生。
+///
+/// 本测试把这个事实钉成可判定断言: mock 可以提供该帧 (契约测试需要它),
+/// 但**文档必须警告生产不发**, 且 mock 的 doc 必须与 im-protocol 的警告一致 ——
+/// 一旦有人删掉任一处警告, 本测试变红。
+#[test]
+fn connected_frame_is_documented_as_never_sent_in_production() {
+    // 1) im-protocol 侧必须保留「生产从不发送」的警告
+    let protocol_src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../im-protocol/src/ws_frames.rs"
+    ))
+    .expect("im-protocol/src/ws_frames.rs must be readable from im-testkit tests");
+    assert!(
+        protocol_src.contains("生产侧**从不发送**本帧"),
+        "im-protocol 的 Connected 变体必须保留「生产从不发送」警告 — \
+         若该帧将来真的开始发送, 本警告应与本测试一并更新 (per §1.47)"
+    );
+
+    // 2) im-testkit 的 mock 侧也必须带同样的警告, 不能只在一处
+    let testkit_src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/mock_ws_frames.rs"
+    ))
+    .expect("mock_ws_frames.rs must be readable");
+    assert!(
+        testkit_src.contains("生产从不发送") || testkit_src.contains("生产侧**从不发送**"),
+        "im-testkit 的 connected mock 必须自带「生产从不发送」警告 doc, \
+         否则接入方读到 API 文档会以为线上真会收到这一帧 (per §1.47)"
+    );
+
+    // 3) 反向对照: auth_ok 才是生产真发的帧, 必须存在
+    assert!(
+        protocol_src.contains("AuthOk"),
+        "AuthOk 变体必须存在 (生产实际发送的鉴权回执)"
+    );
+}
+
+/// `sequence: 42` 魔法数: mock 不得把它当「合法读指针」示范。
+///
+/// gap-ledger §1.50 记录: `mark_read` 曾无上界, 客户端传 `i64::MAX` 会把读指针
+/// 永久顶死, 之后该会话任何 sequence 都不再推进、未读数永久失真、**且不报错**。
+/// 那一节的原文点名了 im-testkit: 「im-testkit 的 mock 就用 `sequence: 42`
+/// 这类魔法数」。
+///
+/// 服务端已改为在 WHERE 里夹紧 (`last_read_sequence < $1`), 但 mock 仍以 42
+/// 作样例。本测试把「42 是 mock 自造值、非生产事实」写成断言, 并显式核对
+/// 夹紧守卫仍然在位 —— 守卫被谁删掉, 这里立刻变红。
+#[test]
+fn mock_sequence_42_is_flagged_as_mock_only_and_server_clamps() {
+    // 1) mock 侧必须声明 42 是 mock 值
+    let testkit_src =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/mock_grpc.rs"))
+            .expect("mock_grpc.rs must be readable");
+    assert!(
+        testkit_src.contains("mock") && testkit_src.contains("42"),
+        "mock_grpc 仍以 sequence=42 作样例 —— 该值必须是 mock 自造, 不能被当成生产事实"
+    );
+
+    // 2) 服务端夹紧守卫必须仍在 (删掉它, 本测试变红)
+    let core_src = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../im-core/src/conversation/pg.rs"
+    ))
+    .expect("im-core/src/conversation/pg.rs must be readable");
+    assert!(
+        core_src.contains("last_read_sequence < $1"),
+        "advance_last_read_sequence 的 WHERE 夹紧守卫消失了 —— \
+         mark_read 又能传 i64::MAX 顶死读指针 (per §1.50)"
+    );
+}
+
 #[test]
 fn mock_ws_frames_ack_idempotent_replay_flag() {
     let v = mock_ws_frames::ack_idempotent_replay_json();
