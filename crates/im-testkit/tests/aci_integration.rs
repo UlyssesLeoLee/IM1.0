@@ -109,7 +109,8 @@ fn test_aci_schema_v0_1_roundtrip() {
 /// - emit_ws_frame_assertion 配对 im-testkit `assert_ws_frame_shape` (字段名 parity)
 #[test]
 fn test_im_testkit_emits_valid_aci_assertion() {
-    let assertion = aci_emitter_helper::emit_smoke_assertion();
+    // 实测 15ms 在 100ms 预算内 -> PASS 分支
+    let assertion = aci_emitter_helper::emit_smoke_assertion(15);
 
     // 1) 10 必填字段非空
     assert_eq!(assertion.assertion_id, "im1.0:smoke:g-1");
@@ -119,6 +120,11 @@ fn test_im_testkit_emits_valid_aci_assertion() {
     assert_eq!(assertion.scope.module.as_deref(), Some("smoke"));
     assert_eq!(assertion.status, Status::Pass);
     assert_eq!(assertion.severity, Severity::Info);
+    assert!(
+        !assertion.reasoning.contains("placeholder"),
+        "reasoning must not be a placeholder: {}",
+        assertion.reasoning
+    );
     assert!(
         !assertion.reasoning.is_empty(),
         "reasoning must be non-empty (per §4.3.3)"
@@ -171,9 +177,91 @@ fn test_im_testkit_emits_valid_aci_assertion() {
     assert_eq!(ws_assertion.expect.value, serde_json::json!("connected"));
 
     // 5) smoke helper 单独打印 JSON (供 aci-smoke.sh 抓 stdout)
-    let pretty = aci_emitter_helper::emit_smoke_assertion_json();
+    let pretty = aci_emitter_helper::emit_smoke_assertion_json(15);
     assert!(pretty.contains("im1.0:smoke:g-1"));
     eprintln!("=== emit_smoke_assertion JSON ===\n{pretty}\n=== END ===");
+}
+
+/// IT-4: latency 断言的 FAIL 路径真实可达 (v0.1 缺失的判别力)。
+///
+/// v0.1 的 `emit_smoke_assertion()` 不接受输入, actual 写死 15ms、status 写死
+/// PASS —— 无论被测代码多慢, 这条断言都绿。本 IT 用**真实实测值**证明:
+/// - 实测 250ms / 预算 100ms -> FAIL + severity=high
+/// - 实测 15ms  / 预算 100ms -> PASS + severity=info
+/// - 「测不了」可表达成 SKIP, 而非伪装成 PASS
+#[test]
+fn test_aci_latency_assertion_has_teeth() {
+    // 1) 超预算必须 FAIL
+    let slow = aci_emitter_helper::emit_smoke_assertion(250);
+    assert_eq!(
+        slow.status,
+        Status::Fail,
+        "250ms over a 100ms budget must NOT report PASS"
+    );
+    assert_eq!(slow.severity, Severity::High);
+    assert_eq!(slow.actual.value, serde_json::json!(250));
+    assert!(
+        slow.reasoning.contains("EXCEEDS"),
+        "FAIL must state the violation: {}",
+        slow.reasoning
+    );
+
+    // 2) 同一断言在预算内 -> PASS (证明状态是算出来的, 不是写死的)
+    let fast = aci_emitter_helper::emit_smoke_assertion(15);
+    assert_eq!(fast.status, Status::Pass);
+    assert_ne!(
+        fast.status, slow.status,
+        "same helper must produce different status for different measurements"
+    );
+
+    // 3) 自定义预算: 30ms / 20ms 预算 -> FAIL (证明不是写死 100)
+    let tight = aci_emitter_helper::emit_smoke_assertion_with_budget(30, 20);
+    assert_eq!(tight.status, Status::Fail);
+    assert_eq!(tight.expect.value, serde_json::json!(20));
+
+    // 4) SKIP 路径可达 (依赖未就绪时不能伪装成 PASS)
+    let skipped = aci_emitter_helper::emit_latency_assertion(
+        "im1.0:smoke:db",
+        0,
+        100,
+        Status::Skip,
+        Severity::Low,
+        "postgres not reachable",
+    );
+    assert_eq!(skipped.status, Status::Skip);
+}
+
+/// IT-5: WS frame kind 不符时必须 FAIL (v0.1 恒绿的直接对照)。
+#[test]
+fn test_aci_ws_frame_kind_mismatch_fails() {
+    let ok =
+        aci_emitter_helper::emit_ws_frame_assertion_with_observed("connected", "connected", true);
+    assert_eq!(ok.status, Status::Pass);
+
+    // 期望 connected, 实测拿到 pong -> FAIL
+    let mismatch =
+        aci_emitter_helper::emit_ws_frame_assertion_with_observed("connected", "pong", true);
+    assert_eq!(
+        mismatch.status,
+        Status::Fail,
+        "observed kind 'pong' vs expected 'connected' must NOT report PASS"
+    );
+    assert_eq!(mismatch.expect.value, serde_json::json!("connected"));
+    assert_eq!(mismatch.actual.value, serde_json::json!("pong"));
+    assert!(
+        mismatch.reasoning.contains("MISMATCH"),
+        "{}",
+        mismatch.reasoning
+    );
+
+    // shape 校验失败也必须 FAIL
+    let shape_fail = aci_emitter_helper::emit_ws_frame_assertion_with_observed("ack", "ack", false);
+    assert_eq!(shape_fail.status, Status::Fail);
+    assert!(
+        shape_fail.reasoning.contains("SHAPE"),
+        "{}",
+        shape_fail.reasoning
+    );
 }
 
 /// IT-3: IM1.0 Rust emitter 与 Star Python emitter 跨语言 parity (字段名 1:1)。
@@ -205,7 +293,7 @@ fn test_aci_emitter_v0_1_compatibility() {
             ExpectActual::new(
                 ExpectValueType::ResponseWithinMs,
                 serde_json::json!(15),
-                "measured 15ms (placeholder)",
+                "measured 15ms",
             ),
             Status::Pass,
             Severity::Info,
