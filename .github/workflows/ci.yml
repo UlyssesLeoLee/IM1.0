@@ -26,7 +26,7 @@ jobs:
       # tag 可被仓库所有者**静默重指向**到任意 commit —— 这是真实的供应链攻击面,
       # 而本仓的 CI runner 能拿到 ghcr.io 推送凭据与部署 kubeconfig。
       # 尾注释保留可读版本号, 便于日后 bump。
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           # 该 action 的 `@stable` 是**分支语义**(表示「用最新 stable Rust」),
@@ -106,7 +106,7 @@ jobs:
       # 实际一个都没跑。见 docs/gap-ledger.md §1.15 / §1.22。
       IM_REQUIRE_PG: "1"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: stable   # 钉 action 的 SHA 后需显式保留「跟随最新 stable」语义
@@ -161,7 +161,7 @@ jobs:
       # 实际一个都没跑。见 docs/gap-ledger.md §1.15 / §1.22。
       IM_REQUIRE_PG: "1"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: stable   # 钉 action 的 SHA 后需显式保留「跟随最新 stable」语义
@@ -272,7 +272,7 @@ jobs:
     name: Static Analysis
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           toolchain: stable   # 钉 action 的 SHA 后需显式保留「跟随最新 stable」语义
@@ -512,7 +512,7 @@ jobs:
     name: Distributable (linux-x64)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
           # 同其余 job: 钉 action 的 SHA, 同时用 toolchain 保留「跟随最新 stable」。
@@ -549,7 +549,7 @@ jobs:
           sha=$(git rev-parse --short HEAD)
           echo "name=${base}-${sha}" >> "$GITHUB_OUTPUT"
           echo "artifact: ${base}-${sha}"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ steps.pkg.outputs.name }}
           path: dist/im1.0-*-linux-x64.zip
