@@ -28,7 +28,7 @@ jobs:
       # 2026-10-04: action 由 tag 改为钉 commit SHA(依据: semgrep
       # `github-actions-mutable-action-tag`)。本 workflow 能拿到共享 K3s dev
       # 集群的 kubeconfig 与 Slack webhook, 属于高价值凭据。
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup kubeconfig
         env:
@@ -96,7 +96,7 @@ jobs:
 
       - name: Notify Slack
         if: always()
-        uses: slackapi/slack-github-action@fcfb566f8b0aab22203f066d80ca1d7e4b5d05b3 # v1
+        uses: slackapi/slack-github-action@dcb1066f776dd043e64d0e8ba94ca15cc7e1875d # v4.0.0
         with:
           payload: |
             {
